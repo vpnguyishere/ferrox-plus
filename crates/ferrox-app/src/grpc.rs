@@ -1282,7 +1282,8 @@ impl GrpcWriter {
         let mut group_start = 0usize;
         let mut payload_len = 0usize;
         let mut prefix_len = 5usize;
-        // A group larger than the live credit would park before it sent a byte; cap it there.
+        // Cap by the live room, read before the window locks: a refused batch takes them in the other order.
+        let room = self.send_room();
         let cap = {
             let init = self
                 .shared
@@ -1294,7 +1295,7 @@ impl GrpcWriter {
                 .send
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            (*init).min(send.conn).min(send.stream)
+            (*init).min(send.conn).min(send.stream).min(room)
         };
         let wide = usize::try_from(cap).unwrap_or(usize::MAX);
         let payload = payload.min(wide.saturating_sub(16).max(1));
@@ -1347,7 +1348,8 @@ impl GrpcWriter {
             .init
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        cap.min(65_535)
+        // A group sized only by the opening window parks when the transport has less room now.
+        cap.min(65_535).min(self.send_room())
     }
 
     /// Adds one `MultiHunk` message to the batch, flushing first when the batch cannot hold all its
@@ -3783,6 +3785,71 @@ mod tests {
             writer.try_send(&data),
             crate::proxy::Push::Took(65_500)
         ));
+    }
+
+    /// The multiplexed transport owns the live window, so a group is cut to its `room()` before
+    /// it is offered: a group sized only by the opening window parks forever when the peer has
+    /// already spent the credit on the response it is reading.
+    #[test]
+    fn a_multi_mode_muxed_writer_cuts_each_group_to_the_live_room() {
+        struct Roomed {
+            limit: u64,
+            got: Arc<Mutex<Vec<u8>>>,
+            offered: Arc<Mutex<Vec<usize>>>,
+        }
+        impl std::io::Write for Roomed {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.got.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::proxy::FrameWrite for Roomed {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                matches!(self.offer_slices(parts), Accepted::All)
+            }
+            fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
+                let total: usize = parts.iter().map(|part| part.len()).sum();
+                self.offered.lock().unwrap().push(total);
+                if total as u64 > self.limit {
+                    return Accepted::Full;
+                }
+                for part in parts {
+                    self.got.lock().unwrap().extend_from_slice(part);
+                }
+                Accepted::All
+            }
+            fn room(&self) -> u64 {
+                self.limit
+            }
+        }
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let offered = Arc::new(Mutex::new(Vec::new()));
+        let shared = mux_shared(
+            Box::new(Roomed {
+                limit: 40_000,
+                got: Arc::clone(&got),
+                offered: Arc::clone(&offered),
+            }),
+            HUNK,
+            65_535,
+        );
+        let writer = GrpcWriter {
+            shared,
+            stream: 1,
+            multi: true,
+        };
+        let data: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        assert!(matches!(
+            writer.try_send(&data),
+            crate::proxy::Push::Took(n) if n == data.len()
+        ));
+        assert!(
+            offered.lock().unwrap().iter().all(|&total| total <= 40_000),
+            "every offered group fits the live room"
+        );
     }
 
     /// A peer whose starting window is smaller than one frame: the writer cuts its elements to
