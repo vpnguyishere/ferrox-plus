@@ -15217,18 +15217,20 @@ fn tls_xhttp<S: Dialed, D: Dialed>(
         || session
             .alpn()
             .is_some_and(|alpn| alpn.eq_ignore_ascii_case(b"h2"));
-    // This tree's H2 client is stream-one: a dual-session mode cannot ride a connection the peer agreed to speak h2 on, and an H1 head is not a fallback it accepted.
-    if h2 && settings.mode != crate::xhttp::XhttpMode::StreamOne {
-        return tls_unreachable(server);
-    }
     let (reader, writer, raw) = session.into_halves()?;
-    if settings.mode == crate::xhttp::XhttpMode::StreamOne {
-        if h2 {
+    if h2 {
+        // One connection carries both directions as streams, so the downlink never dials a second transport (`dialer.go:411`).
+        let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
             // REALITY always dials HTTP/2 (`decideHTTPVersion`, dialer.go:82), never an H1 head.
-            return crate::xhttp_h2::connect_split(reader, writer, raw, host, settings, "https")
-                .map(|(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer))
-                .or_else(|| tls_unreachable(server));
-        }
+            crate::xhttp_h2::connect_split(reader, writer, raw, host, settings, "https")
+        } else {
+            crate::xhttp_h2::connect_dual_split(reader, writer, raw, host, settings, "https")
+        };
+        return pair
+            .map(|(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer))
+            .or_else(|| tls_unreachable(server));
+    }
+    if settings.mode == crate::xhttp::XhttpMode::StreamOne {
         let head = crate::xhttp::dial_path(settings);
         return crate::xhttp::connect_split(reader, writer, host, &head, &settings.headers)
             .map(|(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer))

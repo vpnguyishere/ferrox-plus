@@ -454,15 +454,19 @@ struct Packets {
     poster: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+/// One POST's transport: the H1 dial writes a request head and drains its answer, the H2 dial opens
+/// a stream per packet on the connection both directions already share.
+trait PacketPost: Send {
+    fn post(&mut self, seq: u64, piece: &[u8]) -> bool;
+}
+
 struct Packer {
-    stream: Mutex<Box<dyn FrameStream + Send>>,
+    transport: Mutex<Box<dyn PacketPost + Send>>,
     queue: Mutex<Vec<u8>>,
     cv: Condvar,
     closed: AtomicBool,
     failed: AtomicBool,
-    host: String,
     settings: XhttpSettings,
-    session: String,
     seq: AtomicU64,
     last: Mutex<Option<std::time::Instant>>,
 }
@@ -559,7 +563,6 @@ impl Packer {
 
     fn pump(&self) {
         let mut spare = Vec::new();
-        let mut answer = Vec::new();
         loop {
             let Ok(mut queue) = self.queue.lock() else {
                 self.failed.store(true, Ordering::SeqCst);
@@ -583,11 +586,11 @@ impl Packer {
             };
             self.cv.notify_all();
             drop(queue);
-            let Ok(mut stream) = self.stream.lock() else {
+            let Ok(mut transport) = self.transport.lock() else {
                 self.failed.store(true, Ordering::SeqCst);
                 return;
             };
-            if !self.post(&mut **stream, &piece, &mut answer) {
+            if !self.post(&mut **transport, &piece) {
                 self.failed.store(true, Ordering::SeqCst);
                 self.cv.notify_all();
                 return;
@@ -597,7 +600,7 @@ impl Packer {
         }
     }
 
-    fn post(&self, stream: &mut dyn FrameStream, piece: &[u8], answer: &mut Vec<u8>) -> bool {
+    fn post(&self, transport: &mut dyn PacketPost, piece: &[u8]) -> bool {
         let Ok(mut last) = self.last.lock() else {
             return false;
         };
@@ -615,12 +618,43 @@ impl Packer {
         }
         *last = Some(std::time::Instant::now());
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        transport.post(seq, piece)
+    }
+}
+
+/// The H1 packet transport: one request head, its body, and the answer read back off the same stream.
+struct H1Post {
+    stream: Box<dyn FrameStream + Send>,
+    host: String,
+    settings: XhttpSettings,
+    session: String,
+    answer: Vec<u8>,
+}
+
+impl PacketPost for H1Post {
+    fn post(&mut self, seq: u64, piece: &[u8]) -> bool {
         let (head, body) = packet_head(&self.host, &self.settings, &self.session, seq, piece);
         let wrote = match body {
-            Some(body) => stream.write_slices(&[head.as_bytes(), body]),
-            None => stream.write_all(head.as_bytes()).is_ok(),
+            Some(body) => self.stream.write_slices(&[head.as_bytes(), body]),
+            None => self.stream.write_all(head.as_bytes()).is_ok(),
         };
-        wrote && drain_answer(stream, answer)
+        wrote && drain_answer(&mut *self.stream, &mut self.answer)
+    }
+}
+
+/// The H2 packet transport: the stream is the packet, opened and retired on the session's connection.
+struct H2Post {
+    client: Arc<crate::xhttp_h2::H2Client>,
+    host: String,
+    settings: XhttpSettings,
+    session: String,
+    _owner: Arc<crate::xhttp_h2::ClientOwner>,
+}
+
+impl PacketPost for H2Post {
+    fn post(&mut self, seq: u64, piece: &[u8]) -> bool {
+        self.client
+            .packet(&self.host, &self.settings, &self.session, seq, piece)
     }
 }
 
@@ -767,15 +801,39 @@ impl XhttpWriter {
         settings: &XhttpSettings,
         session: String,
     ) -> Self {
+        let post = H1Post {
+            stream: Box::new(w),
+            host: host.to_owned(),
+            settings: settings.clone(),
+            session,
+            answer: Vec::new(),
+        };
+        Self::packets_with(Box::new(post), settings)
+    }
+    pub(crate) fn packets_h2(
+        client: Arc<crate::xhttp_h2::H2Client>,
+        host: &str,
+        settings: &XhttpSettings,
+        session: String,
+        owner: Arc<crate::xhttp_h2::ClientOwner>,
+    ) -> Self {
+        let post = H2Post {
+            client,
+            host: host.to_owned(),
+            settings: settings.clone(),
+            session,
+            _owner: owner,
+        };
+        Self::packets_with(Box::new(post), settings)
+    }
+    fn packets_with(post: Box<dyn PacketPost + Send>, settings: &XhttpSettings) -> Self {
         let up = Arc::new(Packer {
-            stream: Mutex::new(Box::new(w) as Box<dyn FrameStream + Send>),
+            transport: Mutex::new(post),
             queue: Mutex::new(Vec::new()),
             cv: Condvar::new(),
             closed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
-            host: host.to_owned(),
             settings: settings.clone(),
-            session,
             seq: AtomicU64::new(0),
             last: Mutex::new(None),
         });
@@ -1065,7 +1123,7 @@ pub(crate) struct XhttpSettings {
 
 impl XhttpSettings {
     /// `GenerateSessionID` (config.go:511): a named or literal table at a positive length draws the id, and anything else mints the UUID the reference's default uses.
-    fn session_id(&self) -> String {
+    pub(crate) fn session_id(&self) -> String {
         let table = match self.session_id_table.as_str() {
             "ALPHABET" => "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
             "Alphabet" => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
@@ -2812,7 +2870,12 @@ pub(crate) fn dial_path(settings: &XhttpSettings) -> String {
 }
 
 /// The packet-up and stream-up dial's POST: one POST, chunked framing, the session under the head's own placement. `Connection: close` is the reference dialer's `DisableKeepAlives` (dialer.go:272).
-fn dial_head(host: &str, settings: &XhttpSettings, session: &str, seq: Option<u64>) -> String {
+pub(crate) fn dial_head(
+    host: &str,
+    settings: &XhttpSettings,
+    session: &str,
+    seq: Option<u64>,
+) -> String {
     let mut target = settings.path.clone();
     let mut query = settings.query.clone();
     let mut extra = String::new();
@@ -2828,7 +2891,7 @@ fn dial_head(host: &str, settings: &XhttpSettings, session: &str, seq: Option<u6
 }
 
 /// The downlink a packet-up or stream-up dial opens beside its upload (dialer.go:411).
-fn downlink_head(host: &str, settings: &XhttpSettings, session: &str) -> String {
+pub(crate) fn downlink_head(host: &str, settings: &XhttpSettings, session: &str) -> String {
     let mut target = settings.path.clone();
     let mut query = settings.query.clone();
     let mut extra = String::new();
@@ -2844,7 +2907,7 @@ fn referer_pad_value(settings: &XhttpSettings) -> String {
 }
 
 /// One packet-up POST. The packet rides the body by default, or `X-Data-{i}` headers / `x_data_{i}` cookies when `uplinkDataPlacement` says so: the reference encodes the whole packet as base64url and splits that one string at `uplinkChunkSize` points (`config.go:65-97`), so the hub joins the parts before it decodes.
-fn packet_head<'a>(
+pub(crate) fn packet_head<'a>(
     host: &str,
     settings: &XhttpSettings,
     session: &str,
@@ -4628,20 +4691,24 @@ mod tests {
         let (wrote_first, _first_written) = std::sync::mpsc::sync_channel(1);
         let (release, answer) = std::sync::mpsc::channel();
         let up = Arc::new(Packer {
-            stream: Mutex::new(Box::new(HeldUp {
-                posts: Arc::new(Mutex::new(Vec::new())),
-                wrote_first,
-                answer: Mutex::new(answer),
-                answered: AtomicBool::new(false),
-                reply_at: 0,
+            transport: Mutex::new(Box::new(H1Post {
+                stream: Box::new(HeldUp {
+                    posts: Arc::new(Mutex::new(Vec::new())),
+                    wrote_first,
+                    answer: Mutex::new(answer),
+                    answered: AtomicBool::new(false),
+                    reply_at: 0,
+                }),
+                host: "h".to_owned(),
+                settings: settings.clone(),
+                session: "session".to_owned(),
+                answer: Vec::new(),
             })),
             queue: Mutex::new(vec![0u8; 4]),
             cv: Condvar::new(),
             closed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
-            host: "h".to_owned(),
             settings,
-            session: "session".to_owned(),
             seq: AtomicU64::new(0),
             last: Mutex::new(None),
         });

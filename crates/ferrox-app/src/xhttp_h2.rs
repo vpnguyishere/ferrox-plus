@@ -125,7 +125,7 @@ pub(crate) struct H2StreamOut {
 }
 
 /// The last writer clone out closes the dialed connection: a clone dropped by the relay must not.
-struct ClientOwner {
+pub(crate) struct ClientOwner {
     conn: Arc<H2Conn>,
 }
 
@@ -205,6 +205,8 @@ struct StreamState {
     request_ended: bool,
     /// The upload reader left at a finished response while the client still holds the request open.
     abandoned: bool,
+    /// The response status a client decoded, so a packet POST can refuse a non-2xx answer.
+    status: Option<u16>,
     dead: bool,
 }
 
@@ -455,6 +457,15 @@ impl H2StreamReader {
         let conn = Arc::clone(&self.conn);
         let id = self.id;
         move || conn.reset(id)
+    }
+
+    /// The response status decoded for a client stream, once its head has arrived.
+    pub(crate) fn status(&self) -> Option<u16> {
+        self.stream
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .status
     }
 }
 
@@ -1184,6 +1195,36 @@ impl H2Conn {
         }
     }
 
+    /// A bodyless request ended with its HEADERS (`END_STREAM`), so the peer still owes the answer.
+    fn mark_request_ended(&self, stream: u32) {
+        let ended = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .map(|state| {
+                let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                st.request_ended = true;
+                st.ended
+            });
+        if ended == Some(true) {
+            self.retire(stream);
+        }
+    }
+
+    /// The status a response HEADERS block carries: decoded on the client's reader so the table stays
+    /// in wire order, and `None` when the block does not decode.
+    fn response_status(&self, block: &[u8]) -> Option<u16> {
+        let mut status = None;
+        let mut decoder = self.decoder.lock().ok()?;
+        decoder.decode(block, &mut |name, value| {
+            if name == b":status" {
+                status = std::str::from_utf8(value).ok().and_then(|s| s.parse().ok());
+            }
+        })?;
+        status
+    }
+
     /// The client's request body ends on its own stream while the response keeps reading: an RST
     /// here would discard the answer the peer has not written yet.
     fn finish_stream(&self, stream: u32) {
@@ -1448,6 +1489,7 @@ impl H2Conn {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -1602,6 +1644,11 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
     }
     match kind {
         T_HEADERS => {
+            let status = if flags & F_END_HEADERS != 0 {
+                conn.response_status(&body)
+            } else {
+                None
+            };
             let state = conn
                 .streams
                 .lock()
@@ -1612,6 +1659,9 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
                 state.responded.store(true, Ordering::SeqCst);
                 let done = {
                     let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    if status.is_some() {
+                        st.status = status;
+                    }
                     if flags & F_END != 0 {
                         st.ended = true;
                     }
@@ -1725,6 +1775,13 @@ impl H2Client {
         !self.conn.dead.load(Ordering::SeqCst) && !self.conn.goaway.load(Ordering::SeqCst)
     }
 
+    /// A session that does not pool the connection holds one of these: the last clone closes it.
+    pub(crate) fn owner(&self) -> Arc<ClientOwner> {
+        Arc::new(ClientOwner {
+            conn: Arc::clone(&self.conn),
+        })
+    }
+
     /// `owned` closes the connection when the session's last writer drops; a pooled connection is
     /// the pool's to close, not the session's.
     pub(crate) fn open(
@@ -1734,36 +1791,88 @@ impl H2Client {
         scheme: &str,
         owned: bool,
     ) -> Option<(H2StreamReader, crate::xhttp::XhttpWriter)> {
+        let block = request_block(host, settings, scheme);
+        let closer = owned.then(|| self.owner());
+        let (reader, out) = self.open_headers(&block, closer, false)?;
+        let writer = crate::xhttp::XhttpWriter::new(NullWrite);
+        writer.set_h2(out);
+        Some((reader, writer))
+    }
+
+    /// Sends one request head on a fresh stream. `end_request` marks a bodyless request (the GET
+    /// downlink) so the response's own `END_STREAM` retires the stream.
+    fn open_headers(
+        &self,
+        block: &[u8],
+        owner: Option<Arc<ClientOwner>>,
+        end_request: bool,
+    ) -> Option<(H2StreamReader, H2StreamOut)> {
         let sid = self.next.fetch_add(2, Ordering::SeqCst);
         let state = self.conn.attach_stream(sid, false)?;
-        let block = request_block(host, settings, scheme);
-        if !self.conn.frame(T_HEADERS, F_END_HEADERS, sid, &block) {
+        let flags = if end_request {
+            F_END_HEADERS | F_END
+        } else {
+            F_END_HEADERS
+        };
+        if !self.conn.frame(T_HEADERS, flags, sid, block) {
             self.conn.fail_stream(sid);
             return None;
         }
+        if end_request {
+            self.conn.mark_request_ended(sid);
+        }
+        let reader = H2StreamReader {
+            conn: Arc::clone(&self.conn),
+            stream: state,
+            id: sid,
+            at: 0,
+            cur: Vec::new(),
+            idle_since: None,
+        };
         let out = H2StreamOut {
             conn: Arc::clone(&self.conn),
             stream: sid,
-            _owner: owned.then(|| {
-                Arc::new(ClientOwner {
-                    conn: Arc::clone(&self.conn),
-                })
-            }),
+            _owner: owner,
             client: true,
         };
-        let writer = crate::xhttp::XhttpWriter::new(NullWrite);
-        writer.set_h2(out);
-        Some((
-            H2StreamReader {
-                conn: Arc::clone(&self.conn),
-                stream: state,
-                id: sid,
-                at: 0,
-                cur: Vec::new(),
-                idle_since: None,
-            },
-            writer,
-        ))
+        Some((reader, out))
+    }
+
+    /// One packet-up POST: its own stream, the packet in the body, the answer drained before the
+    /// next shares the connection. A refused packet would stall the download, so the answer is read
+    /// to its end and a non-2xx status fails the upload.
+    pub(crate) fn packet(
+        &self,
+        host: &str,
+        settings: &XhttpSettings,
+        session: &str,
+        seq: u64,
+        piece: &[u8],
+    ) -> bool {
+        let (head, body) = crate::xhttp::packet_head(host, settings, session, seq, piece);
+        let block = block_from_head(&head, host, "https");
+        let Some((mut reader, out)) = self.open_headers(&block, None, false) else {
+            return false;
+        };
+        if let Some(body) = body {
+            if !out.data(body) {
+                self.conn.fail_stream(reader.id);
+                return false;
+            }
+        }
+        self.conn.finish_stream(reader.id);
+        let mut sink = [0u8; 64];
+        loop {
+            match reader.read(&mut sink) {
+                Ok(0) => {
+                    return reader
+                        .status()
+                        .is_none_or(|code| (200..300).contains(&code))
+                }
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
     }
 }
 
@@ -1806,6 +1915,83 @@ pub(crate) fn connect_split<
     scheme: &str,
 ) -> Option<(H2StreamReader, crate::xhttp::XhttpWriter)> {
     H2Client::new(read, write, Some(raw))?.open(host, settings, scheme, true)
+}
+
+/// A dual-session dial on one h2 connection: the GET downlink and the POST upload are two streams,
+/// exactly as the reference's `http2.Transport` muxes them on the one connection it pooled.
+pub(crate) fn connect_dual_split<
+    R: Read + Send + 'static,
+    W: crate::proxy::FrameWrite + Send + 'static,
+>(
+    read: R,
+    write: W,
+    raw: Arc<crate::conn::Connection>,
+    host: &str,
+    settings: &XhttpSettings,
+    scheme: &str,
+) -> Option<(H2StreamReader, crate::xhttp::XhttpWriter)> {
+    let client = H2Client::new(read, write, Some(raw))?;
+    let owner = client.owner();
+    let session = settings.session_id();
+    let down = crate::xhttp::downlink_head(host, settings, &session);
+    let block = block_from_head(&down, host, scheme);
+    let Some((reader, _)) = client.open_headers(&block, None, true) else {
+        client.close();
+        return None;
+    };
+    let writer = if settings.mode == crate::xhttp::XhttpMode::PacketUp {
+        crate::xhttp::XhttpWriter::packets_h2(Arc::clone(&client), host, settings, session, owner)
+    } else {
+        let up = crate::xhttp::dial_head(host, settings, &session, None);
+        let block = block_from_head(&up, host, scheme);
+        let Some((_, out)) = client.open_headers(&block, Some(owner), false) else {
+            client.close();
+            return None;
+        };
+        let writer = crate::xhttp::XhttpWriter::new(NullWrite);
+        writer.set_h2(out);
+        writer
+    };
+    Some((reader, writer))
+}
+
+/// The h2 fields an H1 dial head already decided: its request line becomes the pseudo-headers and
+/// the framing the connection owns is dropped, while `content-length` stays so a packet's body is
+/// bounded.
+fn block_from_head(head: &str, host: &str, scheme: &str) -> Vec<u8> {
+    let mut lines = head.split("\r\n");
+    let mut request = lines.next().unwrap_or_default().split_ascii_whitespace();
+    let method = request.next().unwrap_or("POST");
+    let target = request.next().unwrap_or("/");
+    let mut fields: Vec<(String, String)> = Vec::with_capacity(8);
+    fields.push((":method".to_owned(), method.to_owned()));
+    fields.push((":path".to_owned(), target.to_owned()));
+    fields.push((":scheme".to_owned(), scheme.to_owned()));
+    fields.push((":authority".to_owned(), host.to_owned()));
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("keep-alive")
+            || name.eq_ignore_ascii_case("te")
+            || name.eq_ignore_ascii_case("upgrade")
+        {
+            continue;
+        }
+        fields.push((name.to_ascii_lowercase(), value.trim().to_owned()));
+    }
+    let refs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    block_encode(&refs)
 }
 
 /// What a connection does with a request stream: xHTTP synthesises its H1 head and reuses the H1
@@ -3049,6 +3235,7 @@ mod tests {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -3138,6 +3325,7 @@ mod tests {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -3199,6 +3387,7 @@ mod tests {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -3561,6 +3750,79 @@ mod tests {
         let _ = echo;
     }
 
+    /// The dual dial's downlink GET and upload POST share the one h2 connection the REALITY
+    /// handshake already carried: the stream-up writer is a DATA stream, and the echo comes back on
+    /// the GET the same client opened.
+    #[test]
+    fn h2_dual_split_stream_up_carries_both_directions_on_one_connection() {
+        let (echo_addr, echo) = echo_server();
+        let (addr, server) = serve_one(test_settings("stream-up"), [0xaau8; 16], 1);
+        let conn = Connection::connect(addr).expect("connects");
+        let raw = Arc::new(conn.try_clone().expect("clones"));
+        let settings = test_settings("stream-up");
+        let (mut reader, writer) = connect_dual_split(
+            conn.try_clone().expect("clones"),
+            conn,
+            raw,
+            "127.0.0.1",
+            &settings,
+            "http",
+        )
+        .expect("dials both directions");
+        let header = vless_header(echo_addr.port());
+        let payload: Vec<u8> = (0..32768u32).map(|i| (i % 251) as u8).collect();
+        let mut body = header;
+        body.extend_from_slice(&payload);
+        assert!(writer.send(&body), "the upload takes the request");
+        writer.finish();
+        let mut status = [0u8; 2];
+        reader.read_exact(&mut status).expect("the response head");
+        assert_eq!(status, [0, 0]);
+        let mut got = vec![0u8; payload.len()];
+        reader.read_exact(&mut got).expect("the echo");
+        assert_eq!(got, payload);
+        drop(reader);
+        drop(writer);
+        server.join().expect("joins");
+        let _ = echo;
+    }
+
+    /// Packet-up on the dual dial opens one POST stream per batch beside the GET, and the answer is
+    /// drained before the next batch shares the connection.
+    #[test]
+    fn h2_dual_split_packet_up_posts_beside_the_downlink() {
+        let (echo_addr, echo) = echo_server();
+        let (addr, server) = serve_one(test_settings("packet-up"), [0xaau8; 16], 1);
+        let conn = Connection::connect(addr).expect("connects");
+        let raw = Arc::new(conn.try_clone().expect("clones"));
+        let settings = test_settings("packet-up");
+        let (mut reader, writer) = connect_dual_split(
+            conn.try_clone().expect("clones"),
+            conn,
+            raw,
+            "127.0.0.1",
+            &settings,
+            "http",
+        )
+        .expect("dials both directions");
+        let header = vless_header(echo_addr.port());
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        let mut body = header;
+        body.extend_from_slice(&payload);
+        assert!(writer.send(&body), "the upload takes the request");
+        writer.finish();
+        let mut status = [0u8; 2];
+        reader.read_exact(&mut status).expect("the response head");
+        assert_eq!(status, [0, 0]);
+        let mut got = vec![0u8; payload.len()];
+        reader.read_exact(&mut got).expect("the echo");
+        assert_eq!(got, payload);
+        drop(reader);
+        drop(writer);
+        server.join().expect("joins");
+        let _ = echo;
+    }
+
     /// The scripted peer answers two streams at once and puts the other stream's frames in front of
     /// each reader, so a reader that throws away what it did not ask for returns the wrong bytes
     /// rather than only losing them when the scheduler lets two responses interleave.
@@ -3702,6 +3964,7 @@ mod tests {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -3951,6 +4214,7 @@ mod tests {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -3980,6 +4244,7 @@ mod tests {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -4029,6 +4294,7 @@ mod tests {
                 finished: true,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -4802,6 +5068,7 @@ mod tests {
                 finished: true,
                 request_ended: false,
                 abandoned: true,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -4863,6 +5130,7 @@ mod tests {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -5027,6 +5295,7 @@ mod tests {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -5070,6 +5339,7 @@ mod tests {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -5128,6 +5398,7 @@ mod tests {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -5166,6 +5437,7 @@ mod tests {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -5291,6 +5563,7 @@ mod tests {
                 finished: false,
                 request_ended: false,
                 abandoned: false,
+                status: None,
                 dead: false,
             }),
             cv: Condvar::new(),
