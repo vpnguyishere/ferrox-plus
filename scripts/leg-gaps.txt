@@ -32,6 +32,8 @@ vless-ws-down-8|server-threads|1.36|696
 vless-xhttp-duplex-8|server-threads|1.29|696
 vless-xhttp-down-8|server-threads|1.27|696
 vmess-tls-ws-down-8|server-threads|1.54|696
+vmess-reality-raw-down-8|server|0.78|486|ceiling
+vmess-reality-raw-down-8|server-threads|1.08|696
 vless-grpc-duplex-8|server-threads|1.21|1276
 vless-grpc-duplex-8|server-cpu|5.77|1276
 vless-grpc-duplex-8|client|0.61|1276
