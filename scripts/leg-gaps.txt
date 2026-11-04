@@ -31,6 +31,7 @@ vless-vision-tls-raw-up-1|server-cpu|1.12|486
 vless-ws-down-8|server-threads|1.36|696
 vless-xhttp-duplex-8|server-threads|1.29|696
 vless-xhttp-down-8|server-threads|1.27|696
+vless-tls-xhttp-h2-down-8|server-threads|1.85|696
 vmess-tls-ws-down-8|server-threads|1.54|696
 vmess-reality-raw-down-8|server|0.78|486|ceiling
 vmess-reality-raw-down-8|server-threads|1.08|696

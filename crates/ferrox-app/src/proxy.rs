@@ -45840,10 +45840,11 @@ mod tests {
         );
     }
 
-    /// A dual-session mode on a connection that negotiated h2 is refused before its downlink is
-    /// dialled: this tree's H2 client is stream-one, and the peer never agreed to an H1 head.
+    /// A dual-session mode on a connection that negotiated h2 rides the one connection the
+    /// handshake opened: the GET downlink and the POST upload are streams on it, so no second
+    /// transport is dialled.
     #[test]
-    fn a_dual_session_xhttp_refuses_a_negotiated_h2_connection() {
+    fn a_dual_session_xhttp_dials_over_a_negotiated_h2_connection() {
         let (server_config, mut client_config) = carried_tls_configs();
         let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
             alpn: vec![b"h2".to_vec()],
@@ -45889,11 +45890,11 @@ mod tests {
             &settings,
             false,
         );
-        assert!(out.is_none(), "a dual-session h2 dial is refused");
+        assert!(out.is_some(), "a dual-session h2 dial carries the carrier");
         assert_eq!(
             second.load(Ordering::SeqCst),
             0,
-            "the downlink session is not dialled for a shape this client cannot carry"
+            "the downlink is a stream on the same connection, not a second transport"
         );
     }
 
