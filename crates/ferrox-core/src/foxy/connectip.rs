@@ -602,12 +602,12 @@ fn block_sum(bytes: &[u8]) -> u64 {
             return unsafe { avx2_block_sum(bytes) };
         }
         // SAFETY: SSE2 is part of the x86_64 baseline, and the kernel reads only whole sixteen-byte lanes of a run that is a whole number of them.
-        return unsafe { sse2_block_sum(bytes) };
+        unsafe { sse2_block_sum(bytes) }
     }
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: NEON is part of the aarch64 baseline, and the kernel reads only whole sixteen-byte lanes of a run that is a whole number of them.
-        return unsafe { neon_block_sum(bytes) };
+        unsafe { neon_block_sum(bytes) }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     lane_sum(bytes)
@@ -641,7 +641,7 @@ unsafe fn avx2_block_sum(bytes: &[u8]) -> u64 {
     sum * 256 - high * 255
 }
 
-/// The same two byte sums in the x86_64 baseline: `psadbw` on a sixteen-byte lane, two lanes accumulated, so a block costs the same one load, shift, two sums and two adds as the wide kernel over half the span.
+/// The same two byte sums in the `x86_64` baseline: `psadbw` on a sixteen-byte lane, two lanes accumulated, so a block costs the same one load, shift, two sums and two adds as the wide kernel over half the span.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn sse2_block_sum(bytes: &[u8]) -> u64 {
@@ -668,7 +668,7 @@ unsafe fn sse2_block_sum(bytes: &[u8]) -> u64 {
     sum * 256 - high * 255
 }
 
-/// The same two byte sums in NEON, which is mandatory on aarch64: `vpadal` folds the sixteen octets to two 64-bit lanes in three widening adds, and the shift moves each odd octet into its own lane for the second sum.
+/// The same two byte sums in NEON, which is mandatory on `aarch64`: `vpadal` folds the sixteen octets to two 64-bit lanes in three widening adds, and the shift moves each odd octet into its own lane for the second sum.
 #[cfg(target_arch = "aarch64")]
 unsafe fn neon_block_sum(bytes: &[u8]) -> u64 {
     use core::arch::aarch64::{

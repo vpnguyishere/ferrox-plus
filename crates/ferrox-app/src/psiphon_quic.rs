@@ -1602,7 +1602,8 @@ impl Engine {
         let mut write = 0usize;
         let mut newest: Option<SentPacket> = None;
         let mut acked_bytes = 0u64;
-        for read in 0..len {
+        let mut read = 0usize;
+        while read < len {
             let packet = self.sent[read];
             if packet.space == space
                 && ranges
@@ -1618,6 +1619,7 @@ impl Engine {
                 self.sent[write] = packet;
                 write += 1;
             }
+            read += 1;
         }
         if write == len {
             return;
@@ -2167,9 +2169,9 @@ fn put_ack(buf: &mut Vec<u8>, seen: &[u64]) {
     put_varint(buf, 0);
     put_varint(buf, (count - 1) as u64);
     put_varint(buf, ranges[0].1 - ranges[0].0);
-    for index in 0..count - 1 {
-        let (previous, _) = ranges[index];
-        let (low, high) = ranges[index + 1];
+    for pair in ranges[..count].windows(2) {
+        let (previous, _) = pair[0];
+        let (low, high) = pair[1];
         put_varint(buf, previous.saturating_sub(high).saturating_sub(2));
         put_varint(buf, high - low);
     }
