@@ -670,6 +670,7 @@ unsafe fn sse2_block_sum(bytes: &[u8]) -> u64 {
 
 /// The same two byte sums in NEON, which is mandatory on `aarch64`: `vpadal` folds the sixteen octets to two 64-bit lanes in three widening adds, and the shift moves each odd octet into its own lane for the second sum.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 unsafe fn neon_block_sum(bytes: &[u8]) -> u64 {
     use core::arch::aarch64::{
         uint64x2_t, vaddvq_u64, vdupq_n_u64, vld1q_u8, vpadalq_u32, vpaddlq_u16, vpaddlq_u8,
