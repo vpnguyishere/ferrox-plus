@@ -1364,7 +1364,7 @@ impl Engine {
             ];
             keys.remote
                 .header
-                .decrypt_in_place(&sample, &mut first, &mut pnb)
+                .decrypt_in_place(sample, &mut first, &mut pnb)
                 .map_err(|error| format!("psiphon quic header: {error}"))?;
             let pn_len = usize::from(first & 0x03) + 1;
             let truncated = pnb[..pn_len]
@@ -2369,7 +2369,7 @@ mod tests {
         assert_eq!(count, 5);
         assert_eq!(out.as_slice(), b"hello");
         assert_eq!(counts.allocs, 0, "the window is swapped, not copied");
-        assert!(engine.received.is_empty());
+        assert!(engine.received.is_empty(), "the window was handed over");
     }
 
     #[test]
@@ -2391,7 +2391,7 @@ mod tests {
             })
             .collect();
         engine.expire(base + Duration::from_millis(1000));
-        assert!(engine.sent.is_empty());
+        assert!(engine.sent.is_empty(), "the expired prefix is gone");
         assert_eq!(engine.bytes_in_flight, 0);
         assert_eq!(
             engine.retx.iter().copied().collect::<Vec<_>>(),
