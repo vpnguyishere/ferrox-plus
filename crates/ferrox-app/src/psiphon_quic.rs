@@ -10,7 +10,7 @@
 )]
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, ErrorKind, IoSlice, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -702,6 +702,7 @@ fn packet_key(key: &str) -> Result<[u8; 32], String> {
     Ok(derived)
 }
 
+#[derive(Clone, Copy)]
 struct SentPacket {
     pn: u64,
     space: usize,
@@ -724,7 +725,7 @@ struct Engine {
     scid: Vec<u8>,
     next_pn: [u64; 3],
     largest: [u64; 3],
-    ack_seen: [BTreeSet<u64>; 3],
+    ack_seen: [Vec<u64>; 3],
     ack_pending: [bool; 3],
     crypto_send: [Vec<u8>; 3],
     crypto_sent: [usize; 3],
@@ -758,6 +759,7 @@ struct Engine {
     close_sent: bool,
     window_update: bool,
     path_response: Option<[u8; 8]>,
+    tx_scratch: Vec<u8>,
 }
 
 impl Engine {
@@ -799,7 +801,7 @@ impl Engine {
             scid,
             next_pn: [0; 3],
             largest: [0; 3],
-            ack_seen: std::array::from_fn(|_| BTreeSet::new()),
+            ack_seen: std::array::from_fn(|_| Vec::new()),
             ack_pending: [false; 3],
             crypto_send: std::array::from_fn(|_| Vec::new()),
             crypto_sent: [0; 3],
@@ -833,6 +835,7 @@ impl Engine {
             close_sent: false,
             window_update: false,
             path_response: None,
+            tx_scratch: Vec::new(),
         };
         engine.pump_tls()?;
         Ok(engine)
@@ -923,9 +926,8 @@ impl Engine {
         let pto = self.pto();
         let next = self
             .sent
-            .iter()
+            .first()
             .map(|packet| packet.sent_at + pto)
-            .min()
             .map_or(READ_WAIT, |at| at.saturating_duration_since(now));
         next.min(READ_WAIT).max(Duration::from_millis(1))
     }
@@ -963,27 +965,23 @@ impl Engine {
     fn expire(&mut self, now: Instant) {
         let pto = self.pto();
         let mut at = 0;
-        let mut lost = false;
-        while at < self.sent.len() {
-            if now.saturating_duration_since(self.sent[at].sent_at) >= pto {
-                let packet = self.sent.remove(at);
-                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.size);
-                if let Some((offset, _len)) = packet.crypto {
-                    self.crypto_sent[packet.space] =
-                        self.crypto_sent[packet.space].min(offset as usize);
-                }
-                if let Some((offset, len)) = packet.stream {
-                    self.retx.push_back((offset, len));
-                }
-                if packet.window {
-                    self.window_update = true;
-                }
-                lost = true;
-            } else {
-                at += 1;
+        while at < self.sent.len() && now.saturating_duration_since(self.sent[at].sent_at) >= pto {
+            let packet = self.sent[at];
+            self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.size);
+            if let Some((offset, _len)) = packet.crypto {
+                self.crypto_sent[packet.space] =
+                    self.crypto_sent[packet.space].min(offset as usize);
             }
+            if let Some((offset, len)) = packet.stream {
+                self.retx.push_back((offset, len));
+            }
+            if packet.window {
+                self.window_update = true;
+            }
+            at += 1;
         }
-        if lost {
+        if at > 0 {
+            self.sent.drain(..at);
             self.cwnd = INITIAL_CWND;
         }
     }
@@ -994,7 +992,17 @@ impl Engine {
             return Ok(false);
         }
         let pn = self.next_pn[space];
-        let mut payload = Vec::with_capacity(MAX_PAYLOAD);
+        let head = if space == ONE_RTT {
+            1 + self.dcid.len() + 4
+        } else {
+            0
+        };
+        let mut payload = std::mem::take(&mut self.tx_scratch);
+        payload.clear();
+        payload.reserve(head + MAX_PAYLOAD + 64);
+        if head > 0 {
+            payload.resize(head, 0);
+        }
         let mut crypto_frame = None;
         let mut stream_frame = None;
         let mut window_frame = false;
@@ -1039,7 +1047,7 @@ impl Engine {
                     .saturating_sub(self.stream_sent);
                 let room = available
                     .min(limit)
-                    .min(Self::max_payload_room(payload.len()) as u64);
+                    .min(Self::max_payload_room(payload.len() - head) as u64);
                 if room > 0 {
                     if let Some(frame) =
                         self.write_stream_frame(&mut payload, self.stream_sent, room)
@@ -1052,7 +1060,7 @@ impl Engine {
             }
         } else if self.crypto_pending(space) {
             let data = &self.crypto_send[space][self.crypto_sent[space]..];
-            let len = data.len().min(Self::max_payload_room(payload.len()));
+            let len = data.len().min(Self::max_payload_room(payload.len() - head));
             if len > 0 {
                 let offset = self.crypto_sent[space] as u64;
                 payload.push(0x06);
@@ -1063,18 +1071,42 @@ impl Engine {
                 ack_eliciting = true;
             }
         }
-        if payload.is_empty() {
+        if payload.len() == head {
             if space == ONE_RTT && now.saturating_duration_since(self.last_send) >= KEEPALIVE {
                 payload.push(0x01);
                 ack_eliciting = true;
             } else {
+                self.tx_scratch = payload;
                 return Ok(false);
             }
         }
         if space == INITIAL {
             self.pad_initial(&mut payload, pn);
         }
-        let (packet, pn) = self.seal(space, pn, payload)?;
+        if space == ONE_RTT {
+            self.seal_short(pn, &mut payload, head)?;
+            self.next_pn[space] += 1;
+            let size = payload.len() as u64;
+            if ack_eliciting {
+                self.sent.push(SentPacket {
+                    pn,
+                    space,
+                    sent_at: now,
+                    size,
+                    crypto: crypto_frame,
+                    stream: stream_frame,
+                    window: window_frame,
+                });
+                self.bytes_in_flight = self.bytes_in_flight.saturating_add(size);
+            }
+            self.last_send = now;
+            udp.send(&payload)
+                .map_err(|error| format!("psiphon quic send failed: {error}"))?;
+            self.tx_scratch = payload;
+            return Ok(true);
+        }
+        let packet = self.seal(space, pn, &payload)?;
+        self.tx_scratch = payload;
         self.next_pn[space] += 1;
         let size = packet.len() as u64;
         if ack_eliciting {
@@ -1133,8 +1165,7 @@ impl Engine {
         Some((offset, bytes.len() as u64))
     }
 
-    #[allow(clippy::needless_pass_by_value)]
-    fn seal(&self, space: usize, pn: u64, mut payload: Vec<u8>) -> Result<(Vec<u8>, u64), String> {
+    fn seal(&self, space: usize, pn: u64, payload: &[u8]) -> Result<Vec<u8>, String> {
         let keys = self
             .keys(space)
             .ok_or_else(|| "psiphon quic keys".to_owned())?;
@@ -1144,47 +1175,86 @@ impl Engine {
             HANDSHAKE => 2u8,
             _ => 3u8,
         };
-        let long = space != ONE_RTT;
         let mut header = Vec::with_capacity(64);
-        if long {
-            header.push(0x80 | packet_type << 4 | (pn_len as u8 - 1));
-            header.extend_from_slice(&QUIC_VERSION.to_be_bytes());
-            header.push(u8::try_from(self.dcid.len()).unwrap_or(0));
-            header.extend_from_slice(&self.dcid);
-            header.push(u8::try_from(self.scid.len()).unwrap_or(0));
-            header.extend_from_slice(&self.scid);
-            if space == INITIAL {
-                put_varint(&mut header, 0);
-            }
-            let length = pn_len as u64 + payload.len() as u64 + 16;
-            put_varint(&mut header, length);
-        } else {
-            header.push(0x40 | (u8::from(self.key_phase) << 2) | (pn_len as u8 - 1));
-            header.extend_from_slice(&self.dcid);
+        header.push(0x80 | packet_type << 4 | (pn_len as u8 - 1));
+        header.extend_from_slice(&QUIC_VERSION.to_be_bytes());
+        header.push(u8::try_from(self.dcid.len()).unwrap_or(0));
+        header.extend_from_slice(&self.dcid);
+        header.push(u8::try_from(self.scid.len()).unwrap_or(0));
+        header.extend_from_slice(&self.scid);
+        if space == INITIAL {
+            put_varint(&mut header, 0);
         }
+        let length = pn_len as u64 + payload.len() as u64 + 16;
+        put_varint(&mut header, length);
         let pn_offset = header.len();
         header.extend_from_slice(&pn.to_be_bytes()[8 - pn_len..]);
+        let header_len = header.len();
+        let mut packet = header;
+        packet.extend_from_slice(payload);
+        let (head, body) = packet.split_at_mut(header_len);
         let tag = keys
             .local
             .packet
-            .encrypt_in_place(pn, &header, &mut payload)
+            .encrypt_in_place(pn, head, body)
             .map_err(|error| format!("psiphon quic seal: {error}"))?;
-        let mut packet = header;
-        packet.extend_from_slice(&payload);
         packet.extend_from_slice(tag.as_ref());
         let sample_len = keys.local.header.sample_len();
         let sample_at = pn_offset + 4;
         if packet.len() < sample_at + sample_len {
             return Err("psiphon quic short packet".to_owned());
         }
-        let sample = packet[sample_at..sample_at + sample_len].to_vec();
+        let mut sample = [0u8; 16];
+        let sample = sample
+            .get_mut(..sample_len)
+            .ok_or_else(|| "psiphon quic short sample".to_owned())?;
+        sample.copy_from_slice(&packet[sample_at..sample_at + sample_len]);
         let (first, rest) = packet.split_at_mut(1);
         let pn_slice = &mut rest[pn_offset - 1..pn_offset + pn_len - 1];
         keys.local
             .header
-            .encrypt_in_place(&sample, &mut first[0], pn_slice)
+            .encrypt_in_place(sample, &mut first[0], pn_slice)
             .map_err(|error| format!("psiphon quic header: {error}"))?;
-        Ok((packet, pn))
+        Ok(packet)
+    }
+
+    /// Sealing a one-RTT packet in the buffer its frames were built in: the header fills the prefix the caller reserved, the payload is encrypted where it lies, and the tag lands after it, so no plaintext is copied into a second allocation.
+    fn seal_short(&self, pn: u64, packet: &mut Vec<u8>, head: usize) -> Result<(), String> {
+        let keys = self
+            .one_rtt
+            .as_ref()
+            .ok_or_else(|| "psiphon quic keys".to_owned())?;
+        let pn_len = 4usize;
+        let pn_offset = 1 + self.dcid.len();
+        if packet.len() < head || head != pn_offset + pn_len {
+            return Err("psiphon quic short packet".to_owned());
+        }
+        packet[0] = 0x40 | (u8::from(self.key_phase) << 2) | (pn_len as u8 - 1);
+        packet[1..pn_offset].copy_from_slice(&self.dcid);
+        packet[pn_offset..head].copy_from_slice(&pn.to_be_bytes()[8 - pn_len..]);
+        let (header, body) = packet.split_at_mut(head);
+        let tag = keys
+            .local
+            .packet
+            .encrypt_in_place(pn, header, body)
+            .map_err(|error| format!("psiphon quic seal: {error}"))?;
+        packet.extend_from_slice(tag.as_ref());
+        let sample_len = keys.local.header.sample_len();
+        if packet.len() < head + sample_len {
+            return Err("psiphon quic short packet".to_owned());
+        }
+        let mut sample = [0u8; 16];
+        let sample = sample
+            .get_mut(..sample_len)
+            .ok_or_else(|| "psiphon quic short sample".to_owned())?;
+        sample.copy_from_slice(&packet[head..head + sample_len]);
+        let (first, rest) = packet.split_at_mut(1);
+        let pn_slice = &mut rest[pn_offset - 1..head - 1];
+        keys.local
+            .header
+            .encrypt_in_place(sample, &mut first[0], pn_slice)
+            .map_err(|error| format!("psiphon quic header: {error}"))?;
+        Ok(())
     }
 
     fn receive(&mut self, datagram: &mut [u8], now: Instant) -> Result<(), String> {
@@ -1280,7 +1350,11 @@ impl Engine {
             if packet.len() < pn_offset + 4 + sample_len {
                 return Ok(());
             }
-            let sample = packet[pn_offset + 4..pn_offset + 4 + sample_len].to_vec();
+            let mut sample = [0u8; 16];
+            let sample = sample
+                .get_mut(..sample_len)
+                .ok_or_else(|| "psiphon quic short sample".to_owned())?;
+            sample.copy_from_slice(&packet[pn_offset + 4..pn_offset + 4 + sample_len]);
             let mut first = packet[0];
             let mut pnb = [
                 packet[pn_offset],
@@ -1337,7 +1411,10 @@ impl Engine {
                 .len()
         };
         self.largest[space] = self.largest[space].max(pn);
-        self.ack_seen[space].insert(pn);
+        let seen = &mut self.ack_seen[space];
+        if let Err(at) = seen.binary_search(&pn) {
+            seen.insert(at, pn);
+        }
         self.ack_pending[space] = true;
         self.handle_frames(space, &packet[header_end..header_end + plain_len], now)
     }
@@ -1521,30 +1598,31 @@ impl Engine {
     }
 
     fn ack(&mut self, space: usize, ranges: &[(u64, u64)], now: Instant) {
-        let mut at = 0;
-        let mut acked = Vec::new();
-        while at < self.sent.len() {
-            let packet = &self.sent[at];
+        let len = self.sent.len();
+        let mut write = 0usize;
+        let mut newest: Option<SentPacket> = None;
+        let mut acked_bytes = 0u64;
+        for read in 0..len {
+            let packet = self.sent[read];
             if packet.space == space
                 && ranges
                     .iter()
                     .any(|(low, high)| packet.pn >= *low && packet.pn <= *high)
             {
-                acked.push(self.sent.remove(at));
+                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.size);
+                acked_bytes += packet.size;
+                if newest.is_none_or(|newest| packet.sent_at > newest.sent_at) {
+                    newest = Some(packet);
+                }
             } else {
-                at += 1;
+                self.sent[write] = packet;
+                write += 1;
             }
         }
-        if acked.is_empty() {
+        if write == len {
             return;
         }
-        let mut newest: Option<&SentPacket> = None;
-        for packet in &acked {
-            self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.size);
-            if newest.is_none_or(|newest| packet.sent_at > newest.sent_at) {
-                newest = Some(packet);
-            }
-        }
+        self.sent.truncate(write);
         if let Some(packet) = newest {
             let sample = now.saturating_duration_since(packet.sent_at);
             if let Some(srtt) = self.srtt {
@@ -1556,7 +1634,6 @@ impl Engine {
                 self.rttvar = sample / 2;
             }
         }
-        let acked_bytes: u64 = acked.iter().map(|packet| packet.size).sum();
         let growth = (MSS * acked_bytes / self.cwnd.max(1)).max(MSS);
         self.cwnd = (self.cwnd + growth).min(MAX_CWND);
         self.compact_stream();
@@ -1624,7 +1701,13 @@ impl Engine {
             }
             return Ok(());
         }
-        if offset < self.recv_next {
+        if self.recv_map.is_empty() && offset <= self.recv_next {
+            let skip = usize::try_from(self.recv_next - offset).unwrap_or(usize::MAX);
+            if skip < data.len() {
+                self.received.extend_from_slice(&data[skip..]);
+                self.recv_next = end;
+            }
+        } else if offset < self.recv_next {
             let skip = usize::try_from(self.recv_next - offset).unwrap_or(usize::MAX);
             if skip < data.len() {
                 self.recv_map
@@ -1668,6 +1751,10 @@ impl Engine {
     }
 
     fn pull_received(&mut self, out: &mut Vec<u8>, limit: usize) -> usize {
+        if out.is_empty() && limit >= self.received.len() {
+            std::mem::swap(out, &mut self.received);
+            return out.len();
+        }
         let count = self.received.len().min(limit);
         out.extend_from_slice(&self.received[..count]);
         self.received.drain(..count);
@@ -1802,7 +1889,15 @@ impl Engine {
         } else {
             INITIAL
         };
-        let mut payload = Vec::with_capacity(8);
+        let head = if space == ONE_RTT {
+            1 + self.dcid.len() + 4
+        } else {
+            0
+        };
+        let mut payload = Vec::with_capacity(head + 8);
+        if head > 0 {
+            payload.resize(head, 0);
+        }
         put_varint(&mut payload, 0x1c);
         put_varint(&mut payload, 0);
         put_varint(&mut payload, 0);
@@ -1811,7 +1906,12 @@ impl Engine {
             self.pad_initial(&mut payload, self.next_pn[space]);
         }
         let pn = self.next_pn[space];
-        let (packet, _) = self.seal(space, pn, payload)?;
+        let packet = if space == ONE_RTT {
+            self.seal_short(pn, &mut payload, head)?;
+            payload
+        } else {
+            self.seal(space, pn, &payload)?
+        };
         self.next_pn[space] += 1;
         let _ = now;
         udp.send(&packet)
@@ -2039,34 +2139,37 @@ fn get_varint(buf: &[u8], at: &mut usize) -> Option<u64> {
     Some(value)
 }
 
-fn put_ack(buf: &mut Vec<u8>, seen: &BTreeSet<u64>) {
+fn put_ack(buf: &mut Vec<u8>, seen: &[u64]) {
     let mut iter = seen.iter().rev();
     let Some(&largest) = iter.next() else {
         return;
     };
-    let mut ranges = Vec::new();
+    let mut ranges = [(0u64, 0u64); 32];
+    let mut count = 0usize;
     let mut high = largest;
     let mut low = largest;
     for &pn in iter {
         if pn + 1 == low {
             low = pn;
-        } else if ranges.len() >= 31 {
+        } else if count >= 31 {
             break;
         } else {
-            ranges.push((low, high));
+            ranges[count] = (low, high);
+            count += 1;
             low = pn;
             high = pn;
         }
     }
-    ranges.push((low, high));
+    ranges[count] = (low, high);
+    count += 1;
     buf.push(0x02);
     put_varint(buf, ranges[0].1);
     put_varint(buf, 0);
-    put_varint(buf, (ranges.len() - 1) as u64);
+    put_varint(buf, (count - 1) as u64);
     put_varint(buf, ranges[0].1 - ranges[0].0);
-    for pair in ranges.windows(2) {
-        let (previous, _) = pair[0];
-        let (low, high) = pair[1];
+    for index in 0..count - 1 {
+        let (previous, _) = ranges[index];
+        let (low, high) = ranges[index + 1];
         put_varint(buf, previous.saturating_sub(high).saturating_sub(2));
         put_varint(buf, high - low);
     }
@@ -2094,11 +2197,12 @@ fn long_header_len(initial: bool, dcid_len: usize, scid_len: usize, pn_len: usiz
 #[cfg(test)]
 mod tests {
     use super::{
-        get_varint, randomize_cipher_suites, randomize_kx_groups, transport_params, ObfuscatedUdp,
-        PacketIo, QuicNoise, MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD,
+        get_varint, randomize_cipher_suites, randomize_kx_groups, transport_params, Engine,
+        ObfuscatedUdp, PacketIo, QuicNoise, SentPacket, INITIAL_CWND, MAX_PACKET_SIZE,
+        OBFUSCATION_OVERHEAD, ONE_RTT,
     };
     use std::net::UdpSocket;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn quic_noise_presets_match_the_reference() {
@@ -2224,5 +2328,95 @@ mod tests {
         assert!(sender
             .send(&vec![0u8; MAX_PACKET_SIZE - OBFUSCATION_OVERHEAD + 1])
             .is_err());
+    }
+
+    #[test]
+    fn in_order_stream_data_lands_without_a_staging_allocation() {
+        let mut engine = Engine::new("test", false).expect("engine");
+        engine.received.reserve(4096);
+        engine.feed_stream(0, &[7u8; 1200], false).expect("first");
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            engine
+                .feed_stream(1200, &[9u8; 1200], false)
+                .expect("second");
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "the in-order path appends into the receive window"
+        );
+        assert_eq!(engine.recv_next, 2400);
+        assert_eq!(&engine.received[1200..], &[9u8; 1200][..]);
+    }
+
+    #[test]
+    fn a_gap_is_filled_by_the_packet_before_it() {
+        let mut engine = Engine::new("test", false).expect("engine");
+        engine.feed_stream(4, b"efgh", false).expect("tail");
+        engine.feed_stream(0, b"abcd", false).expect("head");
+        assert_eq!(engine.received.as_slice(), b"abcdefgh");
+        assert_eq!(engine.recv_next, 8);
+    }
+
+    #[test]
+    fn pull_received_hands_the_buffer_over_without_copying() {
+        let mut engine = Engine::new("test", false).expect("engine");
+        engine.feed_stream(0, b"hello", false).expect("data");
+        let mut out = Vec::new();
+        let (count, counts) =
+            ferrox_core::alloc_count::measure(|| engine.pull_received(&mut out, 8));
+        assert_eq!(count, 5);
+        assert_eq!(out.as_slice(), b"hello");
+        assert_eq!(counts.allocs, 0, "the window is swapped, not copied");
+        assert!(engine.received.is_empty());
+    }
+
+    #[test]
+    fn expire_retransmits_the_old_prefix_and_drops_it() {
+        let mut engine = Engine::new("test", false).expect("engine");
+        engine.stream_sent = 400;
+        engine.stream_data = vec![0u8; 400];
+        engine.bytes_in_flight = 400;
+        let base = Instant::now();
+        engine.sent = (0..4)
+            .map(|index| SentPacket {
+                pn: index,
+                space: ONE_RTT,
+                sent_at: base + Duration::from_millis(index * 10),
+                size: 100,
+                crypto: None,
+                stream: Some((index * 100, 100)),
+                window: false,
+            })
+            .collect();
+        engine.expire(base + Duration::from_millis(1000));
+        assert!(engine.sent.is_empty());
+        assert_eq!(engine.bytes_in_flight, 0);
+        assert_eq!(
+            engine.retx.iter().copied().collect::<Vec<_>>(),
+            vec![(0, 100), (100, 100), (200, 100), (300, 100)]
+        );
+        assert_eq!(engine.cwnd, INITIAL_CWND);
+    }
+
+    #[test]
+    fn ack_keeps_unacked_packets_in_order() {
+        let mut engine = Engine::new("test", false).expect("engine");
+        engine.bytes_in_flight = 500;
+        let base = Instant::now();
+        engine.sent = (0..5)
+            .map(|index| SentPacket {
+                pn: index,
+                space: ONE_RTT,
+                sent_at: base + Duration::from_millis(index * 10),
+                size: 100,
+                crypto: None,
+                stream: None,
+                window: false,
+            })
+            .collect();
+        engine.ack(ONE_RTT, &[(1, 1), (3, 3)], base + Duration::from_millis(50));
+        let left: Vec<u64> = engine.sent.iter().map(|packet| packet.pn).collect();
+        assert_eq!(left, vec![0, 2, 4]);
+        assert_eq!(engine.bytes_in_flight, 300);
     }
 }

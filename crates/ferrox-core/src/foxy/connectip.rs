@@ -593,7 +593,7 @@ fn word_sum(bytes: &[u8]) -> u32 {
     sum as u32
 }
 
-/// The words of a run of whole blocks, as an exact integer: the vector kernel where AVX2 answers, the lane walk everywhere else.
+/// The words of a run of whole blocks, as an exact integer: the vector kernel where AVX2 answers, the baseline vector width everywhere else.
 fn block_sum(bytes: &[u8]) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -601,7 +601,15 @@ fn block_sum(bytes: &[u8]) -> u64 {
             // SAFETY: the probe above is the guard, and the kernel reads only whole blocks of a run that is a whole number of them.
             return unsafe { avx2_block_sum(bytes) };
         }
+        // SAFETY: SSE2 is part of the x86_64 baseline, and the kernel reads only whole sixteen-byte lanes of a run that is a whole number of them.
+        return unsafe { sse2_block_sum(bytes) };
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the aarch64 baseline, and the kernel reads only whole sixteen-byte lanes of a run that is a whole number of them.
+        return unsafe { neon_block_sum(bytes) };
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     lane_sum(bytes)
 }
 
@@ -631,6 +639,52 @@ unsafe fn avx2_block_sum(bytes: &[u8]) -> u64 {
     let sum: u64 = every_lanes.iter().sum();
     let high: u64 = odd_lanes.iter().sum();
     sum * 256 - high * 255
+}
+
+/// The same two byte sums in the x86_64 baseline: `psadbw` on a sixteen-byte lane, two lanes accumulated, so a block costs the same one load, shift, two sums and two adds as the wide kernel over half the span.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn sse2_block_sum(bytes: &[u8]) -> u64 {
+    use core::arch::x86_64::{
+        __m128i, _mm_add_epi64, _mm_loadu_si128, _mm_sad_epu8, _mm_setzero_si128, _mm_srli_epi16,
+        _mm_storeu_si128,
+    };
+    let zero = _mm_setzero_si128();
+    let (mut every, mut odd) = (_mm_setzero_si128(), _mm_setzero_si128());
+    let mut at = 0usize;
+    while at + 16 <= bytes.len() {
+        let block: __m128i = unsafe { _mm_loadu_si128(bytes.as_ptr().add(at).cast()) };
+        every = _mm_add_epi64(every, _mm_sad_epu8(block, zero));
+        let high = _mm_srli_epi16(block, 8);
+        odd = _mm_add_epi64(odd, _mm_sad_epu8(high, zero));
+        at += 16;
+    }
+    let mut every_lanes = [0u64; 2];
+    let mut odd_lanes = [0u64; 2];
+    unsafe { _mm_storeu_si128(every_lanes.as_mut_ptr().cast(), every) };
+    unsafe { _mm_storeu_si128(odd_lanes.as_mut_ptr().cast(), odd) };
+    let sum: u64 = every_lanes.iter().sum();
+    let high: u64 = odd_lanes.iter().sum();
+    sum * 256 - high * 255
+}
+
+/// The same two byte sums in NEON, which is mandatory on aarch64: `vpadal` folds the sixteen octets to two 64-bit lanes in three widening adds, and the shift moves each odd octet into its own lane for the second sum.
+#[cfg(target_arch = "aarch64")]
+unsafe fn neon_block_sum(bytes: &[u8]) -> u64 {
+    use core::arch::aarch64::{
+        uint64x2_t, vaddvq_u64, vdupq_n_u64, vld1q_u8, vpadalq_u32, vpaddlq_u16, vpaddlq_u8,
+        vreinterpretq_u8_u16, vshrq_n_u16,
+    };
+    let (mut every, mut odd): (uint64x2_t, uint64x2_t) = (vdupq_n_u64(0), vdupq_n_u64(0));
+    let mut at = 0usize;
+    while at + 16 <= bytes.len() {
+        let block = unsafe { vld1q_u8(bytes.as_ptr().add(at)) };
+        every = vpadalq_u32(every, vpaddlq_u16(vpaddlq_u8(block)));
+        let high = vreinterpretq_u8_u16(vshrq_n_u16::<8>(block));
+        odd = vpadalq_u32(odd, vpaddlq_u16(vpaddlq_u8(high)));
+        at += 16;
+    }
+    vaddvq_u64(every) * 256 - vaddvq_u64(odd) * 255
 }
 
 /// The same sum eight octets a lane, which answers both the run past the last whole block and the whole run where no kernel does: an eight-octet lane folded the way `2^32 = 1 mod 0xffff` allows, then the last three, two or one octets as words.
@@ -1470,6 +1524,19 @@ mod tests {
                     assert_eq!(kernel, by_words(run), "{blocks} blocks, as words");
                 }
             }
+            for blocks in 0..=bytes.len() / BLOCK {
+                let run = &bytes[..blocks * BLOCK];
+                // SAFETY: SSE2 is the x86_64 baseline.
+                let kernel = unsafe { sse2_block_sum(run) };
+                assert_eq!(kernel, by_words(run), "{blocks} blocks, as sse2 words");
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        for blocks in 0..=bytes.len() / BLOCK {
+            let run = &bytes[..blocks * BLOCK];
+            // SAFETY: NEON is the aarch64 baseline.
+            let kernel = unsafe { neon_block_sum(run) };
+            assert_eq!(kernel, by_words(run), "{blocks} blocks, as neon words");
         }
     }
 

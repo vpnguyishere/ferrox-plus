@@ -659,7 +659,7 @@ fn drive(
                     backlog.push_back(Ok(data));
                 }
             }
-            Ok(Some(data)) => match unframe(&data, &mut peer_padding_done) {
+            Ok(Some(data)) => match unframe(data, &mut peer_padding_done) {
                 Ok(Some(payload)) if !payload.is_empty() => backlog.push_back(Ok(payload)),
                 Ok(_) => {}
                 Err(error) => backlog.push_back(Err(error)),
@@ -706,23 +706,31 @@ fn take_varint(data: &[u8], at: &mut usize) -> Option<i64> {
     None
 }
 
-/// Skip the peer's padding header and bytes, or return the message payload.
-fn unframe(data: &[u8], done: &mut bool) -> Result<Option<Vec<u8>>, String> {
+/// Skip the peer's padding header and bytes, or return the message payload in the buffer it arrived in.
+fn unframe(mut data: Vec<u8>, done: &mut bool) -> Result<Option<Vec<u8>>, String> {
     if *done {
-        return Ok(Some(data.to_vec()));
+        return Ok(Some(data));
     }
     let mut at = 0;
-    let padding = take_varint(data, &mut at)
+    let padding = take_varint(&data, &mut at)
         .ok_or_else(|| "psiphon webrtc: invalid padding header".to_owned())?;
     if padding < 0 {
         *done = true;
-        return Ok((at < data.len()).then(|| data[at..].to_vec()));
+        if at >= data.len() {
+            return Ok(None);
+        }
+        data.drain(..at);
+        return Ok(Some(data));
     }
     let skip = at
         .checked_add(usize::try_from(padding).unwrap_or(usize::MAX))
         .filter(|skip| *skip <= data.len())
         .ok_or_else(|| "psiphon webrtc: invalid padding length".to_owned())?;
-    Ok((skip < data.len()).then(|| data[skip..].to_vec()))
+    if skip >= data.len() {
+        return Ok(None);
+    }
+    data.drain(..skip);
+    Ok(Some(data))
 }
 
 /// Lock, recovering the data after a panic.
@@ -1048,15 +1056,31 @@ mod tests {
         let mut header = Vec::new();
         put_varint(&mut header, -1);
         header.extend_from_slice(b"hello");
-        assert_eq!(unframe(&header, &mut done), Ok(Some(b"hello".to_vec())));
+        assert_eq!(unframe(header, &mut done), Ok(Some(b"hello".to_vec())));
         assert!(done);
 
         let mut done = false;
         let mut decoy = Vec::new();
         put_varint(&mut decoy, 3);
         decoy.extend_from_slice(b"xxx");
-        assert_eq!(unframe(&decoy, &mut done), Ok(None));
+        assert_eq!(unframe(decoy, &mut done), Ok(None));
         assert!(!done);
+    }
+
+    #[test]
+    fn an_unframed_payload_keeps_the_message_allocation() {
+        let mut done = false;
+        let mut data = Vec::new();
+        put_varint(&mut data, 2);
+        data.extend_from_slice(b"xxpayload");
+        let base = data.as_ptr();
+        let capacity = data.capacity();
+        let (payload, counts) = ferrox_core::alloc_count::measure(|| unframe(data, &mut done));
+        let payload = payload.expect("payload").expect("a kept message");
+        assert_eq!(payload.as_slice(), b"payload");
+        assert_eq!(counts.allocs, 0, "the header is skipped in place");
+        assert_eq!(payload.as_ptr(), base, "the message buffer does not move");
+        assert_eq!(payload.capacity(), capacity, "the capacity does not grow");
     }
 
     #[test]
