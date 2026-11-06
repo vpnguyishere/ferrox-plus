@@ -875,6 +875,16 @@ pub(crate) fn write_frame(
     pad: &mut PadSource,
 ) -> bool {
     staging.clear();
+    write_frame_into(stream, send, plain, staging, pad)
+}
+
+fn write_frame_into(
+    stream: &mut dyn Write,
+    send: &mut Flow,
+    plain: &[u8],
+    staging: &mut Vec<u8>,
+    pad: &mut PadSource,
+) -> bool {
     if !stage_frame(send, plain, staging, pad) {
         return false;
     }
@@ -932,6 +942,16 @@ fn stage_frames(
     pad: &mut PadSource,
 ) -> bool {
     staging.clear();
+    stage_frames_into(stream, send, plain, staging, pad)
+}
+
+fn stage_frames_into(
+    stream: &mut dyn Write,
+    send: &mut Flow,
+    plain: &[u8],
+    staging: &mut Vec<u8>,
+    pad: &mut PadSource,
+) -> bool {
     if plain.is_empty() {
         if !stage_frame(send, plain, staging, pad) {
             return false;
@@ -1649,7 +1669,7 @@ where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    pump_relay_carried_with_finish(plain, reader, writer, close, send, recv, pending, None)
+    pump_relay_carried_with_finish(plain, reader, writer, close, send, recv, pending, None, None)
 }
 
 /// The carried pump with the carrier's own write-side finish: a clean target EOF ends the request, and a markerless one under `NoTerminationSignal` leaves the carrier FIN as the only end the peer sees.
@@ -1662,6 +1682,7 @@ pub(crate) fn pump_relay_carried_with_finish<R, W>(
     send: Flow,
     recv: Flow,
     pending: Option<PendingResponse>,
+    head: Option<Vec<u8>>,
     finish: Option<Close>,
 ) -> Option<std::sync::Arc<crate::proxy::RelayFinish>>
 where
@@ -1678,6 +1699,7 @@ where
     let mut pad = PadSource::fresh();
     let mut staging = Vec::with_capacity(FRAMES_PER_WRITE * (MAX_WIRE + HEADER_LEN));
     let mut buf = relay_window();
+    let mut head = head;
     let forward_flow = std::sync::Arc::clone(&flow);
     let forward_close = std::sync::Arc::clone(close);
     crate::proxy::lane_pool::submit(
@@ -1691,6 +1713,7 @@ where
                 &mut writer,
                 &mut send,
                 &mut staging,
+                &mut head,
                 pad,
                 &forward_close,
                 &forward_flow,
@@ -1755,6 +1778,7 @@ fn forward_step(
     writer: &mut dyn Write,
     send: &mut Flow,
     staging: &mut Vec<u8>,
+    head: &mut Option<Vec<u8>>,
     pad: &mut PadSource,
     close: &Close,
     flow: &crate::proxy::RelayFinish,
@@ -1762,7 +1786,15 @@ fn forward_step(
     match plain_read.read(buf) {
         Ok(0) => {
             // A clean end tells the peer this direction is done; the other direction keeps relaying.
-            let clean = !send.end_marker || write_frame(writer, send, &[], staging, pad);
+            staging.clear();
+            if let Some(prefix) = head.take() {
+                staging.extend_from_slice(&prefix);
+            }
+            let clean = if send.end_marker {
+                write_frame_into(writer, send, &[], staging, pad)
+            } else {
+                staging.is_empty() || write_frames(writer, staging)
+            };
             if !clean {
                 close();
             }
@@ -1777,7 +1809,15 @@ fn forward_step(
             let mut ok = true;
             while at < read {
                 let end = (at + READ_PLAIN).min(read);
-                if !stage_frames(writer, send, &buf[at..end], staging, pad) {
+                let staged = match head.take() {
+                    Some(prefix) => {
+                        staging.clear();
+                        staging.extend_from_slice(&prefix);
+                        stage_frames_into(writer, send, &buf[at..end], staging, pad)
+                    }
+                    None => stage_frames(writer, send, &buf[at..end], staging, pad),
+                };
+                if !staged {
                     ok = false;
                     break;
                 }
@@ -1908,17 +1948,47 @@ pub(crate) fn serve_decoded<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    serve_decoded_with_finish(reader, writer, close, decoded, freedom, None);
+    serve_decoded_impl(reader, writer, close, decoded, freedom, None, false);
+}
+
+/// The gRPC carrier reads a hunk shorter than 2 KiB only at stream end, so the response header rides
+/// the first body write instead of leaving alone in a hunk the peer's reader would park on.
+pub(crate) fn serve_decoded_deferred<R, W>(
+    reader: R,
+    writer: W,
+    close: &Close,
+    decoded: Option<Accepted>,
+    freedom: bool,
+) where
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: Write + Send + 'static,
+{
+    serve_decoded_impl(reader, writer, close, decoded, freedom, None, true);
 }
 
 /// [`serve_decoded`] with the carrier's write-side finish for the clean EOF `NoTerminationSignal` leaves markerless.
 pub(crate) fn serve_decoded_with_finish<R, W>(
+    reader: R,
+    writer: W,
+    close: &Close,
+    decoded: Option<Accepted>,
+    freedom: bool,
+    finish: Option<Close>,
+) where
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: Write + Send + 'static,
+{
+    serve_decoded_impl(reader, writer, close, decoded, freedom, finish, false);
+}
+
+fn serve_decoded_impl<R, W>(
     reader: R,
     mut writer: W,
     close: &Close,
     decoded: Option<Accepted>,
     freedom: bool,
     finish: Option<Close>,
+    defer_prefix: bool,
 ) where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
@@ -1947,12 +2017,17 @@ pub(crate) fn serve_decoded_with_finish<R, W>(
                 return;
             };
             let uplink = uplink.with_meter(user.reversed());
-            if !write_prefix(&mut writer, &prefix) {
-                close();
-                return;
-            }
+            let head = if defer_prefix {
+                Some(prefix)
+            } else {
+                if !write_prefix(&mut writer, &prefix) {
+                    close();
+                    return;
+                }
+                None
+            };
             pump_relay_carried_with_finish(
-                &uplink, reader, writer, close, send, recv, None, finish,
+                &uplink, reader, writer, close, send, recv, None, head, finish,
             );
         }
         2 => serve_udp_carried(reader, writer, close, &target, &prefix, send, recv, &user),
@@ -2054,7 +2129,7 @@ pub(crate) fn serve_grpc_with(
     let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
-    serve_decoded(reader, writer, &close, decoded, freedom);
+    serve_decoded_deferred(reader, writer, &close, decoded, freedom);
 }
 
 pub(crate) fn serve_grpc_split<R, W>(
@@ -2079,7 +2154,7 @@ pub(crate) fn serve_grpc_split<R, W>(
         closer.close();
         shutdown();
     });
-    serve_decoded(reader, writer, &close, decoded, freedom);
+    serve_decoded_deferred(reader, writer, &close, decoded, freedom);
 }
 
 pub(crate) fn serve_xhttp(stream: Connection, path: &str, users: &Users, freedom: bool) {
@@ -2814,12 +2889,6 @@ mod tests {
         .expect("request");
         assert!(writer.send(&request));
         let (response_key, response_iv) = response_material(&data_iv, &data_key);
-        assert!(read_response(
-            &mut reader,
-            &response_key,
-            &response_iv,
-            auth
-        ));
         let options = OPT_STREAM | OPT_MASK | OPT_PAD;
         let mut send =
             Flow::fresh(Cipher::Chacha, &data_key, &data_iv, options, &data_iv).expect("sends");
@@ -2840,6 +2909,13 @@ mod tests {
             b"ping",
             &mut staging,
             &mut pad
+        ));
+        // The header rides the first body hunk, so the upload opens the answer.
+        assert!(read_response(
+            &mut reader,
+            &response_key,
+            &response_iv,
+            auth
         ));
         let back = read_frame(&mut reader, &mut recv, &mut scratch).expect("reads");
         assert_eq!(back, b"ping");
@@ -4954,6 +5030,7 @@ mod tests {
             let mut pad = PadSource::fresh().expect("entropy");
             let mut writer = Collected(std::sync::Arc::clone(&out));
             let mut done = false;
+            let mut head = None;
             for _ in 0..4 {
                 let (next, _) = forward_step(
                     &mut plain,
@@ -4961,6 +5038,7 @@ mod tests {
                     &mut writer,
                     &mut send,
                     &mut staging,
+                    &mut head,
                     &mut pad,
                     &close,
                     &flow,
