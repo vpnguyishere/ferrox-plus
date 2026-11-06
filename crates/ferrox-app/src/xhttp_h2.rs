@@ -964,15 +964,6 @@ impl H2Conn {
             return None;
         };
         if *conn < total || *window < total {
-            if stream > 1 {
-                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
-                    eprintln!(
-                        "PROBE wide str={stream} total={total} conn={} win={}",
-                        *conn, *window
-                    );
-                }
-            }
             return None;
         }
         *conn -= total;

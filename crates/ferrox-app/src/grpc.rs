@@ -2283,10 +2283,6 @@ impl crate::xhttp_h2::H2Service for VmGrpcService {
             conn.reset(sid);
             return false;
         }
-        eprintln!(
-            "PROBE open sid={sid} es={end_stream} multi={:?}",
-            gate.multi
-        );
         let (reader, writer) = mux_stream(conn, body, out, sid, method);
         let users = Arc::clone(&self.users);
         let freedom = self.freedom;
