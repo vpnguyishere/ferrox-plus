@@ -1811,9 +1811,9 @@ fn forward_step(
             (Next::Done, clean)
         }
         Ok(read) => {
-            static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                eprintln!("PROBE fwd first read={read}");
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 300 {
+                eprintln!("PROBE fwd read={read}");
             }
             let traced = crate::proxy::echo_trace_on();
             if traced {
