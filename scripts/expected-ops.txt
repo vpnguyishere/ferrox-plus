@@ -211,12 +211,9 @@ grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 g
 # Re-blessed 1220 after the TLS 1.2 carrier and psiphon config-gap landings
 # moved this frame's thin-LTO layout again; sniff.rs, the warm probe and the
 # bytes are unchanged.
-# Re-blessed 1223 by psiphon-varint: the one-load varint and its two probes in
-# the same app binary move this frame's thin-LTO layout by three; sniff.rs, the
-# warm probe and the bytes are unchanged.
 # The wireguard routing test runs both lookups over 512 peers: the peer-by-peer
 # scan and the prefix table for the same destination. Both rows come from one
 # test and one binary, so their difference is the lookup and not the build.
 ferrox_app::wg::tests::route_scan_once 68609 wg::tests::a_prefix_table_picks_the_peer_the_scan_picks
 ferrox_app::wg::tests::route_table_once 585 wg::tests::a_prefix_table_picks_the_peer_the_scan_picks
-ferrox_app::sniff::Sniffing::inspect 1223 sniff::tests::a_warm_probe_costs_the_documented_instructions
+ferrox_app::sniff::Sniffing::inspect 1220 sniff::tests::a_warm_probe_costs_the_documented_instructions
