@@ -2301,6 +2301,12 @@ impl Tail {
         if wrote < total {
             self.keep(parts, wrote);
         }
+        {
+            static ONCE: AtomicBool = AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::SeqCst) {
+                eprintln!("DBG tail total={total} wrote={wrote}");
+            }
+        }
         Accepted::All
     }
 

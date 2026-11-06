@@ -123,13 +123,9 @@ jobs:
         shell: bash
         env:
           FERROX_UPSTREAM_HANDOFF: "1"
-        run: >
-          ./scripts/run-benchmark-matrix.sh
-          --tier "${{ inputs.tier }}"
-          --out target/benchmark-matrix
-          --only "${{ matrix.cell }}"
-          --no-build
-          ${{ inputs.flags }}
+        run: |
+          ( sleep 35; for p in $(pgrep -f 'xray-core-run1' || true); do kill -QUIT "$p" || true; done ) &
+          ./scripts/run-benchmark-matrix.sh --tier "${{ inputs.tier }}" --out target/benchmark-matrix --only "${{ matrix.cell }}" --no-build ${{ inputs.flags }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
