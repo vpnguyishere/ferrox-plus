@@ -1700,6 +1700,12 @@ where
     let mut staging = Vec::with_capacity(FRAMES_PER_WRITE * (MAX_WIRE + HEADER_LEN));
     let mut buf = relay_window();
     let mut head = head;
+    {
+        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("DBG pump head={:?}", head.as_ref().map(Vec::len));
+        }
+    }
     let forward_flow = std::sync::Arc::clone(&flow);
     let forward_close = std::sync::Arc::clone(close);
     crate::proxy::lane_pool::submit(
@@ -1813,7 +1819,19 @@ fn forward_step(
                     Some(prefix) => {
                         staging.clear();
                         staging.extend_from_slice(&prefix);
-                        stage_frames_into(writer, send, &buf[at..end], staging, pad)
+                        let primed = staging.len();
+                        let ok = stage_frames_into(writer, send, &buf[at..end], staging, pad);
+                        static ONCE: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            eprintln!(
+                                "DBG primed head={} plain={} staging={} ok={ok}",
+                                prefix.len(),
+                                end - at,
+                                primed
+                            );
+                        }
+                        ok
                     }
                     None => stage_frames(writer, send, &buf[at..end], staging, pad),
                 };
@@ -2010,6 +2028,15 @@ fn serve_decoded_impl<R, W>(
         return;
     }
     crate::accesslog::record_current(&target);
+    {
+        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            eprintln!(
+                "DBG serve cmd={cmd} defer={defer_prefix} prefix={}",
+                prefix.len()
+            );
+        }
+    }
     match cmd {
         1 => {
             let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {

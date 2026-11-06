@@ -1003,6 +1003,20 @@ impl<'a> Gather<'a> {
             Ok(mut stream) => stream.offer_slices(&parts[..pieces]),
             Err(_) => Accepted::Lost,
         };
+        {
+            static ONCE: AtomicBool = AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::SeqCst) {
+                let how = match &took {
+                    Accepted::All => "all",
+                    Accepted::Full => "full",
+                    Accepted::Lost => "lost",
+                };
+                eprintln!(
+                    "DBG flush used={} credit={} took={how}",
+                    self.used, self.credit
+                );
+            }
+        }
         match took {
             Accepted::All => {
                 self.used = 0;
@@ -1070,6 +1084,16 @@ impl GrpcWriter {
         let payload = message_payload(max.saturating_sub(1)).max(1);
         if self.multi {
             return self.send_multi(data, payload);
+        }
+        {
+            static ONCE: AtomicBool = AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::SeqCst) {
+                eprintln!(
+                    "DBG send len={} multi={} max={max} payload={payload}",
+                    data.len(),
+                    self.multi
+                );
+            }
         }
         let mut batch = Gather::new();
         for piece in data.chunks(payload) {
