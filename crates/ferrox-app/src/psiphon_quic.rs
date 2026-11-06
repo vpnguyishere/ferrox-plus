@@ -2143,7 +2143,7 @@ fn get_varint(buf: &[u8], at: &mut usize) -> Option<u64> {
     if end > buf.len() {
         return None;
     }
-    // The four widths are one, two, four and eight octets, so eight bytes from the varint's start hold the whole field whenever they are in the buffer. One big-endian load, a shift past the octets this width does not use, and a mask past its two prefix bits give the value; the eight-octet width shifts and masks by zero over the same expression.
+    // The four widths are one, two, four and eight octets, so eight bytes from the varint's start hold the whole field whenever they are in the buffer. One big-endian load, a shift past the octets this width does not use, and a mask past its two prefix bits give the value; the eight-octet width takes a zero shift through the same expression and masks only the prefix.
     if let Some(word) = buf
         .get(*at..)
         .and_then(|rest| rest.get(..8))
