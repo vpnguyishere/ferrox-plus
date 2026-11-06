@@ -1724,6 +1724,13 @@ where
                 &forward_close,
                 &forward_flow,
             );
+            {
+                static N: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 60 {
+                    eprintln!("DBG t={} fwd {:?}", crate::grpc::dbg_ms(), next);
+                }
+            }
             if next == Next::Idle {
                 crate::proxy::note_wait_idle(REPLY_IDLE);
                 crate::proxy::note_wait_finish(&forward_flow);
@@ -1764,6 +1771,13 @@ where
                 &backward_flow,
                 &mut first,
             );
+            {
+                static N: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 60 {
+                    eprintln!("DBG t={} bwd {:?}", crate::grpc::dbg_ms(), next);
+                }
+            }
             if next == Next::Idle {
                 crate::proxy::note_wait_idle(REPLY_IDLE);
                 crate::proxy::note_wait_finish(&backward_flow);

@@ -96,6 +96,11 @@ impl std::fmt::Debug for Shared {
     }
 }
 
+pub(crate) fn dbg_ms() -> u128 {
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_millis()
+}
+
 /// Take `need` from both windows, waiting for the peer's credit only when `wait` says to: a gathered
 /// batch flushes before it parks, since a peer grants for bytes it has seen and not for ones still
 /// sitting in the batch.
@@ -128,8 +133,8 @@ fn take_window_until(shared: &Shared, need: u64, deadline: Option<Instant>) -> b
             let n = N.fetch_add(1, Ordering::SeqCst);
             if n < 40 {
                 eprintln!(
-                    "DBG wait need={need} conn={} stream={} left={:?}",
-                    send.conn, send.stream, left
+                    "DBG t={} wait need={need} conn={} stream={} left={:?}",
+                    dbg_ms(), send.conn, send.stream, left
                 );
             }
         }
@@ -143,7 +148,8 @@ fn take_window_until(shared: &Shared, need: u64, deadline: Option<Instant>) -> b
             let n = N.fetch_add(1, Ordering::SeqCst);
             if n < 40 {
                 eprintln!(
-                    "DBG wake conn={} stream={} timed_out={}",
+                    "DBG t={} wake conn={} stream={} timed_out={}",
+                    dbg_ms(),
                     send.conn,
                     send.stream,
                     waited.timed_out()
@@ -355,6 +361,12 @@ impl<R: Read> GrpcReader<R> {
             return;
         }
         if flags & F_ACK == 0 {
+            {
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::SeqCst) < 20 {
+                    eprintln!("DBG t={} ping ack", dbg_ms());
+                }
+            }
             self.emit(T_PING, F_ACK, 0, body);
         } else {
             let seq = u64::from_be_bytes(body.try_into().unwrap());
@@ -887,8 +899,8 @@ impl<R: Read> GrpcReader<R> {
             let n = N.fetch_add(1, Ordering::SeqCst);
             if n < 40 {
                 eprintln!(
-                    "DBG win id={id} inc={inc} conn={} stream={}",
-                    send.conn, send.stream
+                    "DBG t={} win id={id} inc={inc} conn={} stream={}",
+                    dbg_ms(), send.conn, send.stream
                 );
             }
         }
