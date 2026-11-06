@@ -1811,6 +1811,10 @@ fn forward_step(
             (Next::Done, clean)
         }
         Ok(read) => {
+            static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("PROBE fwd first read={read}");
+            }
             let traced = crate::proxy::echo_trace_on();
             if traced {
                 crate::proxy::echo_trace("relay fwd first read");
@@ -2031,9 +2035,11 @@ fn serve_decoded_impl<R, W>(
     match cmd {
         1 => {
             let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
+                eprintln!("PROBE dial fail target={target}");
                 close();
                 return;
             };
+            eprintln!("PROBE dial ok target={target}");
             let uplink = uplink.with_meter(user.reversed());
             let head = if defer_prefix {
                 Some(prefix)
@@ -2195,7 +2201,13 @@ pub(crate) fn serve_grpc_muxed(
     opened: &std::sync::atomic::AtomicBool,
 ) {
     reader.arm_mux_poll();
+    eprintln!("PROBE muxed start");
     let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
+    eprintln!(
+        "PROBE muxed decoded={} cmd={:?}",
+        decoded.is_some(),
+        decoded.as_ref().map(|a| a.cmd)
+    );
     if let Some(Accepted { cmd, .. }) = &decoded {
         if freedom && matches!(*cmd, 1 | 2) {
             opened.store(true, std::sync::atomic::Ordering::Relaxed);
