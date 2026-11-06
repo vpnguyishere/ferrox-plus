@@ -1971,7 +1971,6 @@ pub(crate) fn serve_decoded<R, W>(
 
 /// The gRPC carrier reads a hunk shorter than 2 KiB only at stream end, so the response header rides
 /// the first body write instead of leaving alone in a hunk the peer's reader would park on.
-#[cfg(test)]
 pub(crate) fn serve_decoded_deferred<R, W>(
     reader: R,
     writer: W,
@@ -2185,8 +2184,9 @@ pub(crate) fn serve_grpc_muxed_with(
     );
 }
 
-/// One gRPC stream of a shared connection: the VMess header names the target, the response prefix
-/// rides the writer, and the demux pays the windows, so the flow parks only on its own body.
+/// One gRPC stream of a shared connection: the demux has already answered the HTTP/2 head, so this
+/// decodes the VMess header and runs the same codec and relay the single-stream carrier does, on
+/// its own reader and writer pair. Closing here sends the stream's end, never the connection's.
 pub(crate) fn serve_grpc_muxed(
     mut reader: crate::grpc::GrpcReader<crate::grpc::BodyFrames>,
     writer: crate::grpc::GrpcWriter,
@@ -2195,55 +2195,15 @@ pub(crate) fn serve_grpc_muxed(
     opened: &std::sync::atomic::AtomicBool,
 ) {
     reader.arm_mux_poll();
-    let Some(Accepted {
-        target,
-        send,
-        recv,
-        prefix,
-        cmd,
-        user,
-    }) = under_handshake(&mut reader, |read| accept_request(read, users))
-    else {
-        reader.abort();
-        return;
-    };
-    if !freedom || !matches!(cmd, 1 | 2) {
-        reader.abort();
-        return;
-    }
-    opened.store(true, std::sync::atomic::Ordering::Relaxed);
-    crate::accesslog::record_current(&target);
-    match cmd {
-        1 => {
-            let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
-                writer.close();
-                return;
-            };
-            let uplink = uplink.with_meter(user.reversed());
-            if !writer.send(&prefix) {
-                reader.abort();
-                return;
-            }
-            let reset = reader.reset_handle();
-            if crate::proxy::relay_sink_drained_queued(
-                reader,
-                &writer,
-                &uplink,
-                crate::grpc::mark_reader_dead,
-                |reader| crate::grpc::request_ended(reader),
-            )
-            .is_none()
-            {
-                reset();
-            }
+    let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
+    if let Some(Accepted { cmd, .. }) = &decoded {
+        if freedom && matches!(*cmd, 1 | 2) {
+            opened.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        2 => {
-            let closer = writer.clone();
-            let close: Close = std::sync::Arc::new(move || closer.close());
-            serve_udp_carried(reader, writer, &close, &target, &prefix, send, recv, &user);
-        }
-        _ => {}
     }
+    let closer = writer.clone();
+    let close: Close = std::sync::Arc::new(move || closer.close());
+    serve_decoded_deferred(reader, writer, &close, decoded, freedom);
 }
 
 pub(crate) fn serve_xhttp(stream: Connection, path: &str, users: &Users, freedom: bool) {
