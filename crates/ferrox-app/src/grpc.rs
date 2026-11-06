@@ -2303,7 +2303,7 @@ impl Tail {
         }
         {
             static ONCE: AtomicBool = AtomicBool::new(false);
-            if !ONCE.swap(true, Ordering::SeqCst) {
+            if total > 4096 && !ONCE.swap(true, Ordering::SeqCst) {
                 eprintln!("DBG tail total={total} wrote={wrote}");
             }
         }
