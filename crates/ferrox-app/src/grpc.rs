@@ -10,7 +10,7 @@ use crate::proxy::{Accepted, FrameWrite, Settle};
 use crate::h2::{
     block_encode, frame_head, write_frame, Decoder, E_REFUSED, FRAME_CAP, F_ACK, F_END,
     F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_CONCURRENT, S_MAX_FRAME, S_WINDOW,
-    T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
+    T_CONT, T_DATA, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
 };
 
 const MSG_CAP: usize = 16 * 1024 * 1024;
@@ -2513,10 +2513,6 @@ pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
         return None;
     }
     reader.set_handshake_budget(None);
-    // One stream per connection: GOAWAY tells the peer to open its next flow elsewhere.
-    let mut last = [0u8; 8];
-    last[..4].copy_from_slice(&reader.stream.to_be_bytes());
-    let _ = reader.emit(T_GOAWAY, 0, 0, &last);
     let writer = GrpcWriter {
         shared,
         stream: reader.stream,
@@ -4598,9 +4594,11 @@ mod tests {
     }
 
     /// The witness that the peer is asked for one stream per connection: its next flow opens a
-    /// fresh connection instead of hanging on this one.
+    /// fresh connection instead of hanging on this one, and a body sent after the headers still has
+    /// a stream to land on.
     #[test]
-    fn an_accepted_connection_asks_for_one_stream_at_a_time() {
+    fn an_accepted_connection_advertises_one_stream_at_a_time() {
+        use crate::h2::T_GOAWAY;
         let served = Arc::new(Mutex::new(Vec::new()));
         let mut wire = MAGIC.to_vec();
         wire.extend_from_slice(&frame(
@@ -4628,9 +4626,9 @@ mod tests {
         let mut last = [0u8; 8];
         last[..4].copy_from_slice(&1u32.to_be_bytes());
         assert!(
-            text.windows(17)
+            !text.windows(17)
                 .any(|part| part == frame(T_GOAWAY, 0, 0, &last)),
-            "the first stream is the last this connection will take"
+            "the stream must outlive the headers for a peer that buffers its first body"
         );
     }
 
