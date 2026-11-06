@@ -412,10 +412,6 @@ impl<R: Read> GrpcReader<R> {
             return Some(());
         }
         if gate.served != Some(true) || gate.posted != Some(true) || gate.typed != Some(true) {
-            eprintln!(
-                "DBG grpc refuse stream={id} served={:?} posted={:?} typed={:?}",
-                gate.served, gate.posted, gate.typed
-            );
             self.refuse(id);
             return None;
         }
@@ -937,8 +933,6 @@ impl<R: Read> crate::proxy::WindowRead for GrpcReader<R> {
 /// no other.
 const FRAMES_PER_WRITE: usize = 8;
 
-static DBG_BODY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
 /// A gathered frame's own bytes: its nine-byte head and the envelope prefix it carries, at most the
 /// `16` bytes `frame_prefix` can fill.
 const SLOT: usize = 9 + 16;
@@ -1077,21 +1071,13 @@ impl GrpcWriter {
         if self.multi {
             return self.send_multi(data, payload);
         }
-        let dbg_body = data.len() > 64 && DBG_BODY.swap(false, std::sync::atomic::Ordering::Relaxed);
         let mut batch = Gather::new();
         for piece in data.chunks(payload) {
             if !self.message(piece, max, false, &mut batch) {
-                if dbg_body {
-                    eprintln!("DBG send body len={} ok=false", data.len());
-                }
                 return false;
             }
         }
-        let ok = batch.flush_blocking(&self.shared);
-        if dbg_body {
-            eprintln!("DBG send body len={} ok={ok}", data.len());
-        }
-        ok
+        batch.flush_blocking(&self.shared)
     }
 
     /// The blocking writer's `MultiHunk` path: each group is sized from the room the transport has
@@ -2494,7 +2480,6 @@ pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
     )
     .ok()?;
     if magic != *MAGIC {
-        eprintln!("DBG grpc bad magic");
         return None;
     }
     let shared = new_shared(Box::new(write));
@@ -2525,10 +2510,8 @@ pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
         }
     }
     if !reader.answered {
-        eprintln!("DBG grpc headers never answered");
         return None;
     }
-    eprintln!("DBG grpc headers stream={} method={:?}", reader.stream, reader.method);
     reader.set_handshake_budget(None);
     let writer = GrpcWriter {
         shared,

@@ -1466,15 +1466,9 @@ fn read_open_header(
     auth_id: &[u8; AUTH_LEN],
 ) -> Option<Vec<u8>> {
     let mut sealed_len = [0u8; 2 + TAG_LEN];
-    if read_exact(stream, &mut sealed_len).is_err() {
-        eprintln!("DBG vmess sealed_len read fail");
-        return None;
-    }
+    read_exact(stream, &mut sealed_len).ok()?;
     let mut nonce = [0u8; 8];
-    if read_exact(stream, &mut nonce).is_err() {
-        eprintln!("DBG vmess nonce read fail");
-        return None;
-    }
+    read_exact(stream, &mut nonce).ok()?;
     let len_key = kdf16(
         instruction,
         &[b"VMess Header AEAD Key_Length", auth_id, &nonce],
@@ -1484,24 +1478,16 @@ fn read_open_header(
         &[b"VMess Header AEAD Nonce_Length", auth_id, &nonce],
     );
     let len_nonce: [u8; 12] = len_full[..12].try_into().unwrap();
-    let Some(clear_len) = open_header(&len_key, &len_nonce, &sealed_len, auth_id) else {
-        eprintln!("DBG vmess len open fail");
-        return None;
-    };
+    let clear_len = open_header(&len_key, &len_nonce, &sealed_len, auth_id)?;
     if clear_len.len() != 2 {
-        eprintln!("DBG vmess len len={}", clear_len.len());
         return None;
     }
     let head_len = usize::from(u16::from_be_bytes([clear_len[0], clear_len[1]]));
     if !(38..=4096).contains(&head_len) {
-        eprintln!("DBG vmess head_len={head_len}");
         return None;
     }
     let mut sealed_head = crate::proxy::unfilled(head_len + TAG_LEN);
-    if read_exact(stream, &mut sealed_head).is_err() {
-        eprintln!("DBG vmess head read fail len={head_len}");
-        return None;
-    }
+    read_exact(stream, &mut sealed_head).ok()?;
     let head_key = kdf16(instruction, &[b"VMess Header AEAD Key", auth_id, &nonce]);
     let head_full = kdf(instruction, &[b"VMess Header AEAD Nonce", auth_id, &nonce]);
     let head_nonce: [u8; 12] = head_full[..12].try_into().unwrap();
@@ -1509,24 +1495,13 @@ fn read_open_header(
 }
 fn decode_header(header: &[u8]) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)> {
     if header.len() < 38 || header[0] != 1 || header[34] & OPT_STREAM == 0 {
-        eprintln!(
-            "DBG decode head len={} version={} option={:#x} streambit={}",
-            header.len(),
-            header.first().copied().unwrap_or(0),
-            header.get(34).copied().unwrap_or(0),
-            header.get(34).map_or(0, |o| o & OPT_STREAM)
-        );
         return None;
     }
     let cmd = header[37];
     if cmd != 1 && cmd != 2 {
-        eprintln!("DBG decode cmd={cmd}");
         return None;
     }
-    let Some(cipher) = Cipher::from_code(header[35] & 0x0f) else {
-        eprintln!("DBG decode cipher={}", header[35] & 0x0f);
-        return None;
-    };
+    let cipher = Cipher::from_code(header[35] & 0x0f)?;
     let options = header[34];
     // Padding is drawn from the masking size parser, so the reference cannot build the generator without the mask bit either (`proxy/vmess/encoding/server.go`).
     if options & OPT_PAD != 0 && options & OPT_MASK == 0 {
@@ -1537,36 +1512,22 @@ fn decode_header(header: &[u8]) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)>
         return None;
     }
     let mut cursor = 38;
-    let Some(target) = decode_target(header, &mut cursor) else {
-        eprintln!("DBG decode target fail cursor={cursor}");
-        return None;
-    };
+    let target = decode_target(header, &mut cursor)?;
     let margin = usize::from(header[35] >> 4);
     if cursor + margin + 4 > header.len() {
-        eprintln!(
-            "DBG decode margin overrun cursor={cursor} margin={margin} len={}",
-            header.len()
-        );
         return None;
     }
     cursor += margin;
     if fnv1a(&header[..cursor])
         != u32::from_be_bytes(header[cursor..cursor + 4].try_into().unwrap())
     {
-        eprintln!(
-            "DBG decode fnv fail cursor={cursor} margin={margin} option={:#x}",
-            header[34]
-        );
         return None;
     }
     let data_iv: [u8; 16] = header[1..17].try_into().unwrap();
     let data_key: [u8; 16] = header[17..33].try_into().unwrap();
     let auth = header[33];
     let (response_key, response_iv) = response_material(&data_iv, &data_key);
-    let Some(prefix) = response_prefix(&response_key, &response_iv, auth) else {
-        eprintln!("DBG decode prefix fail");
-        return None;
-    };
+    let prefix = response_prefix(&response_key, &response_iv, auth)?;
     let mut recv = Flow::fresh(cipher, &data_key, &data_iv, options, &data_iv)?;
     let mut send = Flow::fresh(cipher, &response_key, &response_iv, options, &response_iv)?;
     // The body AEAD rides the response material, the sealed size rides the request's keys (`proxy/vmess/encoding/server.go` `EncodeResponseBody`): both directions derive the size AEAD from the request body key and IV.
@@ -1654,31 +1615,9 @@ impl Users {
 pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Accepted> {
     let mut auth_id = [0u8; AUTH_LEN];
     read_exact(stream, &mut auth_id).ok()?;
-    eprintln!("DBG vmess auth id read");
-    let (instruction, user) = match users.authenticate(&auth_id) {
-        Some(found) => found,
-        None => {
-            eprintln!("DBG vmess auth fail");
-            return None;
-        }
-    };
-    eprintln!("DBG vmess auth ok");
-    let header = match read_open_header(stream, &instruction, &auth_id) {
-        Some(header) => header,
-        None => {
-            eprintln!("DBG vmess open header fail");
-            return None;
-        }
-    };
-    eprintln!("DBG vmess header len={}", header.len());
-    let (target, mut send, recv, prefix, cmd) = match decode_header(&header) {
-        Some(decoded) => decoded,
-        None => {
-            eprintln!("DBG vmess decode fail");
-            return None;
-        }
-    };
-    eprintln!("DBG vmess accepted cmd={cmd} target={target}");
+    let (instruction, user) = users.authenticate(&auth_id)?;
+    let header = read_open_header(stream, &instruction, &auth_id)?;
+    let (target, mut send, recv, prefix, cmd) = decode_header(&header)?;
     send.end_marker = !user.no_termination;
     let meter = crate::stats::user(&user.email, user.level);
     Some(Accepted {
@@ -1739,7 +1678,6 @@ where
     let mut pad = PadSource::fresh();
     let mut staging = Vec::with_capacity(FRAMES_PER_WRITE * (MAX_WIRE + HEADER_LEN));
     let mut buf = relay_window();
-    let mut trace = true;
     let forward_flow = std::sync::Arc::clone(&flow);
     let forward_close = std::sync::Arc::clone(close);
     crate::proxy::lane_pool::submit(
@@ -1756,7 +1694,6 @@ where
                 pad,
                 &forward_close,
                 &forward_flow,
-                &mut trace,
             );
             if next == Next::Idle {
                 crate::proxy::note_wait_idle(REPLY_IDLE);
@@ -1821,14 +1758,9 @@ fn forward_step(
     pad: &mut PadSource,
     close: &Close,
     flow: &crate::proxy::RelayFinish,
-    trace: &mut bool,
 ) -> (Next, bool) {
     match plain_read.read(buf) {
         Ok(0) => {
-            if *trace {
-                eprintln!("DBG fwd eof");
-                *trace = false;
-            }
             // A clean end tells the peer this direction is done; the other direction keeps relaying.
             let clean = !send.end_marker || write_frame(writer, send, &[], staging, pad);
             if !clean {
@@ -1837,9 +1769,6 @@ fn forward_step(
             (Next::Done, clean)
         }
         Ok(read) => {
-            if *trace {
-                eprintln!("DBG fwd read={read}");
-            }
             let traced = crate::proxy::echo_trace_on();
             if traced {
                 crate::proxy::echo_trace("relay fwd first read");
@@ -1853,10 +1782,6 @@ fn forward_step(
                     break;
                 }
                 at = end;
-            }
-            if *trace {
-                eprintln!("DBG fwd staged ok={ok} read={read}");
-                *trace = false;
             }
             if traced {
                 crate::proxy::echo_trace(if ok {
@@ -2007,12 +1932,10 @@ pub(crate) fn serve_decoded_with_finish<R, W>(
         user,
     }) = decoded
     else {
-        eprintln!("DBG vmess serve none");
         close();
         return;
     };
     if !freedom || !matches!(cmd, 1 | 2) {
-        eprintln!("DBG vmess serve refused freedom={freedom} cmd={cmd}");
         close();
         return;
     }
@@ -2020,18 +1943,14 @@ pub(crate) fn serve_decoded_with_finish<R, W>(
     match cmd {
         1 => {
             let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
-                eprintln!("DBG vmess dial fail {target}");
                 close();
                 return;
             };
-            eprintln!("DBG vmess dial ok {target} prefix={}", prefix.len());
             let uplink = uplink.with_meter(user.reversed());
             if !write_prefix(&mut writer, &prefix) {
-                eprintln!("DBG vmess prefix write fail");
                 close();
                 return;
             }
-            eprintln!("DBG vmess prefix written");
             pump_relay_carried_with_finish(
                 &uplink, reader, writer, close, send, recv, None, finish,
             );
@@ -2130,11 +2049,9 @@ pub(crate) fn serve_grpc_with(
     freedom: bool,
 ) {
     let Some((mut reader, writer)) = crate::grpc::accept_with(stream, settings) else {
-        eprintln!("DBG vmess grpc accept_with failed");
         return;
     };
     let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
-    eprintln!("DBG vmess grpc decoded={}", decoded.is_some());
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
     serve_decoded(reader, writer, &close, decoded, freedom);
@@ -2153,11 +2070,9 @@ pub(crate) fn serve_grpc_split<R, W>(
 {
     let Some((mut reader, writer)) = crate::grpc::accept_split_with(reader, writer, settings)
     else {
-        eprintln!("DBG vmess grpc split accept failed");
         return;
     };
     let decoded = accept_request_bounded(&mut reader, users);
-    eprintln!("DBG vmess grpc split decoded={}", decoded.is_some());
     let closer = writer.clone();
     let shutdown = std::sync::Arc::clone(close);
     let close: Close = std::sync::Arc::new(move || {

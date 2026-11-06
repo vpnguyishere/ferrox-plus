@@ -363,7 +363,7 @@ ready = {"tag": "matrix-ready", "protocol": "socks", "listen": "127.0.0.1",
 server = {"inbounds": doc.get("inbounds", []) + [ready],
           "outbounds": direct or [{"tag": "direct", "protocol": "freedom", "settings": {}}]}
 json.dump(server, open(sys.argv[2], "w"), indent=2)
-json.dump({"outbounds": proxy, "log": {"loglevel": "debug"}}, open(sys.argv[3], "w"), indent=2)
+json.dump({"outbounds": proxy}, open(sys.argv[3], "w"), indent=2)
 PY
 }
 
