@@ -124,7 +124,6 @@ jobs:
         env:
           FERROX_UPSTREAM_HANDOFF: "1"
         run: |
-          ( sleep 18; pgrep -af 'parity-engines/xray-core' || true; for p in $(pgrep -f 'parity-engines/xray-core' || true); do kill -QUIT "$p" || true; done ) &
           ./scripts/run-benchmark-matrix.sh --tier "${{ inputs.tier }}" --out target/benchmark-matrix --only "${{ matrix.cell }}" --no-build ${{ inputs.flags }}
       - uses: actions/upload-artifact@v4
         if: always()

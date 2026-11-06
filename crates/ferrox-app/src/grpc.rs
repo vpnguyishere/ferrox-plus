@@ -123,11 +123,33 @@ fn take_window_until(shared: &Shared, need: u64, deadline: Option<Instant>) -> b
         if left.is_zero() {
             return false;
         }
+        {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::SeqCst);
+            if n < 40 {
+                eprintln!(
+                    "DBG wait need={need} conn={} stream={} left={:?}",
+                    send.conn, send.stream, left
+                );
+            }
+        }
         let (guard, waited) = shared
             .wake
             .wait_timeout(send, left)
             .unwrap_or_else(PoisonError::into_inner);
         send = guard;
+        {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::SeqCst);
+            if n < 40 {
+                eprintln!(
+                    "DBG wake conn={} stream={} timed_out={}",
+                    send.conn,
+                    send.stream,
+                    waited.timed_out()
+                );
+            }
+        }
         if waited.timed_out() {
             return false;
         }
@@ -859,6 +881,16 @@ impl<R: Read> GrpcReader<R> {
             send.stream = send.stream.saturating_add(inc).min(WINDOW_MAX);
         } else {
             return;
+        }
+        {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::SeqCst);
+            if n < 40 {
+                eprintln!(
+                    "DBG win id={id} inc={inc} conn={} stream={}",
+                    send.conn, send.stream
+                );
+            }
         }
         self.shared.wake.notify_all();
     }
