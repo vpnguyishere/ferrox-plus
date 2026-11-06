@@ -1178,6 +1178,14 @@ impl<R: Read> Wire<R> {
         &mut self.carrier
     }
 
+    /// Keeps the carrier's control frames (window grants, pings) flowing after its data half ended, so the opposite lane's wait still finishes.
+    fn pump_control(&mut self) -> Option<bool>
+    where
+        R: crate::proxy::RelayPoll,
+    {
+        self.carrier.pump_control()
+    }
+
     fn buffered(&self) -> usize {
         self.end - self.start
     }
@@ -1886,7 +1894,7 @@ fn forward_step(
 
 /// One step of the carrier leg: open the lazy server's response header first, then write what the
 /// frames it opens carry, and half-close on the peer's marker rather than on an EOF.
-fn backward_step<R: Read>(
+fn backward_step<R: Read + crate::proxy::RelayPoll>(
     reader: &mut Wire<R>,
     answer: &mut Option<Answer>,
     recv: &mut Flow,
@@ -1927,11 +1935,19 @@ fn backward_step<R: Read>(
                 // A frame that will not open ends both directions.
                 close();
                 let _ = out.shutdown(Shutdown::Both);
-            } else {
-                // A marker or a clean carrier FIN ends this direction only.
-                let _ = out.shutdown(Shutdown::Write);
+                return Next::Done;
             }
-            Next::Done
+            // A marker or a clean carrier FIN ends this direction only.
+            let _ = out.shutdown(Shutdown::Write);
+            if flow.ended() {
+                return Next::Done;
+            }
+            // The opposite lane may still be waiting on the peer's window, which only this half reads.
+            match reader.pump_control() {
+                Some(retry) if retry => Next::Retry,
+                Some(_) => Next::Idle,
+                None => Next::Done,
+            }
         }
         Opened::Batch { at, len } => {
             if crate::proxy::echo_trace_on() && *first {

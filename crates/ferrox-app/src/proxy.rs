@@ -4638,6 +4638,11 @@ impl Carried for crate::ws::WsReader {
 /// A carrier a relay lane reads: its socket holds the relay quantum, so a step that finds nothing hands the wait back instead of pinning the worker.
 pub(crate) trait RelayPoll {
     fn arm_relay_poll(&mut self);
+
+    /// Reads and dispatches carrier control frames after the data half ends, so a write side still waiting on the peer's window keeps being fed; `None` when the carrier has no such frames.
+    fn pump_control(&mut self) -> Option<bool> {
+        None
+    }
 }
 
 impl RelayPoll for Connection {

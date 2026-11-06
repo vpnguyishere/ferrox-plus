@@ -300,6 +300,15 @@ impl GrpcReader<Connection> {
 impl<R: Read + crate::proxy::RelayPoll> crate::proxy::RelayPoll for GrpcReader<R> {
     fn arm_relay_poll(&mut self) {
         self.read.arm_relay_poll();
+        self.poll = true;
+    }
+
+    fn pump_control(&mut self) -> Option<bool> {
+        match self.pump() {
+            Ok(Some(())) => Some(true),
+            Err(ref error) if crate::proxy::is_timeout(error) => Some(false),
+            _ => None,
+        }
     }
 }
 
