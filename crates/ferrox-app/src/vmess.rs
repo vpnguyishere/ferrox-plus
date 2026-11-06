@@ -27,9 +27,6 @@ const OPT_AUTH_LEN: u8 = 0x10;
 /// The grace after a peer half-close, long enough for a target that answers late.
 const REPLY_IDLE: Duration = Duration::from_secs(30);
 
-static DBG_FWD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-static DBG_FWD_OUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
 /// A sealed size field: the two plain octets and their tag, what `AEADChunkSizeParser`
 /// reads when the request asks for an authenticated length.
 const SIZE_FIELD: usize = HEADER_LEN + TAG_LEN;
@@ -1742,6 +1739,7 @@ where
     let mut pad = PadSource::fresh();
     let mut staging = Vec::with_capacity(FRAMES_PER_WRITE * (MAX_WIRE + HEADER_LEN));
     let mut buf = relay_window();
+    let mut trace = true;
     let forward_flow = std::sync::Arc::clone(&flow);
     let forward_close = std::sync::Arc::clone(close);
     crate::proxy::lane_pool::submit(
@@ -1758,6 +1756,7 @@ where
                 pad,
                 &forward_close,
                 &forward_flow,
+                &mut trace,
             );
             if next == Next::Idle {
                 crate::proxy::note_wait_idle(REPLY_IDLE);
@@ -1822,9 +1821,14 @@ fn forward_step(
     pad: &mut PadSource,
     close: &Close,
     flow: &crate::proxy::RelayFinish,
+    trace: &mut bool,
 ) -> (Next, bool) {
     match plain_read.read(buf) {
         Ok(0) => {
+            if *trace {
+                eprintln!("DBG fwd eof");
+                *trace = false;
+            }
             // A clean end tells the peer this direction is done; the other direction keeps relaying.
             let clean = !send.end_marker || write_frame(writer, send, &[], staging, pad);
             if !clean {
@@ -1833,7 +1837,7 @@ fn forward_step(
             (Next::Done, clean)
         }
         Ok(read) => {
-            if DBG_FWD.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if *trace {
                 eprintln!("DBG fwd read={read}");
             }
             let traced = crate::proxy::echo_trace_on();
@@ -1850,8 +1854,9 @@ fn forward_step(
                 }
                 at = end;
             }
-            if DBG_FWD_OUT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if *trace {
                 eprintln!("DBG fwd staged ok={ok} read={read}");
+                *trace = false;
             }
             if traced {
                 crate::proxy::echo_trace(if ok {
