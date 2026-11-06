@@ -412,6 +412,10 @@ impl<R: Read> GrpcReader<R> {
             return Some(());
         }
         if gate.served != Some(true) || gate.posted != Some(true) || gate.typed != Some(true) {
+            eprintln!(
+                "DBG grpc refuse stream={id} served={:?} posted={:?} typed={:?}",
+                gate.served, gate.posted, gate.typed
+            );
             self.refuse(id);
             return None;
         }
@@ -2480,6 +2484,7 @@ pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
     )
     .ok()?;
     if magic != *MAGIC {
+        eprintln!("DBG grpc bad magic");
         return None;
     }
     let shared = new_shared(Box::new(write));
@@ -2510,8 +2515,10 @@ pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
         }
     }
     if !reader.answered {
+        eprintln!("DBG grpc headers never answered");
         return None;
     }
+    eprintln!("DBG grpc headers stream={} method={:?}", reader.stream, reader.method);
     reader.set_handshake_budget(None);
     let writer = GrpcWriter {
         shared,
