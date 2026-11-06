@@ -1811,10 +1811,6 @@ fn forward_step(
             (Next::Done, clean)
         }
         Ok(read) => {
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 300 {
-                eprintln!("PROBE fwd read={read}");
-            }
             let traced = crate::proxy::echo_trace_on();
             if traced {
                 crate::proxy::echo_trace("relay fwd first read");

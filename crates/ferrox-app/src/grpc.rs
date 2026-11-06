@@ -1521,6 +1521,21 @@ impl GrpcWriter {
         take_window(&self.shared, need, true)
     }
 
+    /// The largest blocking batch a muxed peer's opening window pays for in one offer: the transport
+    /// takes a batch whole or not at all, so a batch past that window would wait for credit the peer
+    /// grants only for bytes it has already received.
+    fn hunk_cap(&self) -> u64 {
+        if !self.shared.muxed {
+            return u64::MAX;
+        }
+        let init = self
+            .shared
+            .init
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (*init).min(65_535).max(1)
+    }
+
     /// Writes one message, splitting it only when it exceeds `max` bytes.
     fn message<'a>(&self, data: &'a [u8], max: usize, end: bool, batch: &mut Gather<'a>) -> bool {
         let mut prefix = [0u8; 16];
@@ -1533,6 +1548,11 @@ impl GrpcWriter {
             return false;
         }
         if total <= max {
+            if !reserved && batch.credit > 0 && batch.credit + total as u64 > self.hunk_cap() {
+                if !batch.flush_blocking(&self.shared) {
+                    return false;
+                }
+            }
             if !reserved && !self.credit(batch, total as u64) {
                 return false;
             }

@@ -900,24 +900,11 @@ impl H2Conn {
             if need == 0 || group.len() > 4 {
                 continue;
             }
-            {
-                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 300 {
-                    eprintln!("PROBE sg str={stream} need={need} max={max}");
-                }
-            }
             let mut index = 0;
             let mut offset = 0;
             while need > 0 {
                 let want = need.min(max);
                 let Some(chunk) = self.credit(&state, want as u64, &mut batch) else {
-                    {
-                        static N: std::sync::atomic::AtomicU64 =
-                            std::sync::atomic::AtomicU64::new(0);
-                        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100 {
-                            eprintln!("PROBE sg credit-none str={stream} need={need}");
-                        }
-                    }
                     return false;
                 };
                 if batch.full() && !batch.flush(self) {
@@ -977,6 +964,15 @@ impl H2Conn {
             return None;
         };
         if *conn < total || *window < total {
+            if stream > 1 {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                    eprintln!(
+                        "PROBE wide str={stream} total={total} conn={} win={}",
+                        *conn, *window
+                    );
+                }
+            }
             return None;
         }
         *conn -= total;
@@ -1150,16 +1146,6 @@ impl H2Conn {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 continue;
-            }
-            {
-                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100 {
-                    let win = *stream
-                        .send_window
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    eprintln!("PROBE win wait need={need} conn={} win={win}", *conn);
-                }
             }
             let (guard, waited) = self
                 .wake
