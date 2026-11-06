@@ -2139,6 +2139,32 @@ fn put_varint(buf: &mut Vec<u8>, value: u64) {
 fn get_varint(buf: &[u8], at: &mut usize) -> Option<u64> {
     let first = *buf.get(*at)?;
     let len = 1usize << (first >> 6);
+    let end = at.checked_add(len)?;
+    if end > buf.len() {
+        return None;
+    }
+    // The four widths are one, two, four and eight octets, so eight bytes from the varint's start hold the whole field whenever they are in the buffer. One big-endian load, a shift past the octets this width does not use, and a mask past its two prefix bits give the value; the eight-octet width shifts and masks by zero over the same expression.
+    if let Some(word) = buf
+        .get(*at..)
+        .and_then(|rest| rest.get(..8))
+        .and_then(|word| <[u8; 8]>::try_from(word).ok())
+    {
+        let bits = len * 8 - 2;
+        *at = end;
+        return Some((u64::from_be_bytes(word) >> (64 - len * 8)) & ((1u64 << bits) - 1));
+    }
+    let mut value = u64::from(first & 0x3f);
+    for index in 1..len {
+        value = (value << 8) | u64::from(buf[*at + index]);
+    }
+    *at = end;
+    Some(value)
+}
+
+#[cfg(test)]
+fn get_varint_byte(buf: &[u8], at: &mut usize) -> Option<u64> {
+    let first = *buf.get(*at)?;
+    let len = 1usize << (first >> 6);
     if *at + len > buf.len() {
         return None;
     }
@@ -2209,9 +2235,9 @@ fn long_header_len(initial: bool, dcid_len: usize, scid_len: usize, pn_len: usiz
 #[cfg(test)]
 mod tests {
     use super::{
-        get_varint, randomize_cipher_suites, randomize_kx_groups, transport_params, Engine,
-        ObfuscatedUdp, PacketIo, QuicNoise, SentPacket, INITIAL_CWND, MAX_PACKET_SIZE,
-        OBFUSCATION_OVERHEAD, ONE_RTT,
+        get_varint, get_varint_byte, randomize_cipher_suites, randomize_kx_groups,
+        transport_params, Engine, ObfuscatedUdp, PacketIo, QuicNoise, SentPacket, INITIAL_CWND,
+        MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD, ONE_RTT,
     };
     use std::net::UdpSocket;
     use std::time::{Duration, Instant};
@@ -2257,6 +2283,85 @@ mod tests {
             ids.push(id);
         }
         ids
+    }
+
+    #[test]
+    fn the_word_read_is_the_byte_walk_at_every_width_and_buffer_end() {
+        for value in [
+            0,
+            1,
+            0x3f,
+            0x40,
+            0x3fff,
+            0x4000,
+            (1 << 30) - 1,
+            1 << 30,
+            (1 << 62) - 1,
+        ] {
+            let mut encoded = Vec::new();
+            super::put_varint(&mut encoded, value);
+            for pad in 0..12usize {
+                let mut buf = encoded.clone();
+                buf.resize(buf.len() + pad, 0);
+                let (mut word_at, mut byte_at) = (0usize, 0usize);
+                let word = get_varint(&buf, &mut word_at);
+                let byte = get_varint_byte(&buf, &mut byte_at);
+                assert_eq!(word, byte, "{value} with {pad} trailing octets");
+                assert_eq!(word_at, byte_at, "{value} with {pad} trailing octets");
+                assert_eq!(word, Some(value));
+            }
+            for cut in 0..encoded.len() {
+                let mut at = 0usize;
+                assert_eq!(
+                    get_varint(&encoded[..cut], &mut at),
+                    None,
+                    "{value} cut at {cut}"
+                );
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn word_varint_probe(buf: &[u8]) -> u64 {
+        let mut sum = 0u64;
+        for _ in 0..4096 {
+            let mut at = 0usize;
+            sum = sum
+                .wrapping_add(get_varint(std::hint::black_box(buf), &mut at).unwrap_or_default());
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn byte_varint_probe(buf: &[u8]) -> u64 {
+        let mut sum = 0u64;
+        for _ in 0..4096 {
+            let mut at = 0usize;
+            sum = sum.wrapping_add(
+                get_varint_byte(std::hint::black_box(buf), &mut at).unwrap_or_default(),
+            );
+        }
+        sum
+    }
+
+    #[test]
+    fn the_word_varint_read_costs_the_load_and_nothing_else() {
+        let mut encoded = Vec::new();
+        super::put_varint(&mut encoded, (1 << 62) - 1);
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&encoded);
+        buf[8..].copy_from_slice(&encoded);
+        assert_eq!(word_varint_probe(&buf), byte_varint_probe(&buf));
+    }
+
+    #[test]
+    fn the_byte_varint_walk_costs_the_same_answer() {
+        let mut encoded = Vec::new();
+        super::put_varint(&mut encoded, (1 << 62) - 1);
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&encoded);
+        buf[8..].copy_from_slice(&encoded);
+        assert_eq!(byte_varint_probe(&buf), word_varint_probe(&buf));
     }
 
     #[test]

@@ -206,6 +206,11 @@ front-healthcheck  proxy::hc_tests::an_hc_get_answers_the_configured_body_after_
 # about the rescan.
 front-healthcheck  proxy::hc_tests::the_front_scan_costs_every_window_it_has_already_walked  ferrox_app::proxy::hc_tests::the_front_scan_costs_every_window_it_has_already_walked
 front-healthcheck  proxy::hc_tests::the_seam_scan_costs_the_bytes_it_has_not_walked  ferrox_app::proxy::hc_tests::the_seam_scan_costs_the_bytes_it_has_not_walked
+# The same eight-octet QUIC varint decoded 4096 times by the one-load read and
+# by the byte walk it replaced: one ops job reports both frames, and only their
+# difference is a claim about the decode.
+carrier-psiphon  psiphon_quic::tests::the_word_varint_read_costs_the_load_and_nothing_else  ferrox_app::psiphon_quic::tests::word_varint_probe
+carrier-psiphon  psiphon_quic::tests::the_byte_varint_walk_costs_the_same_answer  ferrox_app::psiphon_quic::tests::byte_varint_probe
 carrier-quic  proxy::tests::quic_serves_vless_echo_over_loopback  quic::serve_loop
 wireguard  wireguard::device::tests::a_replayed_transport_counter_is_refused  wireguard::device::Tunnel::send
 wireguard  wg::tests::a_prefix_table_picks_the_peer_the_scan_picks  ferrox_app::wg::tests::route_scan_once
