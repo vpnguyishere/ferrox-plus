@@ -892,4 +892,5 @@ carrier-psiphon syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
 carrier-psiphon relay-staging-copies-per-byte UNBLESSED not measured
 carrier-psiphon download-staging-copies-per-byte 0 ferrox-app-psiphon-ssh::tests::a_channel_chunk_is_the_packet_allocation
 carrier-psiphon flow-clone-allocations 0 ferrox-app-psiphon::tests::a_flow_clone_shares_the_credential_words
+carrier-psiphon quic-varint-probe-ops 131079 scripts/count-ops.sh
 carrier-psiphon seconds-per-live-transfer UNBLESSED .github/workflows/psiphon-live.yml

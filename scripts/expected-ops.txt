@@ -216,4 +216,9 @@ grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 g
 # test and one binary, so their difference is the lookup and not the build.
 ferrox_app::wg::tests::route_scan_once 68609 wg::tests::a_prefix_table_picks_the_peer_the_scan_picks
 ferrox_app::wg::tests::route_table_once 585 wg::tests::a_prefix_table_picks_the_peer_the_scan_picks
+# The same eight-octet QUIC varint decoded 4096 times: the one-load read reports
+# 131079 and the byte walk 360460, so the load takes 229381 (63.6%) out. The
+# values, offsets and refusals are unchanged.
+# (The byte row stays in scripts/method-ops.txt as the comparison.)
+ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::the_word_varint_read_costs_the_load_and_nothing_else
 ferrox_app::sniff::Sniffing::inspect 1220 sniff::tests::a_warm_probe_costs_the_documented_instructions
