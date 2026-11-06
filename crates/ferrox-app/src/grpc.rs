@@ -937,6 +937,8 @@ impl<R: Read> crate::proxy::WindowRead for GrpcReader<R> {
 /// no other.
 const FRAMES_PER_WRITE: usize = 8;
 
+static DBG_BODY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// A gathered frame's own bytes: its nine-byte head and the envelope prefix it carries, at most the
 /// `16` bytes `frame_prefix` can fill.
 const SLOT: usize = 9 + 16;
@@ -1075,13 +1077,21 @@ impl GrpcWriter {
         if self.multi {
             return self.send_multi(data, payload);
         }
+        let dbg_body = data.len() > 64 && DBG_BODY.swap(false, std::sync::atomic::Ordering::Relaxed);
         let mut batch = Gather::new();
         for piece in data.chunks(payload) {
             if !self.message(piece, max, false, &mut batch) {
+                if dbg_body {
+                    eprintln!("DBG send body len={} ok=false", data.len());
+                }
                 return false;
             }
         }
-        batch.flush_blocking(&self.shared)
+        let ok = batch.flush_blocking(&self.shared);
+        if dbg_body {
+            eprintln!("DBG send body len={} ok={ok}", data.len());
+        }
+        ok
     }
 
     /// The blocking writer's `MultiHunk` path: each group is sized from the room the transport has

@@ -27,6 +27,9 @@ const OPT_AUTH_LEN: u8 = 0x10;
 /// The grace after a peer half-close, long enough for a target that answers late.
 const REPLY_IDLE: Duration = Duration::from_secs(30);
 
+static DBG_FWD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static DBG_FWD_OUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// A sealed size field: the two plain octets and their tag, what `AEADChunkSizeParser`
 /// reads when the request asks for an authenticated length.
 const SIZE_FIELD: usize = HEADER_LEN + TAG_LEN;
@@ -1830,6 +1833,9 @@ fn forward_step(
             (Next::Done, clean)
         }
         Ok(read) => {
+            if DBG_FWD.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("DBG fwd read={read}");
+            }
             let traced = crate::proxy::echo_trace_on();
             if traced {
                 crate::proxy::echo_trace("relay fwd first read");
@@ -1843,6 +1849,9 @@ fn forward_step(
                     break;
                 }
                 at = end;
+            }
+            if DBG_FWD_OUT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("DBG fwd staged ok={ok} read={read}");
             }
             if traced {
                 crate::proxy::echo_trace(if ok {
