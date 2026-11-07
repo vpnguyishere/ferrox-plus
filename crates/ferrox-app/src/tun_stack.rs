@@ -275,7 +275,9 @@ fn send_plain(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>) {
 
 #[cfg(target_os = "linux")]
 fn with_headroom(packet: &[u8]) -> Vec<u8> {
-    let mut buffer = vec![0u8; VIRTIO_NET_HDR_LEN + packet.len()];
+    // GRO appends into the first buffer, so it needs room for a full aggregate.
+    let mut buffer = Vec::with_capacity(VIRTIO_NET_HDR_LEN + 65_535);
+    buffer.resize(VIRTIO_NET_HDR_LEN + packet.len(), 0);
     buffer[VIRTIO_NET_HDR_LEN..].copy_from_slice(packet);
     buffer
 }
