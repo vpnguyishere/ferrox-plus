@@ -19,7 +19,7 @@ use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 use crate::proxy::Outbound;
 use crate::tun::Spec;
-use crate::wg_stack::{Packet, TX_POOL};
+use crate::wg_stack::Packet;
 use crate::wireguard::DeviceConfig;
 
 const RX_QUEUE: usize = 1024;
@@ -104,7 +104,6 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
     let (packets, incoming) = mpsc::sync_channel(RX_QUEUE);
     let (outgoing, writes) = mpsc::sync_channel(TX_QUEUE);
     let (recycle, reused) = mpsc::channel();
-    let (tx_recycle, tx_reused) = mpsc::sync_channel(TX_POOL);
     #[cfg(unix)]
     let (wake_read, wake_write) = std::os::unix::net::UnixStream::pair().expect("tun wake pair");
     #[cfg(unix)]
@@ -121,21 +120,13 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             outgoing,
             stack_out,
             Some(recycle),
-            tx_reused,
             wake_read,
         );
         #[cfg(not(unix))]
-        crate::wg_stack::serve_tun_device(
-            config,
-            incoming,
-            outgoing,
-            stack_out,
-            Some(recycle),
-            tx_reused,
-        );
+        crate::wg_stack::serve_tun_device(config, incoming, outgoing, stack_out, Some(recycle));
     });
     let writer = Arc::clone(&device);
-    thread::spawn(move || send_loop(writer, writes, tx_recycle, offload));
+    thread::spawn(move || send_loop(writer, writes, offload));
     let mtu = spec.mtu();
     thread::spawn(move || recv_loop(device, packets, reused, mtu, wake_write));
 }
@@ -231,18 +222,13 @@ fn recv_loop(
 }
 
 #[cfg(target_os = "linux")]
-fn send_loop(
-    device: Arc<SyncDevice>,
-    packets: Receiver<Vec<u8>>,
-    recycle: SyncSender<Vec<u8>>,
-    offload: bool,
-) {
+fn send_loop(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, offload: bool) {
     if !offload {
-        send_plain(device, packets, recycle);
+        send_plain(device, packets);
         return;
     }
     let mut gro = GROTable::default();
-    let mut aggregates: Vec<Vec<u8>> = (0..WRITE_BATCH)
+    let mut pool: Vec<Vec<u8>> = (0..WRITE_BATCH)
         .map(|_| Vec::with_capacity(VIRTIO_NET_HDR_LEN + 65_535))
         .collect();
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH);
@@ -251,27 +237,24 @@ fn send_loop(
             return;
         };
         batch.clear();
-        let mut take = |packet: Vec<u8>, batch: &mut Vec<Vec<u8>>| {
-            let mut buffer = aggregates
-                .pop()
-                .unwrap_or_else(|| Vec::with_capacity(VIRTIO_NET_HDR_LEN + 65_535));
+        let mut take = |packet: &[u8], batch: &mut Vec<Vec<u8>>| {
+            let mut buffer = pool.pop().unwrap_or_else(|| Vec::with_capacity(65_535));
             buffer.clear();
             buffer.resize(VIRTIO_NET_HDR_LEN, 0);
-            buffer.extend_from_slice(&packet);
+            buffer.extend_from_slice(packet);
             batch.push(buffer);
-            let _ = recycle.try_send(packet);
         };
-        take(packet, &mut batch);
+        take(&packet, &mut batch);
         while batch.len() < WRITE_BATCH {
             match packets.try_recv() {
-                Ok(packet) => take(packet, &mut batch),
+                Ok(packet) => take(&packet, &mut batch),
                 Err(_) => break,
             }
         }
         let written = device.send_multiple(&mut gro, &mut batch, VIRTIO_NET_HDR_LEN);
         for mut buffer in batch.drain(..) {
             buffer.clear();
-            aggregates.push(buffer);
+            pool.push(buffer);
         }
         if let Err(error) = written {
             eprintln!("tun write: {error}");
@@ -281,13 +264,8 @@ fn send_loop(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn send_loop(
-    device: Arc<SyncDevice>,
-    packets: Receiver<Vec<u8>>,
-    recycle: SyncSender<Vec<u8>>,
-    _offload: bool,
-) {
-    send_plain(device, packets, recycle);
+fn send_loop(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, _offload: bool) {
+    send_plain(device, packets);
 }
 
 #[cfg(unix)]
@@ -305,12 +283,11 @@ fn packet_bytes(reuse: &Receiver<Vec<u8>>, source: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn send_plain(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, recycle: SyncSender<Vec<u8>>) {
+fn send_plain(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>) {
     while let Ok(packet) = packets.recv() {
         if let Err(error) = device.send(&packet) {
             eprintln!("tun write: {error}");
             return;
         }
-        let _ = recycle.try_send(packet);
     }
 }

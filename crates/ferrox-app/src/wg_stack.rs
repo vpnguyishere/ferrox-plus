@@ -97,9 +97,6 @@ const RX_BURST: usize = 256;
 /// about 212 KiB, so a 128-datagram chunk per flow stays under it and does not
 /// lose tail segments, whose retransmit costs a whole RTO.
 const TX_BURST: usize = 128;
-/// Segment buffers the stack keeps for the TUN writer to refill; a reused
-/// buffer costs no allocation on the transmit path.
-pub(crate) const TX_POOL: usize = 256;
 /// The most server datagram lanes one inbound may hold.
 const UDP_FLOWS: usize = 4096;
 /// The largest inner packet the server's TCP may build, so a read becomes one
@@ -149,8 +146,6 @@ pub(crate) type UdpRoutes = Arc<Mutex<HashMap<u16, Sender<Vec<u8>>>>>;
 struct QueueDevice {
     rx: VecDeque<(Vec<u8>, usize)>,
     tx: VecDeque<Vec<u8>>,
-    tx_pool: Vec<Vec<u8>>,
-    tx_reuse: Option<Receiver<Vec<u8>>>,
     mtu: usize,
     headroom: usize,
     recycle: Option<Sender<Vec<u8>>>,
@@ -162,8 +157,6 @@ impl QueueDevice {
         Self {
             rx: VecDeque::new(),
             tx: VecDeque::new(),
-            tx_pool: Vec::new(),
-            tx_reuse: None,
             mtu,
             headroom,
             recycle: None,
@@ -178,20 +171,6 @@ impl QueueDevice {
             }
         }
         self.rx.push_back((packet, at));
-    }
-
-    /// Refill the segment pool from the writer, which returns every buffer it
-    /// has copied into its aggregate.
-    fn refill_tx(&mut self) {
-        let Some(reuse) = self.tx_reuse.as_ref() else {
-            return;
-        };
-        while self.tx_pool.len() < TX_POOL {
-            match reuse.try_recv() {
-                Ok(buffer) => self.tx_pool.push(buffer),
-                Err(_) => break,
-            }
-        }
     }
 
     /// Return a receive slot to the batch, leaving copied payloads alone.
@@ -247,7 +226,6 @@ impl Drop for QueueRx {
 /// The transmit token that prepends tunnel headroom and a tag to one segment.
 struct QueueTx<'a> {
     tx: &'a mut VecDeque<Vec<u8>>,
-    pool: &'a mut Vec<Vec<u8>>,
     headroom: usize,
 }
 
@@ -258,9 +236,7 @@ impl TxToken for QueueTx<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = self.pool.pop().unwrap_or_default();
-        buffer.clear();
-        buffer.reserve(self.headroom + len + WG_TAG_SIZE);
+        let mut buffer = Vec::with_capacity(self.headroom + len + WG_TAG_SIZE);
         buffer.resize(self.headroom + len, 0);
         let answer = f(&mut buffer[self.headroom..]);
         self.tx.push_back(buffer);
@@ -293,7 +269,6 @@ impl Device for QueueDevice {
             },
             QueueTx {
                 tx: &mut self.tx,
-                pool: &mut self.tx_pool,
                 headroom: self.headroom,
             },
         ))
@@ -303,7 +278,6 @@ impl Device for QueueDevice {
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(QueueTx {
             tx: &mut self.tx,
-            pool: &mut self.tx_pool,
             headroom: self.headroom,
         })
     }
@@ -1257,10 +1231,9 @@ pub(crate) fn serve_tun_device(
     to_tunnel: SyncSender<Vec<u8>>,
     out: Outbound,
     recycle: Option<Sender<Vec<u8>>>,
-    tx_reuse: Receiver<Vec<u8>>,
     wake: std::os::unix::net::UnixStream,
 ) {
-    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, tx_reuse);
+    let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
     stack.device.recycle = recycle;
     let _ = wake.set_nonblocking(true);
     let mut buf = vec![0u8; 64 * 1024];
@@ -1298,9 +1271,8 @@ pub(crate) fn serve_tun_device(
     to_tunnel: SyncSender<Vec<u8>>,
     out: Outbound,
     recycle: Option<Sender<Vec<u8>>>,
-    tx_reuse: Receiver<Vec<u8>>,
 ) {
-    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, tx_reuse);
+    let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
     stack.device.recycle = recycle;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -1565,7 +1537,6 @@ impl ClientStack {
 
     /// Drive the interface, every flow, and the queued transmits one turn.
     fn poll(&mut self, buf: &mut [u8]) -> bool {
-        self.device.refill_tx();
         let now = self.now();
         self.reassembly.expire();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
@@ -1686,15 +1657,8 @@ impl ServerStack {
     }
 
     /// Build the same interface over a TUN whose packets already carry their IP header.
-    fn new_tun(
-        config: &DeviceConfig,
-        to_tunnel: impl Into<ToTunnel>,
-        out: Outbound,
-        tx_reuse: Receiver<Vec<u8>>,
-    ) -> Self {
-        let mut stack = Self::with_mtu(config, to_tunnel, out, 0, config.mtu, config.mtu);
-        stack.device.tx_reuse = Some(tx_reuse);
-        stack
+    fn new_tun(config: &DeviceConfig, to_tunnel: impl Into<ToTunnel>, out: Outbound) -> Self {
+        Self::with_mtu(config, to_tunnel, out, 0, config.mtu, config.mtu)
     }
 
     fn with_mtu(
