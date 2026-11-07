@@ -82,6 +82,7 @@ const LISTENER_TTL: Duration = Duration::from_secs(60);
 const TICK: Duration = Duration::from_millis(1);
 /// A TUN carries no tunnel reader to wake the stack, so an idle wait is also
 /// the bound on a target's answer; keep it below a request's round trip.
+#[cfg(not(unix))]
 const TUN_TICK: Duration = Duration::from_micros(100);
 /// Datagram lanes are idle most of their life; a ten millisecond wake is a
 /// poll of their own, not a bound on a request.

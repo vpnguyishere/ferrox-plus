@@ -67,3 +67,12 @@ Against the native handler the userspace path removes the hand-written TCP reass
 | the TCP state machine and socket buffers | `smoltcp` 0.14 |
 | the stack tuning reference | `upstream/zeptun/src/stack/tcp.zig`, `src/engine.zig` |
 | the native fallback | `docs/function/front-tun.md`, `crates/ferrox-app/src/tun.rs` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/tun_stack.rs
+- symbols: tun_stack
+<!-- scope:end -->

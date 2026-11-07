@@ -55,7 +55,7 @@ fn open(spec: &Spec) -> io::Result<(SyncDevice, bool, usize)> {
         let multi = spec.queues() > 1;
         match build(spec, multi, true) {
             Ok((device, offload, multi)) => {
-                return Ok((device, offload, if multi { spec.queues() } else { 1 }));
+                Ok((device, offload, if multi { spec.queues() } else { 1 }))
             }
             Err(error) => {
                 if let Ok((device, offload, multi)) = build(spec, multi, false) {
@@ -69,7 +69,7 @@ fn open(spec: &Spec) -> io::Result<(SyncDevice, bool, usize)> {
                 if let Ok((device, offload, _)) = build(spec, false, false) {
                     return Ok((device, offload, 1));
                 }
-                return Err(error);
+                Err(error)
             }
         }
     }
@@ -100,6 +100,7 @@ fn build(spec: &Spec, multi: bool, offload: bool) -> io::Result<(SyncDevice, boo
     Ok((device, offload, multi))
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outbound) {
     let (packets, incoming) = mpsc::sync_channel(RX_QUEUE);
     let (outgoing, writes) = mpsc::sync_channel(TX_QUEUE);
@@ -125,8 +126,8 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
         #[cfg(not(unix))]
         crate::wg_stack::serve_tun_device(config, incoming, outgoing, stack_out, Some(recycle));
     });
-    let writer = Arc::clone(&device);
-    thread::spawn(move || send_loop(writer, writes, offload));
+    let send_device = Arc::clone(&device);
+    thread::spawn(move || send_loop(send_device, writes, offload));
     let mtu = spec.mtu();
     thread::spawn(move || recv_loop(device, packets, reused, mtu, wake_write));
 }
@@ -146,6 +147,7 @@ fn device_config(spec: &Spec) -> DeviceConfig {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::needless_pass_by_value)]
 fn recv_loop(
     device: Arc<SyncDevice>,
     packets: SyncSender<Packet>,
@@ -270,7 +272,7 @@ fn send_loop(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, _offload: bool
 
 #[cfg(unix)]
 fn wake_signal(wake: &WakeWriter) {
-    let _ = unsafe { libc::write(wake.as_raw_fd(), b"\0".as_ptr().cast(), 1) };
+    let _ = unsafe { libc::write(wake.as_raw_fd(), c"".as_ptr().cast(), 1) };
 }
 
 #[cfg(not(unix))]
@@ -283,6 +285,7 @@ fn packet_bytes(reuse: &Receiver<Vec<u8>>, source: &[u8]) -> Vec<u8> {
     bytes
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn send_plain(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>) {
     while let Ok(packet) = packets.recv() {
         if let Err(error) = device.send(&packet) {
