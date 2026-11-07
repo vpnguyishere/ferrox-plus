@@ -1733,7 +1733,7 @@ fn push_varint(out: &mut Vec<u8>, mut value: u64) {
 }
 
 /// Reads one protobuf varint at `at`, advancing the cursor.
-#[inline]
+#[inline(always)]
 fn read_varint(msg: &[u8], at: &mut usize) -> Option<u64> {
     let first = *msg.get(*at)?;
     *at += 1;
