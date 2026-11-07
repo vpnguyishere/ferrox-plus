@@ -78,7 +78,9 @@ fn build(spec: &Spec, multi: bool, offload: bool) -> io::Result<(SyncDevice, boo
         IpAddr::V6(address) => builder.ipv6(address, spec.prefix().min(128)),
     };
     #[cfg(target_os = "linux")]
-    builder.offload(offload).multi_queue(multi);
+    let builder = builder.offload(offload).multi_queue(multi);
+    #[cfg(not(target_os = "linux"))]
+    let builder = builder;
     let device = builder.build_sync()?;
     #[cfg(target_os = "linux")]
     let offload = device.tcp_gso();
