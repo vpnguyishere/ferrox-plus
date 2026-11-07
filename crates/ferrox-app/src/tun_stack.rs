@@ -24,6 +24,10 @@ use crate::wireguard::DeviceConfig;
 
 const RX_QUEUE: usize = 1024;
 const TX_QUEUE: usize = 1024;
+/// A writer keeps this many aggregate-sized buffers so GRO never allocates on
+/// the packet path; 32 packets fill one 64 KiB aggregate.
+#[cfg(target_os = "linux")]
+const WRITE_BATCH: usize = 32;
 
 #[cfg(unix)]
 type WakeWriter = std::os::unix::net::UnixStream;
@@ -224,20 +228,35 @@ fn send_loop(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, offload: bool)
         return;
     }
     let mut gro = GROTable::default();
-    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(IDEAL_BATCH_SIZE);
+    let mut pool: Vec<Vec<u8>> = (0..WRITE_BATCH)
+        .map(|_| Vec::with_capacity(VIRTIO_NET_HDR_LEN + 65_535))
+        .collect();
+    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH);
     loop {
         let Ok(packet) = packets.recv() else {
             return;
         };
         batch.clear();
-        batch.push(with_headroom(&packet));
-        while batch.len() < IDEAL_BATCH_SIZE {
+        let mut take = |packet: &[u8], batch: &mut Vec<Vec<u8>>| {
+            let mut buffer = pool.pop().unwrap_or_else(|| Vec::with_capacity(65_535));
+            buffer.clear();
+            buffer.resize(VIRTIO_NET_HDR_LEN, 0);
+            buffer.extend_from_slice(packet);
+            batch.push(buffer);
+        };
+        take(&packet, &mut batch);
+        while batch.len() < WRITE_BATCH {
             match packets.try_recv() {
-                Ok(packet) => batch.push(with_headroom(&packet)),
+                Ok(packet) => take(&packet, &mut batch),
                 Err(_) => break,
             }
         }
-        if let Err(error) = device.send_multiple(&mut gro, &mut batch, VIRTIO_NET_HDR_LEN) {
+        let written = device.send_multiple(&mut gro, &mut batch, VIRTIO_NET_HDR_LEN);
+        for mut buffer in batch.drain(..) {
+            buffer.clear();
+            pool.push(buffer);
+        }
+        if let Err(error) = written {
             eprintln!("tun write: {error}");
             return;
         }
@@ -271,13 +290,4 @@ fn send_plain(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>) {
             return;
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-fn with_headroom(packet: &[u8]) -> Vec<u8> {
-    // GRO appends into the first buffer, so it needs room for a full aggregate.
-    let mut buffer = Vec::with_capacity(VIRTIO_NET_HDR_LEN + 65_535);
-    buffer.resize(VIRTIO_NET_HDR_LEN + packet.len(), 0);
-    buffer[VIRTIO_NET_HDR_LEN..].copy_from_slice(packet);
-    buffer
 }
