@@ -1733,43 +1733,8 @@ fn push_varint(out: &mut Vec<u8>, mut value: u64) {
 }
 
 /// Reads one protobuf varint at `at`, advancing the cursor.
-#[inline(always)]
+#[inline]
 fn read_varint(msg: &[u8], at: &mut usize) -> Option<u64> {
-    let first = *msg.get(*at)?;
-    *at += 1;
-    if first & 0x80 == 0 {
-        return Some(u64::from(first));
-    }
-    let second = *msg.get(*at)?;
-    *at += 1;
-    if second & 0x80 == 0 {
-        return Some(u64::from(first & 0x7F) | (u64::from(second) << 7));
-    }
-    let third = *msg.get(*at)?;
-    *at += 1;
-    if third & 0x80 == 0 {
-        return Some(
-            u64::from(first & 0x7F) | (u64::from(second & 0x7F) << 7) | (u64::from(third) << 14),
-        );
-    }
-    let mut value =
-        u64::from(first & 0x7F) | (u64::from(second & 0x7F) << 7) | (u64::from(third & 0x7F) << 14);
-    for shift in (21..70).step_by(7) {
-        let byte = *msg.get(*at)?;
-        *at += 1;
-        if shift == 63 && byte > 1 {
-            return None;
-        }
-        value |= u64::from(byte & 0x7F) << shift;
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-fn read_varint_byte(msg: &[u8], at: &mut usize) -> Option<u64> {
     let first = *msg.get(*at)?;
     *at += 1;
     if first & 0x80 == 0 {
@@ -1791,7 +1756,7 @@ fn read_varint_byte(msg: &[u8], at: &mut usize) -> Option<u64> {
 }
 
 /// The `Data` field of a `Hunk`, and where it sits inside the message: the reader hands over the bytes where they lie, so the offset is part of the answer rather than something the caller finds again.
-#[inline(always)]
+#[inline]
 fn hunk_decode(msg: &[u8]) -> Option<(usize, &[u8])> {
     let mut at = 0;
     let mut data: &[u8] = &[];
@@ -2875,42 +2840,7 @@ mod tests {
     }
 
     #[test]
-    fn the_direct_reads_are_the_byte_loop_at_every_width_and_end() {
-        for value in [
-            0,
-            1,
-            0x7F,
-            0x80,
-            0x3FFF,
-            0x4000,
-            0x1F_FFFF,
-            0x20_0000,
-            u64::MAX,
-        ] {
-            let mut encoded = Vec::new();
-            push_varint(&mut encoded, value);
-            for pad in 0..12usize {
-                let mut buf = encoded.clone();
-                buf.resize(buf.len() + pad, 0);
-                let (mut direct_at, mut byte_at) = (0usize, 0usize);
-                let direct = read_varint(&buf, &mut direct_at);
-                let byte = read_varint_byte(&buf, &mut byte_at);
-                assert_eq!(direct, byte, "{value} with {pad} trailing octets");
-                assert_eq!(direct_at, byte_at, "{value} with {pad} trailing octets");
-                assert_eq!(direct, Some(value));
-            }
-            for cut in 0..encoded.len() {
-                let (mut direct_at, mut byte_at) = (0usize, 0usize);
-                let direct = read_varint(&encoded[..cut], &mut direct_at);
-                let byte = read_varint_byte(&encoded[..cut], &mut byte_at);
-                assert_eq!(direct, byte, "{value} cut at {cut}");
-                assert_eq!(direct_at, byte_at, "{value} cut at {cut}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_direct_writes_are_the_byte_loop_at_every_width() {
+    fn the_direct_write_is_the_byte_loop_at_every_width() {
         for value in [
             0,
             1,
@@ -2929,29 +2859,6 @@ mod tests {
             assert_eq!(direct_len, byte_len, "{value}");
             assert_eq!(direct[..direct_len], byte[..byte_len], "{value}");
         }
-    }
-
-    #[inline(never)]
-    fn direct_read_probe(buf: &[u8]) -> u64 {
-        let mut sum = 0u64;
-        for _ in 0..4096 {
-            let mut at = 0usize;
-            sum = sum
-                .wrapping_add(read_varint(std::hint::black_box(buf), &mut at).unwrap_or_default());
-        }
-        sum
-    }
-
-    #[inline(never)]
-    fn walk_read_probe(buf: &[u8]) -> u64 {
-        let mut sum = 0u64;
-        for _ in 0..4096 {
-            let mut at = 0usize;
-            sum = sum.wrapping_add(
-                read_varint_byte(std::hint::black_box(buf), &mut at).unwrap_or_default(),
-            );
-        }
-        sum
     }
 
     #[inline(never)]
@@ -2976,26 +2883,6 @@ mod tests {
             ) as u64);
         }
         sum
-    }
-
-    #[test]
-    fn the_direct_read_costs_the_second_byte_and_nothing_else() {
-        let mut encoded = Vec::new();
-        push_varint(&mut encoded, 16375);
-        assert_eq!(encoded.len(), 2);
-        let mut buf = [0u8; 16];
-        buf[..encoded.len()].copy_from_slice(&encoded);
-        assert_eq!(direct_read_probe(&buf), walk_read_probe(&buf));
-    }
-
-    #[test]
-    fn the_walk_read_costs_the_same_answer() {
-        let mut encoded = Vec::new();
-        push_varint(&mut encoded, 16375);
-        assert_eq!(encoded.len(), 2);
-        let mut buf = [0u8; 16];
-        buf[..encoded.len()].copy_from_slice(&encoded);
-        assert_eq!(walk_read_probe(&buf), direct_read_probe(&buf));
     }
 
     #[test]
