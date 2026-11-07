@@ -169,3 +169,70 @@ jobs:
           path: tun-bench-results
           retention-days: 30
           if-no-files-found: warn
+
+  raw:
+    name: raw device
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: tun-raw
+
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git python3 iproute2 util-linux iperf3 iputils-ping curl
+
+      - name: build the native device forwarder
+        run: cargo build --release --manifest-path scripts/tun-raw/Cargo.toml
+
+      - name: build the tun-rs benchmark suite
+        run: |
+          git init --quiet "$RUNNER_TEMP/tun-benchmark2"
+          git -C "$RUNNER_TEMP/tun-benchmark2" remote add origin https://github.com/tun-rs/tun-benchmark2
+          git -C "$RUNNER_TEMP/tun-benchmark2" fetch --quiet --no-tags --depth 1 origin e65a9ff57a3b6565215f83d2b97accda00ca7b3d
+          git -C "$RUNNER_TEMP/tun-benchmark2" checkout --quiet FETCH_HEAD
+          sed -i 's/tun-rs = { version = "2.8.1"/tun-rs = { version = "2.8.18"/' "$RUNNER_TEMP/tun-benchmark2/Cargo.toml"
+          if ! ( cd "$RUNNER_TEMP/tun-benchmark2" && cargo build --release --bins ); then
+            echo "the 2.8.18 build failed; falling back to the suite's 2.8.1 pin"
+            rm -f "$RUNNER_TEMP/tun-benchmark2/Cargo.lock"
+            git -C "$RUNNER_TEMP/tun-benchmark2" checkout -- Cargo.toml
+            ( cd "$RUNNER_TEMP/tun-benchmark2" && cargo build --release --bins )
+          fi
+          {
+            printf '| component | revision |\n|---|---|\n'
+            printf '| ferrox-tun-raw | `%s` |\n' "$(git rev-parse HEAD)"
+            printf '| tun-benchmark2 | `e65a9ff57a3b6565215f83d2b97accda00ca7b3d` |\n'
+            printf '| tun-rs | `2.8.18`, falling back to `2.8.1` |\n'
+          } > "$RUNNER_TEMP/tun-raw-identity.md"
+          cat "$RUNNER_TEMP/tun-raw-identity.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: raw throughput, udp, latency, cpu and memory
+        env:
+          FERROX_RAW: ${{ github.workspace }}/scripts/tun-raw/target/release/ferrox-tun-raw
+          TUN_RS_DIR: ${{ runner.temp }}/tun-benchmark2
+          OUT_DIR: tun-raw-results
+          DURATION: ${{ inputs.duration }}
+          REPEAT: ${{ inputs.repeat }}
+          QUEUES: ${{ inputs.queues }}
+        run: sudo -E sh scripts/tun-raw-bench.sh
+
+      - name: summary
+        if: always()
+        run: |
+          cat "$RUNNER_TEMP/tun-raw-identity.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          cat tun-raw-results/runner.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          cat tun-raw-results/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tun-raw-${{ github.run_id }}
+          path: tun-raw-results
+          retention-days: 30
+          if-no-files-found: warn
