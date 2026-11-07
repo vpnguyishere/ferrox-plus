@@ -27,7 +27,7 @@ const TX_QUEUE: usize = 1024;
 /// A writer keeps this many aggregate-sized buffers so GRO never allocates on
 /// the packet path; 32 packets fill one 64 KiB aggregate.
 #[cfg(target_os = "linux")]
-const WRITE_BATCH: usize = 32;
+const WRITE_BATCH: usize = 64;
 
 #[cfg(unix)]
 type WakeWriter = std::os::unix::net::UnixStream;
