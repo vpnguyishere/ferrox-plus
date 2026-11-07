@@ -648,6 +648,7 @@ unix unix-timeout-bound-read-back 50 ferrox-app-conn::tests::a_unix_read_timeout
 unix unix-path-past-the-field-refused 200 ferrox-app-conn::tests::a_unix_path_past_the_socket_field_is_refused
 
 # --- tun device inbound -----------------------------------------------------
+front-tun-smoltcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
 front-tun ops-retired-instructions UNBLESSED scripts/count-ops.sh
 front-tun dial-set-flows-matching-the-pinned-stack 3 ferrox-app-tun::tests::the_dial_set_matches_the_pinned_stream
 front-tun reverse-role-response-round-trips 1 ferrox-app-tun::tests::the_response_bytes_come_back_as_ip_packets

@@ -13720,10 +13720,11 @@ fn serve_tun_inbound(inbound: &Json, out: &Outbound, _address: &str) -> bool {
         prefix,
         queues,
     );
-    if matches!(
-        field("stack").and_then(Json::as_str),
-        Some("smoltcp" | "userspace")
-    ) {
+    let stack = field("stack").and_then(Json::as_str).unwrap_or("smoltcp");
+    if stack != "loopback" {
+        if !matches!(stack, "smoltcp" | "userspace") {
+            eprintln!("tun inbound: unknown stack `{stack}`, using the userspace stack");
+        }
         match crate::tun_stack::serve(&spec, out) {
             Ok(()) => return true,
             Err(error) => eprintln!("tun inbound: {error}"),
