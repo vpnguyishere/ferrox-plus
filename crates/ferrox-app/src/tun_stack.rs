@@ -6,6 +6,8 @@
 
 use std::io;
 use std::net::IpAddr;
+#[cfg(unix)]
+use std::os::fd::AsRawFd as _;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
@@ -22,6 +24,11 @@ use crate::wireguard::DeviceConfig;
 
 const RX_QUEUE: usize = 1024;
 const TX_QUEUE: usize = 1024;
+
+#[cfg(unix)]
+type WakeWriter = std::os::unix::net::UnixStream;
+#[cfg(not(unix))]
+type WakeWriter = ();
 
 /// Open the device and start one stack per queue.
 pub(crate) fn serve(spec: &Spec, out: &Outbound) -> io::Result<()> {
@@ -93,15 +100,31 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
     let (packets, incoming) = mpsc::sync_channel(RX_QUEUE);
     let (outgoing, writes) = mpsc::sync_channel(TX_QUEUE);
     let (recycle, reused) = mpsc::channel();
+    #[cfg(unix)]
+    let (wake_read, wake_write) = std::os::unix::net::UnixStream::pair().expect("tun wake pair");
+    #[cfg(unix)]
+    let _ = wake_write.set_nonblocking(true);
+    #[cfg(not(unix))]
+    let wake_write = ();
     let config = device_config(spec);
     let stack_out = out.clone();
     thread::spawn(move || {
+        #[cfg(unix)]
+        crate::wg_stack::serve_tun_device(
+            config,
+            incoming,
+            outgoing,
+            stack_out,
+            Some(recycle),
+            wake_read,
+        );
+        #[cfg(not(unix))]
         crate::wg_stack::serve_tun_device(config, incoming, outgoing, stack_out, Some(recycle));
     });
     let writer = Arc::clone(&device);
     thread::spawn(move || send_loop(writer, writes, offload));
     let mtu = spec.mtu();
-    thread::spawn(move || recv_loop(device, packets, reused, mtu));
+    thread::spawn(move || recv_loop(device, packets, reused, mtu, wake_write));
 }
 
 fn device_config(spec: &Spec) -> DeviceConfig {
@@ -124,6 +147,7 @@ fn recv_loop(
     packets: SyncSender<Packet>,
     reuse: Receiver<Vec<u8>>,
     mtu: usize,
+    wake: WakeWriter,
 ) {
     let mut original = vec![0u8; VIRTIO_NET_HDR_LEN + 65_535];
     let mut bufs: Vec<Vec<u8>> = (0..IDEAL_BATCH_SIZE)
@@ -155,6 +179,9 @@ fn recv_loop(
                 return;
             }
         }
+        if count > 0 {
+            wake_signal(&wake);
+        }
     }
 }
 
@@ -164,6 +191,7 @@ fn recv_loop(
     packets: SyncSender<Packet>,
     reuse: Receiver<Vec<u8>>,
     mtu: usize,
+    wake: WakeWriter,
 ) {
     let mut buffer = vec![0u8; mtu.max(1500) + 64];
     loop {
@@ -185,6 +213,7 @@ fn recv_loop(
         if packets.send(packet).is_err() {
             return;
         }
+        wake_signal(&wake);
     }
 }
 
@@ -219,6 +248,14 @@ fn send_loop(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, offload: bool)
 fn send_loop(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, _offload: bool) {
     send_plain(device, packets);
 }
+
+#[cfg(unix)]
+fn wake_signal(wake: &WakeWriter) {
+    let _ = unsafe { libc::write(wake.as_raw_fd(), b"\0".as_ptr().cast(), 1) };
+}
+
+#[cfg(not(unix))]
+fn wake_signal(_: &WakeWriter) {}
 
 fn packet_bytes(reuse: &Receiver<Vec<u8>>, source: &[u8]) -> Vec<u8> {
     let mut bytes = reuse.try_recv().unwrap_or_default();

@@ -1223,6 +1223,47 @@ pub(crate) fn server(
 }
 
 /// Run the server stack over a TUN until its reader is dropped.
+#[cfg(unix)]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn serve_tun_device(
+    config: DeviceConfig,
+    packets: Receiver<Packet>,
+    to_tunnel: SyncSender<Vec<u8>>,
+    out: Outbound,
+    recycle: Option<Sender<Vec<u8>>>,
+    wake: std::os::unix::net::UnixStream,
+) {
+    let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
+    stack.device.recycle = recycle;
+    let _ = wake.set_nonblocking(true);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let mut closed = false;
+        for _ in 0..RX_BURST {
+            match packets.try_recv() {
+                Ok(packet) => stack.receive(packet),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        let progressed = stack.poll(&mut buf);
+        if closed {
+            return;
+        }
+        if progressed {
+            continue;
+        }
+        if wait_for_tun(&stack, &wake) {
+            return;
+        }
+    }
+}
+
+/// Run the server stack over a TUN until its reader is dropped.
+#[cfg(not(unix))]
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn serve_tun_device(
     config: DeviceConfig,
@@ -1244,6 +1285,38 @@ pub(crate) fn serve_tun_device(
             return;
         }
     }
+}
+
+/// Wait until the TUN reader signals a packet or a local stream has bytes; the
+/// timeout services smoltcp's retransmit timers.
+#[cfg(unix)]
+fn wait_for_tun(stack: &ServerStack, wake: &std::os::unix::net::UnixStream) -> bool {
+    let mut fds = Vec::with_capacity(stack.flows.len() + 1);
+    fds.push(libc::pollfd {
+        fd: wake.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    for flow in &stack.flows {
+        if flow.up_pending() || flow.up_eof {
+            continue;
+        }
+        fds.push(libc::pollfd {
+            fd: flow.local.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    let timeout = TICK.as_millis() as libc::c_int;
+    let answered = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+    if answered <= 0 {
+        return answered < 0;
+    }
+    if fds[0].revents & libc::POLLIN != 0 {
+        let mut sink = [0u8; 256];
+        let _ = unsafe { libc::read(wake.as_raw_fd(), sink.as_mut_ptr().cast(), sink.len()) };
+    }
+    fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
 }
 
 /// One server turn, or true once the inbound is closed.
@@ -1419,7 +1492,7 @@ impl ClientStack {
             );
             socket.set_nagle_enabled(false);
             socket.set_ack_delay(None);
-            socket.set_congestion_control(CongestionControl::None);
+            socket.set_congestion_control(CongestionControl::Cubic);
             if let Err(error) = socket.connect(
                 self.iface.context(),
                 IpEndpoint::from(*destination),
@@ -1803,7 +1876,7 @@ impl ServerStack {
         );
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
-        socket.set_congestion_control(CongestionControl::None);
+        socket.set_congestion_control(CongestionControl::Cubic);
         if socket.listen(IpListenEndpoint { addr: None, port }).is_ok() {
             let handle = self.sockets.add(socket);
             listeners.push(Listener {
