@@ -1791,7 +1791,7 @@ fn read_varint_byte(msg: &[u8], at: &mut usize) -> Option<u64> {
 }
 
 /// The `Data` field of a `Hunk`, and where it sits inside the message: the reader hands over the bytes where they lie, so the offset is part of the answer rather than something the caller finds again.
-#[inline]
+#[inline(always)]
 fn hunk_decode(msg: &[u8]) -> Option<(usize, &[u8])> {
     let mut at = 0;
     let mut data: &[u8] = &[];
