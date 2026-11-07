@@ -67,7 +67,7 @@ fn open_tun(name: &str, offload: bool, multi_queue: bool) -> io::Result<File> {
 
     if offload {
         let offloads: libc::c_int = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
-        let rc = unsafe { libc::ioctl(fd, TUNSETOFFLOAD, &raw const offloads) };
+        let rc = unsafe { libc::ioctl(fd, TUNSETOFFLOAD, offloads as libc::c_ulong) };
         if rc < 0 {
             let error = io::Error::last_os_error();
             unsafe { libc::close(fd) };
@@ -139,9 +139,7 @@ fn main() -> io::Result<()> {
         right.push(open_tun(&iface2, offload, queues > 1)?);
     }
 
-    eprintln!(
-        "ferrox-tun-raw: {iface1} <-> {iface2} queues={queues} offload={offload}"
-    );
+    eprintln!("ferrox-tun-raw: {iface1} <-> {iface2} queues={queues} offload={offload}");
     let mut handles = Vec::with_capacity(queues * 2);
     for (l, r) in left.into_iter().zip(right) {
         let l2 = l.try_clone()?;

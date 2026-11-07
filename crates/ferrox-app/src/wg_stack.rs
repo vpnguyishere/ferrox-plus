@@ -1216,6 +1216,19 @@ pub(crate) fn server(
     }
 }
 
+/// Run the server stack over a TUN until its reader is dropped.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn serve_tun_device(
+    config: DeviceConfig,
+    packets: Receiver<Packet>,
+    to_tunnel: SyncSender<Vec<u8>>,
+    out: Outbound,
+) {
+    let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
+    let mut buf = vec![0u8; 64 * 1024];
+    while !server_turn(&mut stack, &packets, &mut buf) {}
+}
+
 /// One server turn, or true once the inbound is closed.
 fn server_turn(stack: &mut ServerStack, packets: &Packets, buf: &mut [u8]) -> bool {
     let mut closed = false;
@@ -1545,7 +1558,28 @@ impl ServerStack {
         out: Outbound,
         headroom: usize,
     ) -> Self {
-        let mut device = QueueDevice::new(INNER_MTU, headroom);
+        let fragment = if headroom == 0 {
+            TUNNEL_FRAGMENT
+        } else {
+            config.mtu
+        };
+        Self::with_mtu(config, to_tunnel, out, headroom, INNER_MTU, fragment)
+    }
+
+    /// Build the same interface over a TUN whose packets already carry their IP header.
+    fn new_tun(config: &DeviceConfig, to_tunnel: impl Into<ToTunnel>, out: Outbound) -> Self {
+        Self::with_mtu(config, to_tunnel, out, 0, config.mtu, config.mtu)
+    }
+
+    fn with_mtu(
+        config: &DeviceConfig,
+        to_tunnel: impl Into<ToTunnel>,
+        out: Outbound,
+        headroom: usize,
+        device_mtu: usize,
+        fragment: usize,
+    ) -> Self {
+        let mut device = QueueDevice::new(device_mtu, headroom);
         let mut iface = Interface::new(
             iface_config(0x5eed_5678),
             &mut device,
@@ -1569,11 +1603,7 @@ impl ServerStack {
             addresses: config.addresses.clone(),
             mtu: config.mtu,
             reassembly: Reassembly::default(),
-            fragment: if headroom == 0 {
-                TUNNEL_FRAGMENT
-            } else {
-                config.mtu
-            },
+            fragment,
             started: StdInstant::now(),
         }
     }

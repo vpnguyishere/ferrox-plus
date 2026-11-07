@@ -37,6 +37,7 @@ sha2 = { version = "0.11" }
 x25519-dalek = "3"
 socket2 = "0.6"
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic"] }
+tun-rs = "2.8.18"
 crypto_box = "0.9"
 snow = "0.10"
 curve25519-dalek = "4"

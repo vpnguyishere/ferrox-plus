@@ -46,21 +46,84 @@ pub(crate) fn is_device(protocol: &str) -> bool {
     matches!(protocol, "tun" | "utun" | "wintun" | "tun2socks")
 }
 
+const DEFAULT_ADDRESS: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(198, 18, 0, 1));
+const DEFAULT_PREFIX: u8 = 15;
+
 pub(crate) struct Spec {
     name: String,
     mtu: usize,
+    address: IpAddr,
+    prefix: u8,
+    queues: usize,
 }
 
 impl Spec {
     pub(crate) fn new(name: Option<&str>, mtu: Option<usize>) -> Self {
+        Self::with(name, mtu, None, None, None)
+    }
+
+    pub(crate) fn with(
+        name: Option<&str>,
+        mtu: Option<usize>,
+        address: Option<IpAddr>,
+        prefix: Option<u8>,
+        queues: Option<usize>,
+    ) -> Self {
         Self {
             name: name
                 .filter(|n| !n.is_empty())
                 .unwrap_or("ferrox0")
                 .to_owned(),
             mtu: mtu.filter(|m| *m > 0).unwrap_or(DEFAULT_MTU),
+            address: address.unwrap_or(DEFAULT_ADDRESS),
+            prefix: prefix.filter(|p| *p > 0).unwrap_or(DEFAULT_PREFIX),
+            queues: queues.filter(|q| *q > 0).unwrap_or_else(default_queues),
         }
     }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn mtu(&self) -> usize {
+        self.mtu
+    }
+
+    pub(crate) fn address(&self) -> IpAddr {
+        self.address
+    }
+
+    pub(crate) fn prefix(&self) -> u8 {
+        self.prefix
+    }
+
+    pub(crate) fn queues(&self) -> usize {
+        self.queues
+    }
+}
+
+pub(crate) fn default_queues() -> usize {
+    if cfg!(target_os = "linux") {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
+    } else {
+        1
+    }
+}
+
+/// Split `address[/prefix]` and let an explicit `prefix` fill a missing CIDR.
+pub(crate) fn parse_address(
+    value: Option<&str>,
+    prefix: Option<u32>,
+) -> (Option<IpAddr>, Option<u8>) {
+    let explicit = prefix.and_then(|p| u8::try_from(p).ok());
+    let Some(value) = value else {
+        return (None, explicit);
+    };
+    let (address, cidr) = match value.split_once('/') {
+        Some((address, prefix)) => (address, prefix.parse::<u8>().ok()),
+        None => (value, None),
+    };
+    (address.parse::<IpAddr>().ok(), cidr.or(explicit))
 }
 
 #[derive(Debug, Clone, Copy)]

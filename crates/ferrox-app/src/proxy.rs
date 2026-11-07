@@ -13702,10 +13702,33 @@ fn serve_tun_inbound(inbound: &Json, out: &Outbound, _address: &str) -> bool {
             .and_then(|s| s.get(key))
             .or_else(|| inbound.get(key))
     };
-    let spec = crate::tun::Spec::new(
+    let (address, prefix) = crate::tun::parse_address(
+        field("address").and_then(|value| match value {
+            Json::Str(text) => Some(text.as_str()),
+            Json::Arr(items) => items.first().and_then(Json::as_str),
+            _ => None,
+        }),
+        field("prefix").and_then(Json::as_u32),
+    );
+    let queues = field("queues")
+        .and_then(Json::as_u32)
+        .and_then(|queues| usize::try_from(queues).ok());
+    let spec = crate::tun::Spec::with(
         field("name").and_then(Json::as_str),
         field("mtu").and_then(Json::as_u32).map(|m| m as usize),
+        address,
+        prefix,
+        queues,
     );
+    if matches!(
+        field("stack").and_then(Json::as_str),
+        Some("smoltcp" | "userspace")
+    ) {
+        match crate::tun_stack::serve(&spec, out) {
+            Ok(()) => return true,
+            Err(error) => eprintln!("tun inbound: {error}"),
+        }
+    }
     let Ok(device) = crate::tun::Device::open(&spec) else {
         eprintln!("tun inbound: {}", crate::tun::refusal_reason(&spec));
         return false;

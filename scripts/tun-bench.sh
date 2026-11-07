@@ -150,7 +150,7 @@ services() {
 
 start_ferrox() {
     [ -n "$FERROX" ] || return 1
-    printf '%s\n' "{\"inbounds\":[{\"tag\":\"tun\",\"protocol\":\"tun\",\"settings\":{\"name\":\"fx0\",\"mtu\":$MTU}}],\"outbounds\":[{\"tag\":\"proxy\",\"protocol\":\"socks\",\"settings\":{\"servers\":[{\"address\":\"$VETH_SERVER\",\"port\":$SOCKS_PORT}]}}]}" \
+    printf '%s\n' "{\"inbounds\":[{\"tag\":\"tun\",\"protocol\":\"tun\",\"settings\":{\"name\":\"fx0\",\"mtu\":$MTU,\"stack\":\"smoltcp\",\"address\":\"$TUN_ADDR\",\"prefix\":$TUN_PREFIX,\"queues\":$QUEUES}}],\"outbounds\":[{\"tag\":\"proxy\",\"protocol\":\"socks\",\"settings\":{\"servers\":[{\"address\":\"$VETH_SERVER\",\"port\":$SOCKS_PORT}]}}]}" \
         > "$OUT_DIR/ferrox.json"
     "$FERROX" run -c "$OUT_DIR/ferrox.json" > "$OUT_DIR/ferrox.log" 2>&1 &
     ENGINE_PIDS=$!

@@ -70,6 +70,7 @@ mod socks;
 mod stats;
 mod transparent;
 mod tun;
+mod tun_stack;
 mod veepn;
 mod vision;
 mod vmess;
