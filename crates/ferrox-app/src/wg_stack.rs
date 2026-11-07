@@ -1539,6 +1539,7 @@ impl ClientStack {
     fn poll(&mut self, buf: &mut [u8]) -> bool {
         let now = self.now();
         self.reassembly.expire();
+        self.iface.poll(now, &mut self.device, &mut self.sockets);
         let ready = self.readiness.sync(&self.flows);
         let mut retiring = std::mem::take(&mut self.retiring);
         let mut moved = false;
