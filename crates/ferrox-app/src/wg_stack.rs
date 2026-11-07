@@ -41,10 +41,10 @@ use crate::wireguard::{DeviceConfig, PeerConfig};
 
 /// The receive side of one flow: a peer may have this much in flight before a
 /// window update, which is the reference's order of magnitude.
-const TCP_RECV_BUFFER: usize = 512 * 1024;
+const TCP_RECV_BUFFER: usize = 1024 * 1024;
 /// The send side of one flow: a stream moves this queue per round trip, and a
 /// tunnel's round trip is milliseconds, so the queue bounds a fast link.
-const TCP_SEND_BUFFER: usize = 2 * 1024 * 1024;
+const TCP_SEND_BUFFER: usize = 1024 * 1024;
 /// One turn drains at most this many local reads into a flow, so a download
 /// does not wait a whole tick for each buffer when the peer is far ahead.
 const UP_BURST: usize = 64;
