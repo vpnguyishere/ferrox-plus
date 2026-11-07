@@ -48,6 +48,12 @@ const TCP_SEND_BUFFER: usize = 2 * 1024 * 1024;
 /// One turn drains at most this many local reads into a flow, so a download
 /// does not wait a whole tick for each buffer when the peer is far ahead.
 const UP_BURST: usize = 64;
+
+static DBG_PUMP_NS: AtomicU64 = AtomicU64::new(0);
+static DBG_IFACE_NS: AtomicU64 = AtomicU64::new(0);
+static DBG_TX_NS: AtomicU64 = AtomicU64::new(0);
+static DBG_UP_BYTES: AtomicU64 = AtomicU64::new(0);
+static DBG_DOWN_BYTES: AtomicU64 = AtomicU64::new(0);
 /// The most answers a client races for one target.
 const RACES: usize = 8;
 /// A pinned lane re-races its answers after this long without a reply.
@@ -1237,7 +1243,20 @@ pub(crate) fn serve_tun_device(
     stack.device.recycle = recycle;
     let _ = wake.set_nonblocking(true);
     let mut buf = vec![0u8; 64 * 1024];
+    let mut last = StdInstant::now();
     loop {
+        if last.elapsed() >= Duration::from_secs(2) {
+            eprintln!(
+                "TUNDBG pump={}ms iface={}ms tx={}ms up={}MB down={}MB flows={}",
+                DBG_PUMP_NS.swap(0, Ordering::Relaxed) / 1_000_000,
+                DBG_IFACE_NS.swap(0, Ordering::Relaxed) / 1_000_000,
+                DBG_TX_NS.swap(0, Ordering::Relaxed) / 1_000_000,
+                DBG_UP_BYTES.swap(0, Ordering::Relaxed) / 1_000_000,
+                DBG_DOWN_BYTES.swap(0, Ordering::Relaxed) / 1_000_000,
+                stack.flows.len()
+            );
+            last = StdInstant::now();
+        }
         let mut closed = false;
         for _ in 0..RX_BURST {
             match packets.try_recv() {
@@ -1798,23 +1817,32 @@ impl ServerStack {
             self.listen(port);
         }
         let now = self.now();
+        let t = StdInstant::now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+        DBG_IFACE_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.handoff();
         let ready = self.readiness.sync(&self.flows);
         let mut moved = false;
+        let t = StdInstant::now();
         for (flow, &up_ready) in self.flows.iter_mut().zip(ready) {
             moved |= pump(flow, &mut self.sockets, buf, up_ready);
         }
+        DBG_PUMP_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let t = StdInstant::now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+        DBG_IFACE_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let t = StdInstant::now();
         for _ in 0..TX_BURST {
             let Some(mut packet) = self.device.tx.pop_front() else {
                 break;
             };
             lower_syn_ack_mss(&mut packet, self.headroom, self.mtu);
             if !send_packet(&self.to_tunnel, packet, self.headroom, self.fragment) {
+                DBG_TX_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 return moved;
             }
         }
+        DBG_TX_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.flows.retain(|flow| {
             if flow.done {
                 let _ = flow.local.shutdown(Shutdown::Both);
@@ -1982,6 +2010,7 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
         match socket.recv_slice(buf) {
             Ok(0) | Err(RecvError::InvalidState) => break,
             Ok(n) => {
+                DBG_UP_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                 moved = true;
                 let mut at = 0;
                 while at < n {
@@ -2038,6 +2067,7 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
                     break;
                 }
                 Ok(n) => {
+                    DBG_DOWN_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                     moved = true;
                     bursts += 1;
                     match socket.send_slice(&buf[..n]) {
