@@ -48,10 +48,6 @@ const TCP_SEND_BUFFER: usize = 2 * 1024 * 1024;
 /// One turn drains at most this many local reads into a flow, so a download
 /// does not wait a whole tick for each buffer when the peer is far ahead.
 const UP_BURST: usize = 64;
-/// The virtio header a Linux TUN expects before each packet; the transmit
-/// token reserves it so the writer does not copy the segment again.
-#[cfg(target_os = "linux")]
-const TUN_HEADROOM: usize = 10;
 /// The most answers a client races for one target.
 const RACES: usize = 8;
 /// A pinned lane re-races its answers after this long without a reply.
@@ -152,7 +148,6 @@ struct QueueDevice {
     tx: VecDeque<Vec<u8>>,
     mtu: usize,
     headroom: usize,
-    tx_headroom: usize,
     recycle: Option<Sender<Vec<u8>>>,
 }
 
@@ -164,7 +159,6 @@ impl QueueDevice {
             tx: VecDeque::new(),
             mtu,
             headroom,
-            tx_headroom: headroom,
             recycle: None,
         }
     }
@@ -275,7 +269,7 @@ impl Device for QueueDevice {
             },
             QueueTx {
                 tx: &mut self.tx,
-                headroom: self.tx_headroom,
+                headroom: self.headroom,
             },
         ))
     }
@@ -284,7 +278,7 @@ impl Device for QueueDevice {
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(QueueTx {
             tx: &mut self.tx,
-            headroom: self.tx_headroom,
+            headroom: self.headroom,
         })
     }
 
@@ -1664,12 +1658,7 @@ impl ServerStack {
 
     /// Build the same interface over a TUN whose packets already carry their IP header.
     fn new_tun(config: &DeviceConfig, to_tunnel: impl Into<ToTunnel>, out: Outbound) -> Self {
-        let mut stack = Self::with_mtu(config, to_tunnel, out, 0, config.mtu, config.mtu);
-        #[cfg(target_os = "linux")]
-        {
-            stack.device.tx_headroom = TUN_HEADROOM;
-        }
-        stack
+        Self::with_mtu(config, to_tunnel, out, 0, config.mtu, config.mtu)
     }
 
     fn with_mtu(

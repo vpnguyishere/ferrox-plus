@@ -230,10 +230,10 @@ fn send_loop(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, offload: bool)
             return;
         };
         batch.clear();
-        batch.push(packet);
+        batch.push(with_headroom(&packet));
         while batch.len() < IDEAL_BATCH_SIZE {
             match packets.try_recv() {
-                Ok(packet) => batch.push(packet),
+                Ok(packet) => batch.push(with_headroom(&packet)),
                 Err(_) => break,
             }
         }
@@ -266,13 +266,16 @@ fn packet_bytes(reuse: &Receiver<Vec<u8>>, source: &[u8]) -> Vec<u8> {
 
 fn send_plain(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>) {
     while let Ok(packet) = packets.recv() {
-        #[cfg(target_os = "linux")]
-        let packet = &packet[VIRTIO_NET_HDR_LEN..];
-        #[cfg(not(target_os = "linux"))]
-        let packet = &packet[..];
-        if let Err(error) = device.send(packet) {
+        if let Err(error) = device.send(&packet) {
             eprintln!("tun write: {error}");
             return;
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn with_headroom(packet: &[u8]) -> Vec<u8> {
+    let mut buffer = vec![0u8; VIRTIO_NET_HDR_LEN + packet.len()];
+    buffer[VIRTIO_NET_HDR_LEN..].copy_from_slice(packet);
+    buffer
 }
