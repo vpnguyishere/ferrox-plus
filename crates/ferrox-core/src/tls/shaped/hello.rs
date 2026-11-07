@@ -125,6 +125,11 @@ impl Hello {
         self.ciphers.as_deref().unwrap_or(self.profile.ciphers)
     }
 
+    /// Whether this hello offered `id`, so a server may select it.
+    pub(crate) fn offers_cipher(&self, id: u16) -> bool {
+        self.cipher_table().contains(&id)
+    }
+
     /// Replaces the hello's ALPN table with the config's list.
     pub(crate) fn set_alpn(&mut self, alpn: &[Vec<u8>]) {
         if !alpn.is_empty() {

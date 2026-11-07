@@ -191,26 +191,16 @@ proxy::decode_trojan_request 1170 proxy::tests::the_trojan_header_costs_two_read
 # but this probe's messages do not walk it. The messages, offsets, prefixes and
 # bytes are unchanged.
 grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
-# The sniff probe's frame in the app binary, re-measured by count-ops on
-# 2026-11-04: one pre-warmed inspection prices the peek and the host parse, 1228.
-# The vmess carrier's added code moved this frame's codegen on this tree; the
-# messages, offsets and bytes are unchanged, and a docs-only tree still reads 1220.
-# The test that used to carry this row measured 35898 for two inspections, most
-# of it the first call's 32 KiB buffer growth, so the row named more than the
-# page's claim; the warm count test holds exactly one call and the buffer is the
-# worker thread's before it. `the_probe_buffer_is_the_worker_threads_not_the_flows`
-# stays as the witness for that buffer's identity and capacity, which this row
-# cannot see.
-# Re-blessed 1231 by p2-ech: the shaped-ECH sealer and cover changes in
-# ferrox-core move this frame's thin-LTO layout by three instructions;
-# sniff.rs and the warm probe are untouched, and the bytes are unchanged.
-# Re-blessed 1228 by psiphon-in-place: the in-place QUIC and WebRTC payload
-# handling and its five allocation tests in the same app binary move this
-# frame's thin-LTO layout back by three; sniff.rs, the warm probe and the
-# bytes are unchanged.
-# Re-blessed 1220 after the TLS 1.2 carrier and psiphon config-gap landings
-# moved this frame's thin-LTO layout again; sniff.rs, the warm probe and the
-# bytes are unchanged.
+# Blessed 102414 by grpc-common-varint-write: 4096 two-byte Hunk lengths of
+# 16375 now take the direct write, against 118798 for the byte loop on the same
+# run, so the loop took 16384 (13.8%) out. The read keeps its loop: a direct
+# two/three-byte read moved the one-byte probe above to 84003, so that rewrite
+# did not land. The bytes, lengths and the 73251 row are unchanged.
+grpc::tests::direct_write_probe 102414 grpc::tests::the_direct_write_costs_the_second_byte_and_nothing_else
+# sniff::Sniffing::inspect is reported in scripts/method-ops.txt, not gated:
+# its loopback probe's frame has read 1228 and 1231 on the same source, so an
+# exact row here would be a coin flip. The probe test still asserts the domain
+# and the allocation ceiling; the page's number is the latest report.
 # The wireguard routing test runs both lookups over 512 peers: the peer-by-peer
 # scan and the prefix table for the same destination. Both rows come from one
 # test and one binary, so their difference is the lookup and not the build.
@@ -221,4 +211,10 @@ ferrox_app::wg::tests::route_table_once 585 wg::tests::a_prefix_table_picks_the_
 # values, offsets and refusals are unchanged.
 # (The byte row stays in scripts/method-ops.txt as the comparison.)
 ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::the_word_varint_read_costs_the_load_and_nothing_else
-ferrox_app::sniff::Sniffing::inspect 1220 sniff::tests::a_warm_probe_costs_the_documented_instructions
+# The four-slice SSH packet sealed 4096 times through the direct write reports
+# 47483770; flattening the same slices into one and sealing that reports
+# 47621538. The direct probe is 137768 (0.29%) lower, a net that includes the
+# flatten copy and the four-slices-versus-one effect, not the previous writer's
+# framing loop. The bytes and their order are unchanged.
+ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47483770 psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621538 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy

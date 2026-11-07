@@ -10,7 +10,6 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use hkdf::Hkdf;
 use sha2::Sha256;
-use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RECORD_VERSION: u8 = 1;
@@ -376,7 +375,7 @@ impl Client {
         timeout: Duration,
         proxy: Option<&Proxy>,
         headers: &[(String, String)],
-        dns: &[SocketAddr],
+        dns: &crate::psiphon_dns::Config,
     ) -> Result<Self, String> {
         let sni = if front.disable_sni || front.dial.parse::<std::net::IpAddr>().is_ok() {
             String::new()
@@ -399,10 +398,12 @@ impl Client {
             fronted: true,
             protocol: "INPROXY-BROKER",
             headers: headers.to_vec(),
-            dns: dns.to_vec(),
+            dns: Vec::new(),
+            provider_id: None,
             shape: crate::psiphon_ssh::TlsShape::default(),
         };
-        let http = psiphon_meek::MeekHttp::new_plain(meek, proxy.cloned(), timeout, BROKER_PATH);
+        let http = psiphon_meek::MeekHttp::new_plain(meek, proxy.cloned(), timeout, BROKER_PATH)
+            .with_dns(dns.clone());
         let transport = Box::new(MeekTransport { http });
         Self::new(broker, transport, random::<32>())
     }
@@ -640,6 +641,18 @@ fn api_parameters(identity: &Identity<'_>) -> Value {
         (Value::UInt(9), Value::Text(identity.platform.to_owned())),
         (Value::UInt(54), Value::Text("unknown".to_owned())),
     ];
+    if !identity.authorizations.is_empty() {
+        fields.push((
+            Value::UInt(1),
+            Value::Array(
+                identity
+                    .authorizations
+                    .iter()
+                    .map(|authorization| Value::Text(authorization.clone()))
+                    .collect(),
+            ),
+        ));
+    }
     if !identity.client_features.is_empty() {
         fields.push((
             Value::UInt(10),

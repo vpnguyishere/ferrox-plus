@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
-const MAX_PAYLOAD: usize = 64 * 1024;
+pub(crate) const MAX_REQUEST_PAYLOAD: usize = 64 * 1024;
 const LIMITED_READ_CHUNK: usize = 4 * 1024;
 const MIN_COOKIE_PADDING: usize = 16;
 const MAX_COOKIE_PADDING: usize = 256;
@@ -19,6 +19,100 @@ const MAX_POLL: Duration = Duration::from_secs(5);
 const POLL_GROWTH: f64 = 1.5;
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
+
+const ALTERNATE_CONTENT_TYPES: &[&str] = &[
+    "application/octet-stream",
+    "audio/mpeg",
+    "image/jpeg",
+    "video/mpeg",
+];
+
+/// The per-connection meek choices the reference draws for the lifetime of
+/// the relay: the cookie name, request content type, payload cap and the
+/// probability a successful round trip drops the connection.
+#[derive(Clone, Debug)]
+struct Profile {
+    /// The cookie name drawn for this connection.
+    cookie_name: String,
+    /// The request content type drawn for this connection.
+    content_type: &'static str,
+    /// The largest request body this connection may send.
+    request_limit: usize,
+    /// The chance a successful round trip drops the connection.
+    redial_tls: f64,
+}
+
+/// One random coin with the given probability.
+fn coin_probability(probability: f64) -> bool {
+    if probability <= 0.0 {
+        return false;
+    }
+    if probability >= 1.0 {
+        return true;
+    }
+    f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0 < probability
+}
+
+/// A random value in `0..bound`.
+fn random_below(bound: u64) -> u64 {
+    if bound <= 1 {
+        return 0;
+    }
+    u64::from_be_bytes(random::<8>()) % bound
+}
+
+/// The reference's alternate cookie name: two to ten characters from `[a-z_]`.
+fn alternate_cookie_name() -> String {
+    let length = 2 + usize::from(random::<1>()[0]) % 9;
+    (0..length)
+        .map(|_| {
+            let draw = random::<1>()[0] % 27;
+            if draw == 26 {
+                '_'
+            } else {
+                char::from(b'a' + draw)
+            }
+        })
+        .collect()
+}
+
+/// Choose the reference's per-connection meek values from the lane shape.
+fn profile(shape: &TlsShape, protocol: &str) -> Profile {
+    let cookie_name = if coin_probability(shape.meek_alternate_cookie_name) {
+        alternate_cookie_name()
+    } else {
+        char::from(b'A' + random::<1>()[0] % 26).to_string()
+    };
+    let content_type = if coin_probability(shape.meek_alternate_content_type) {
+        ALTERNATE_CONTENT_TYPES[usize::from(random::<1>()[0]) % ALTERNATE_CONTENT_TYPES.len()]
+    } else {
+        ALTERNATE_CONTENT_TYPES[0]
+    };
+    let shaped = shape.meek_traffic_shaping_protocols.is_empty()
+        || shape
+            .meek_traffic_shaping_protocols
+            .iter()
+            .any(|name| name == protocol || name == &cookie_protocol(protocol));
+    let (request_limit, redial_tls) = if shaped && coin_probability(shape.meek_traffic_shaping) {
+        let low = shape.meek_min_limit_request.clamp(1, MAX_REQUEST_PAYLOAD);
+        let high = shape
+            .meek_max_limit_request
+            .clamp(1, MAX_REQUEST_PAYLOAD)
+            .max(low);
+        let request_limit = low
+            + usize::try_from(random_below(u64::try_from(high - low).unwrap_or(0) + 1))
+                .unwrap_or(0);
+        (request_limit, shape.meek_redial_tls)
+    } else {
+        (MAX_REQUEST_PAYLOAD, 0.0)
+    };
+    Profile {
+        cookie_name,
+        content_type,
+        request_limit,
+        redial_tls,
+    }
+}
 
 /// Choose the HTTP/1 response body chunk size for the active buffer limit.
 fn response_read_chunk(limit: bool) -> usize {
@@ -56,6 +150,7 @@ pub(crate) struct Meek {
     pub(crate) quic: bool,
     pub(crate) fronted: bool,
     pub(crate) protocol: &'static str,
+    pub(crate) provider_id: Option<String>,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) dns: Vec<SocketAddr>,
     pub(crate) shape: TlsShape,
@@ -66,6 +161,7 @@ pub(crate) fn connect(
     meek: &Meek,
     timeout: Duration,
     proxy: Option<&Proxy>,
+    dns: &crate::psiphon_dns::Config,
     limit_buffer_sizes: bool,
 ) -> Result<TcpStream, String> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -82,13 +178,19 @@ pub(crate) fn connect(
         .map_err(|error| format!("psiphon meek loopback: {error}"))?;
     let config = meek.clone();
     let proxy = proxy.cloned();
+    let dns = dns.clone();
     std::thread::Builder::new()
         .name("psiphon-meek".to_owned())
         .spawn(move || match listener.accept() {
             Ok((socket, _)) => {
-                if let Err(why) =
-                    relay(socket, &config, proxy.as_ref(), timeout, limit_buffer_sizes)
-                {
+                if let Err(why) = relay(
+                    socket,
+                    &config,
+                    proxy.as_ref(),
+                    timeout,
+                    &dns,
+                    limit_buffer_sizes,
+                ) {
                     eprintln!("psiphon: fronted-meek relay: {why}");
                 }
             }
@@ -154,8 +256,10 @@ pub(crate) fn post(
     body: &[u8],
     timeout: Duration,
     proxy: Option<&Proxy>,
+    dns: &crate::psiphon_dns::Config,
 ) -> Result<Vec<u8>, String> {
-    let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, path, endpoint)?;
+    let mut http =
+        MeekHttp::new(meek.clone(), proxy.cloned(), timeout, path, endpoint)?.with_dns(dns.clone());
     http.round_trip(body)
 }
 
@@ -194,19 +298,22 @@ fn start_relay(
     Ok(local)
 }
 
+/// Carry the fronted meek relay until the local stream closes.
 fn relay(
     mut local: TcpStream,
     meek: &Meek,
     proxy: Option<&Proxy>,
     timeout: Duration,
+    dns: &crate::psiphon_dns::Config,
     limit_buffer_sizes: bool,
 ) -> Result<(), String> {
     local
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("psiphon meek socket: {error}"))?;
     let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, "/", None)?
+        .with_dns(dns.clone())
         .with_limit_buffer_sizes(limit_buffer_sizes);
-    let mut buffer = vec![0u8; MAX_PAYLOAD];
+    let mut buffer = vec![0u8; http.request_limit()];
     let mut interval = POLL;
     loop {
         local
@@ -240,6 +347,7 @@ fn relay(
     Ok(())
 }
 
+/// Carry a preconnected in-proxy meek relay until the local stream closes.
 fn relay_stream(
     mut local: TcpStream,
     meek: &Meek,
@@ -252,7 +360,7 @@ fn relay_stream(
         .map_err(|error| format!("psiphon meek socket: {error}"))?;
     let mut http = MeekHttp::new_over(meek.clone(), timeout, "/", transport)?
         .with_limit_buffer_sizes(limit_buffer_sizes);
-    let mut buffer = vec![0u8; MAX_PAYLOAD];
+    let mut buffer = vec![0u8; http.request_limit()];
     let mut interval = POLL;
     loop {
         local
@@ -286,10 +394,18 @@ fn relay_stream(
     Ok(())
 }
 
+/// A TCP stream with or without the fragmentor beneath TLS.
+enum FragmentOrTcp {
+    Tcp(TcpStream),
+    Fragment(crate::psiphon_fragment::FragmentStream),
+}
+
 /// A plain TCP or TLS stream carrying meek HTTP.
 enum MeekStream {
     Plain(TcpStream),
+    Fragment(crate::psiphon_fragment::FragmentStream),
     Tls(ClientSession<TcpStream>),
+    TlsFragment(ClientSession<crate::psiphon_fragment::FragmentStream>),
     WebRtc(WebRtcStream),
     TlsWebRtc(ClientSession<WebRtcStream>),
     H3(Box<crate::psiphon_h3::H3>),
@@ -300,7 +416,9 @@ impl Read for MeekStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(stream) => stream.read(buf),
+            Self::Fragment(stream) => stream.read(buf),
             Self::Tls(stream) => stream.read(buf),
+            Self::TlsFragment(stream) => stream.read(buf),
             Self::WebRtc(stream) => stream.read(buf),
             Self::TlsWebRtc(stream) => stream.read(buf),
             Self::H3(_) => Err(std::io::Error::other("psiphon h3 is not a byte stream")),
@@ -313,7 +431,9 @@ impl Write for MeekStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(stream) => stream.write(buf),
+            Self::Fragment(stream) => stream.write(buf),
             Self::Tls(stream) => stream.write(buf),
+            Self::TlsFragment(stream) => stream.write(buf),
             Self::WebRtc(stream) => stream.write(buf),
             Self::TlsWebRtc(stream) => stream.write(buf),
             Self::H3(_) => Err(std::io::Error::other("psiphon h3 is not a byte stream")),
@@ -324,7 +444,9 @@ impl Write for MeekStream {
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Self::Plain(stream) => stream.flush(),
+            Self::Fragment(stream) => stream.flush(),
             Self::Tls(stream) => stream.flush(),
+            Self::TlsFragment(stream) => stream.flush(),
             Self::WebRtc(stream) => stream.flush(),
             Self::TlsWebRtc(stream) => stream.flush(),
             Self::H3(_) => Ok(()),
@@ -338,7 +460,9 @@ impl MeekStream {
     fn write_parts(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         match self {
             Self::Plain(stream) => crate::proxy::write_all_parts::<2>(stream, parts),
+            Self::Fragment(stream) => crate::proxy::write_all_parts::<2>(stream, parts),
             Self::Tls(stream) => stream.write_all_slices(parts),
+            Self::TlsFragment(stream) => stream.write_all_slices(parts),
             Self::WebRtc(stream) => crate::proxy::write_all_parts::<2>(stream, parts),
             Self::TlsWebRtc(stream) => stream.write_all_slices(parts),
             Self::H3(_) => Err(std::io::Error::other("psiphon h3 is not a byte stream")),
@@ -349,8 +473,11 @@ impl MeekStream {
     fn peer_closed(&self) -> bool {
         let stream = match self {
             Self::Plain(stream) => stream,
+            Self::Fragment(stream) => stream.get_ref(),
             Self::Tls(stream) if stream.closed() => return true,
             Self::Tls(stream) => stream.get_ref(),
+            Self::TlsFragment(stream) if stream.closed() => return true,
+            Self::TlsFragment(stream) => stream.get_ref().get_ref(),
             Self::WebRtc(_) => return false,
             Self::TlsWebRtc(stream) => return stream.closed(),
             Self::H3(h3) => return h3.is_closed(),
@@ -372,10 +499,12 @@ pub(crate) struct MeekHttp {
     path: &'static str,
     stream: Option<MeekStream>,
     cookie: Option<(String, String)>,
+    profile: Profile,
     front_index: usize,
     alpn_warned: bool,
     preconnected: bool,
     limit_buffer_sizes: bool,
+    dns: crate::psiphon_dns::Config,
 }
 
 impl MeekHttp {
@@ -387,7 +516,9 @@ impl MeekHttp {
         path: &'static str,
         endpoint: Option<&'static str>,
     ) -> Result<Self, String> {
-        let cookie = Some(make_cookie(&meek, endpoint)?);
+        let chosen = profile(&meek.shape, meek.protocol);
+        let cookie = Some(make_cookie(&meek, endpoint, &chosen.cookie_name)?);
+        let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
         Ok(Self {
             meek,
             proxy,
@@ -395,10 +526,12 @@ impl MeekHttp {
             path,
             stream: None,
             cookie,
+            profile: chosen,
             front_index: 0,
             alpn_warned: false,
             preconnected: false,
             limit_buffer_sizes: false,
+            dns,
         })
     }
 
@@ -409,6 +542,13 @@ impl MeekHttp {
         timeout: Duration,
         path: &'static str,
     ) -> Self {
+        let chosen = Profile {
+            cookie_name: String::new(),
+            content_type: ALTERNATE_CONTENT_TYPES[0],
+            request_limit: MAX_REQUEST_PAYLOAD,
+            redial_tls: 0.0,
+        };
+        let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
         Self {
             meek,
             proxy,
@@ -416,10 +556,12 @@ impl MeekHttp {
             path,
             stream: None,
             cookie: None,
+            profile: chosen,
             front_index: 0,
             alpn_warned: false,
             preconnected: false,
             limit_buffer_sizes: false,
+            dns,
         }
     }
 
@@ -430,7 +572,9 @@ impl MeekHttp {
         path: &'static str,
         stream: MeekStream,
     ) -> Result<Self, String> {
-        let cookie = Some(make_cookie(&meek, None)?);
+        let chosen = profile(&meek.shape, meek.protocol);
+        let cookie = Some(make_cookie(&meek, None, &chosen.cookie_name)?);
+        let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
         Ok(Self {
             meek,
             proxy: None,
@@ -438,11 +582,19 @@ impl MeekHttp {
             path,
             stream: Some(stream),
             cookie,
+            profile: chosen,
             front_index: 0,
             alpn_warned: false,
             preconnected: true,
             limit_buffer_sizes: false,
+            dns,
         })
+    }
+
+    /// Use the lane's resolver knobs and cache instead of a per-client default.
+    pub(crate) fn with_dns(mut self, dns: crate::psiphon_dns::Config) -> Self {
+        self.dns = dns;
+        self
     }
 
     /// Apply `LimitMeekBufferSizes` to both response readers.
@@ -463,26 +615,36 @@ impl MeekHttp {
         h3_read_chunk(self.limit_buffer_sizes)
     }
 
+    /// The largest request body this connection may stage.
+    fn request_limit(&self) -> usize {
+        self.profile.request_limit
+    }
+
     /// Send one request body and return the response body.
     pub(crate) fn round_trip(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
         if self.stream.is_none() {
             self.open()?;
         }
-        match self.exchange(body) {
-            Ok(reply) => Ok(reply),
+        let reply = match self.exchange(body) {
+            Ok(reply) => reply,
             Err(why) if body.is_empty() && !self.preconnected => {
                 self.stream = None;
                 self.open()?;
-                self.exchange(body).map_err(|_| why)
+                self.exchange(body).map_err(|_| why)?
             }
             Err(why) => {
                 self.stream = None;
-                Err(why)
+                return Err(why);
             }
+        };
+        if coin_probability(self.profile.redial_tls) && !self.preconnected {
+            self.stream = None;
         }
+        Ok(reply)
     }
 
     /// Dial the next front and start a TLS session when required.
+    #[allow(clippy::too_many_lines)]
     fn open(&mut self) -> Result<(), String> {
         if self.preconnected {
             return Err("psiphon meek connection is gone".to_owned());
@@ -499,16 +661,21 @@ impl MeekHttp {
                 self.meek.port,
                 &sni,
                 self.timeout,
-                &self.meek.dns,
+                &self.dns,
             )?;
             self.stream = Some(MeekStream::H3(Box::new(h3)));
             return Ok(());
         }
-        let address = crate::psiphon_dns::resolve(&self.meek.dial, self.meek.port, &self.meek.dns)
-            .map_err(|error| format!("psiphon meek resolve {}: {error}", self.meek.dial))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| format!("psiphon meek resolve {}: no address", self.meek.dial))?;
+        let address = crate::psiphon_dns::resolve_fronting(
+            &self.dns,
+            self.meek.provider_id.as_deref(),
+            &self.meek.dial,
+            self.meek.port,
+        )
+        .map_err(|error| format!("psiphon meek resolve {}: {error}", self.meek.dial))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("psiphon meek resolve {}: no address", self.meek.dial))?;
         let stream = match &self.proxy {
             Some(proxy) => proxy.connect(address, self.timeout)?,
             None => TcpStream::connect_timeout(&address, self.timeout)
@@ -518,10 +685,26 @@ impl MeekHttp {
             .set_read_timeout(Some(self.timeout))
             .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
             .map_err(|error| format!("psiphon meek socket: {error}"))?;
+        let fragment = self.meek.shape.may_fragment(self.meek.protocol);
         if !self.meek.https {
-            self.stream = Some(MeekStream::Plain(stream));
+            self.stream = Some(if fragment {
+                MeekStream::Fragment(crate::psiphon_fragment::FragmentStream::new(
+                    stream,
+                    self.meek.shape.fragmentor.clone(),
+                ))
+            } else {
+                MeekStream::Plain(stream)
+            });
             return Ok(());
         }
+        let stream = if fragment {
+            FragmentOrTcp::Fragment(crate::psiphon_fragment::FragmentStream::new(
+                stream,
+                self.meek.shape.fragmentor.clone(),
+            ))
+        } else {
+            FragmentOrTcp::Tcp(stream)
+        };
         // The SSH host key authenticates the payload; the fronting certificate is only cover.
         let server_name = if self.meek.disable_sni {
             address.ip().to_string()
@@ -548,11 +731,24 @@ impl MeekHttp {
             padding: self.meek.shape.padding(),
             ..TlsConfig::default()
         };
-        let mut tls = ferrox_core::tls::connect(&config, stream)
-            .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
-        tls.handshake()
-            .map_err(|error| format!("psiphon meek handshake {}: {error}", self.meek.sni))?;
-        self.stream = Some(MeekStream::Tls(tls));
+        match stream {
+            FragmentOrTcp::Tcp(stream) => {
+                let mut tls = ferrox_core::tls::connect(&config, stream)
+                    .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
+                tls.handshake().map_err(|error| {
+                    format!("psiphon meek handshake {}: {error}", self.meek.sni)
+                })?;
+                self.stream = Some(MeekStream::Tls(tls));
+            }
+            FragmentOrTcp::Fragment(stream) => {
+                let mut tls = ferrox_core::tls::connect(&config, stream)
+                    .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
+                tls.handshake().map_err(|error| {
+                    format!("psiphon meek handshake {}: {error}", self.meek.sni)
+                })?;
+                self.stream = Some(MeekStream::TlsFragment(tls));
+            }
+        }
         Ok(())
     }
 
@@ -602,7 +798,7 @@ impl MeekHttp {
             })
             .collect();
         for (name, value) in [
-            ("Content-Type", "application/octet-stream"),
+            ("Content-Type", self.profile.content_type),
             ("User-Agent", USER_AGENT),
             ("Accept", "*/*"),
             ("Connection", "keep-alive"),
@@ -703,8 +899,12 @@ fn cookie_protocol(protocol: &str) -> String {
     protocol.replacen("-CDN", "", 1)
 }
 
-/// Build the cookie header for a meek request.
-fn make_cookie(meek: &Meek, endpoint: Option<&str>) -> Result<(String, String), String> {
+/// Build the cookie header for a meek request with the profile's cookie name.
+fn make_cookie(
+    meek: &Meek,
+    endpoint: Option<&str>,
+    name: &str,
+) -> Result<(String, String), String> {
     let key = ferrox_core::b64::decode(meek.public_key.as_bytes())
         .ok_or_else(|| "psiphon meek cookie key is not base64".to_owned())?;
     let key = PublicKey::from_slice(&key)
@@ -746,14 +946,14 @@ fn make_cookie(meek: &Meek, endpoint: Option<&str>) -> Result<(String, String), 
     value.extend_from_slice(ephemeral.as_bytes());
     value.extend_from_slice(&sealed);
     client.apply(&mut value[seed_len..]);
-    let name = char::from(b'A' + random::<1>()[0] % 26).to_string();
-    Ok((name, ferrox_core::b64::encode(&value)))
+    Ok((name.to_owned(), ferrox_core::b64::encode(&value)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// One deterministic fronted-meek entry for the unit tests.
     fn entry() -> Meek {
         Meek {
             dial: "front.example".to_owned(),
@@ -772,7 +972,12 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
-            shape: TlsShape::default(),
+            provider_id: None,
+            shape: TlsShape {
+                meek_alternate_cookie_name: 0.0,
+                meek_alternate_content_type: 0.0,
+                ..TlsShape::default()
+            },
         }
     }
 
@@ -801,18 +1006,101 @@ mod tests {
         }
     }
 
+    /// A cookie carries the seed and the encrypted endpoint payload.
     #[test]
     fn a_cookie_carries_a_seed_then_an_encrypted_payload() {
-        let (name, value) = make_cookie(&entry(), None).expect("cookie");
+        let meek = entry();
+        let chosen = profile(&meek.shape, meek.protocol);
+        let (name, value) = make_cookie(&meek, None, &chosen.cookie_name).expect("cookie");
+        assert_eq!(name, chosen.cookie_name);
         assert!(name.as_bytes()[0].is_ascii_uppercase());
         let bytes = ferrox_core::b64::decode(value.as_bytes()).expect("base64");
         assert!(bytes.len() > SEED_LENGTH + 8 + MIN_COOKIE_PADDING + 32);
     }
 
+    /// The default profile draws one uppercase cookie letter.
     #[test]
-    fn the_cookie_name_is_one_letter() {
-        let (name, _) = make_cookie(&entry(), None).expect("cookie");
+    fn the_cookie_name_is_one_letter_when_the_alternate_coin_fails() {
+        let meek = entry();
+        let chosen = profile(&meek.shape, meek.protocol);
+        let (name, _) = make_cookie(&meek, None, &chosen.cookie_name).expect("cookie");
         assert_eq!(name.len(), 1);
+    }
+
+    /// An alternate cookie name is a two-to-ten character lowercase word.
+    #[test]
+    fn an_alternate_cookie_name_is_a_lowercase_word() {
+        let shape = TlsShape {
+            meek_alternate_cookie_name: 1.0,
+            ..TlsShape::default()
+        };
+        for _ in 0..64 {
+            let chosen = profile(&shape, "FRONTED-MEEK-OSSH");
+            assert!((2..=10).contains(&chosen.cookie_name.len()));
+            assert!(chosen
+                .cookie_name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_'));
+        }
+    }
+
+    /// An alternate content type is one of the cover media types.
+    #[test]
+    fn an_alternate_content_type_is_a_cover_type() {
+        let shape = TlsShape {
+            meek_alternate_content_type: 1.0,
+            ..TlsShape::default()
+        };
+        for _ in 0..64 {
+            let chosen = profile(&shape, "FRONTED-MEEK-OSSH");
+            assert!(ALTERNATE_CONTENT_TYPES.contains(&chosen.content_type));
+        }
+    }
+
+    /// A shaped request cap falls inside the configured range.
+    #[test]
+    fn traffic_shaping_draws_the_request_limit_inside_its_range() {
+        let shape = TlsShape {
+            meek_traffic_shaping: 1.0,
+            meek_min_limit_request: 1024,
+            meek_max_limit_request: 2048,
+            ..TlsShape::default()
+        };
+        for _ in 0..64 {
+            let chosen = profile(&shape, "FRONTED-MEEK-OSSH");
+            assert!((1024..=2048).contains(&chosen.request_limit));
+        }
+    }
+
+    /// A protocol outside the shaping list keeps the full cap.
+    #[test]
+    fn traffic_shaping_skips_a_protocol_outside_its_limit() {
+        let shape = TlsShape {
+            meek_traffic_shaping: 1.0,
+            meek_traffic_shaping_protocols: vec!["TLS-OSSH".to_owned()],
+            meek_min_limit_request: 1024,
+            meek_max_limit_request: 2048,
+            ..TlsShape::default()
+        };
+        let chosen = profile(&shape, "FRONTED-MEEK-OSSH");
+        assert_eq!(chosen.request_limit, MAX_REQUEST_PAYLOAD);
+    }
+
+    /// Redial is selected only when the shaping coin lands.
+    #[test]
+    fn redial_tls_is_selected_only_inside_traffic_shaping() {
+        let shaped = TlsShape {
+            meek_traffic_shaping: 1.0,
+            meek_redial_tls: 1.0,
+            ..TlsShape::default()
+        };
+        assert_eq!(profile(&shaped, "FRONTED-MEEK-OSSH").redial_tls, 1.0);
+        let unshaped = TlsShape {
+            meek_traffic_shaping: 0.0,
+            meek_redial_tls: 1.0,
+            ..TlsShape::default()
+        };
+        assert_eq!(profile(&unshaped, "FRONTED-MEEK-OSSH").redial_tls, 0.0);
     }
 
     /// A head and the caller's body reach the socket as the one request the staged buffer built.

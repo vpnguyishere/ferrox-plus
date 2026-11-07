@@ -220,6 +220,7 @@ pub(crate) struct Server<S: Stream> {
     suite: Option<u16>,
     phase: Phase,
     client_random: [u8; 32],
+    client_version: u16,
     ems: bool,
     own_random: [u8; 32],
     share: Option<keys::Share>,
@@ -252,6 +253,7 @@ impl<S: Stream> Server<S> {
             suite: None,
             phase: Phase::Hello,
             client_random: [0u8; 32],
+            client_version: 0,
             ems: false,
             own_random: [0u8; 32],
             share: None,
@@ -362,6 +364,7 @@ impl<S: Stream> Server<S> {
 
         self.transcript = transcript;
         self.client_random = hello.random;
+        self.client_version = hello.version;
         self.ems = hello.ems;
         self.own_random = random;
         self.share = share;
@@ -557,7 +560,7 @@ impl<S: Stream> Server<S> {
         {
             return Ok(fallback.to_vec());
         }
-        Ok(pkcs1_pre_master(&out, &fallback))
+        Ok(pkcs1_pre_master(&out, &fallback, self.client_version))
     }
 
     fn next_plain(&mut self, want: u8) -> Result<Vec<u8>, TlsError> {
@@ -782,20 +785,25 @@ impl<S: Stream> Server<S> {
 }
 
 /// RFC 5246's `EM = 0x00 || 0x02 || PS || 0x00 || M`, with `M` always 48 bytes: the last 48 bytes
-/// are the premaster only when the prefix, a non-empty `PS` and the separator all check out. The
-/// checks and the fallback selection are branchless, so a bad padding looks like a good one.
-fn pkcs1_pre_master(block: &[u8], fallback: &[u8; PRE_MASTER]) -> Vec<u8> {
+/// are the premaster only when the prefix, a non-empty `PS`, the separator and the
+/// `ClientHello` version all check out. The checks and the fallback selection are
+/// branchless, so a bad padding looks like a good one.
+fn pkcs1_pre_master(block: &[u8], fallback: &[u8; PRE_MASTER], client_version: u16) -> Vec<u8> {
     if block.len() < PRE_MASTER + 11 {
         return fallback.to_vec();
     }
     let separator = block.len() - PRE_MASTER - 1;
-    let mut good =
-        u8::from(block[0] == 0) & u8::from(block[1] == 2) & u8::from(block[separator] == 0);
+    let message = &block[block.len() - PRE_MASTER..];
+    let [hi, lo] = client_version.to_be_bytes();
+    let mut good = u8::from(block[0] == 0)
+        & u8::from(block[1] == 2)
+        & u8::from(block[separator] == 0)
+        & u8::from(message[0] == hi)
+        & u8::from(message[1] == lo);
     for &byte in &block[2..separator] {
         good &= u8::from(byte != 0);
     }
     let mask = 0u8.wrapping_sub(good);
-    let message = &block[block.len() - PRE_MASTER..];
     let mut secret = Vec::with_capacity(PRE_MASTER);
     for at in 0..PRE_MASTER {
         secret.push((message[at] & mask) | (fallback[at] & !mask));
@@ -1164,21 +1172,28 @@ mod tests {
         block[0] = 0;
         block[1] = 2;
         block[256 - PRE_MASTER - 1] = 0;
-        let message: Vec<u8> = (0..PRE_MASTER as u8).collect();
+        let mut message: Vec<u8> = (0..PRE_MASTER as u8).collect();
+        message[0] = 0x03;
+        message[1] = 0x03;
         block[256 - PRE_MASTER..].copy_from_slice(&message);
-        assert_eq!(pkcs1_pre_master(&block, &fallback), message);
+        assert_eq!(pkcs1_pre_master(&block, &fallback, 0x0303), message);
 
         let mut bad = block.clone();
         bad[2] = 0;
-        assert_eq!(pkcs1_pre_master(&bad, &fallback), fallback.to_vec());
+        assert_eq!(pkcs1_pre_master(&bad, &fallback, 0x0303), fallback.to_vec());
 
         let mut bad = block.clone();
         bad[256 - PRE_MASTER - 1] = 1;
-        assert_eq!(pkcs1_pre_master(&bad, &fallback), fallback.to_vec());
+        assert_eq!(pkcs1_pre_master(&bad, &fallback, 0x0303), fallback.to_vec());
+
+        let mut bad = block.clone();
+        bad[1] = 3;
+        assert_eq!(pkcs1_pre_master(&bad, &fallback, 0x0303), fallback.to_vec());
 
         let mut bad = block;
-        bad[1] = 3;
-        assert_eq!(pkcs1_pre_master(&bad, &fallback), fallback.to_vec());
+        bad[256 - PRE_MASTER] = 0x03;
+        bad[256 - PRE_MASTER + 1] = 0x04;
+        assert_eq!(pkcs1_pre_master(&bad, &fallback, 0x0303), fallback.to_vec());
     }
 
     #[test]

@@ -76,18 +76,32 @@ pub struct Hop {
 impl Hop {
     /// The distinct ports the plan covers, ascending, an overlap named once.
     /// Expanded once per dial so the rotation and the wire's source-port check
-    /// share one view of the set.
+    /// share one view of the set. The set is opened at the ranges' total
+    /// capped at the distinct-port ceiling (65,536), so a plan whose pushed
+    /// ports stay under the ceiling pays one allocation; a plan that pushes
+    /// past it grows before `dedup` and its allocation count is not claimed.
+    /// The sorted pass replaces the old `contains`-per-port scan's linear
+    /// check per new port on top of its growth reallocations.
     #[must_use]
     pub fn ports(&self) -> Vec<u16> {
-        let mut set: Vec<u16> = Vec::new();
+        let total = self
+            .ranges
+            .iter()
+            .map(|range| {
+                usize::from(range.end)
+                    .checked_sub(usize::from(range.start))
+                    .map_or(0, |span| span + 1)
+            })
+            .sum::<usize>()
+            .min(65536);
+        let mut set = Vec::with_capacity(total);
         for range in &self.ranges {
             for port in range.start..=range.end {
-                if !set.contains(&port) {
-                    set.push(port);
-                }
+                set.push(port);
             }
         }
         set.sort_unstable();
+        set.dedup();
         set
     }
 }
@@ -96,20 +110,33 @@ impl Hop {
 /// exists: a single-port plan stays, an empty plan yields `avoid` unchanged.
 /// `roll` is caller-supplied entropy folded in, so the choice is a pure function
 /// of the port set, the port to avoid and one number — proven without a rng.
+/// `ports` is the sorted distinct set `Hop::ports` hands out; the avoided
+/// port's place is one binary search, and the reply is one modulo plus one
+/// skip, where the old form filtered the set twice and walked it a second
+/// time to land the index.
+///
+/// # Contract
+///
+/// `ports` must be strictly ascending and distinct, as `Hop::ports` returns
+/// and `Hopper::open` restores. An unsorted or duplicate set violates the
+/// contract: in debug builds the `debug_assert` below panics, and in release
+/// builds `binary_search` answers without an error, so callers must not hand
+/// one in.
 #[must_use]
 pub fn pick_next(ports: &[u16], avoid: u16, roll: usize) -> u16 {
-    let candidates = ports.iter().filter(|port| **port != avoid).count();
-    if candidates == 0 {
-        return ports.first().copied().unwrap_or(avoid);
+    debug_assert!(ports.windows(2).all(|w| w[0] < w[1]));
+    match ports.len() {
+        0 => avoid,
+        1 => ports[0],
+        _ => match ports.binary_search(&avoid) {
+            Err(_) => ports[roll % ports.len()],
+            Ok(at) => {
+                let candidates = ports.len() - 1;
+                let index = roll % candidates;
+                ports[if index < at { index } else { index + 1 }]
+            }
+        },
     }
-    let mut index = roll % candidates;
-    for &port in ports.iter().filter(|port| **port != avoid) {
-        if index == 0 {
-            return port;
-        }
-        index -= 1;
-    }
-    avoid
 }
 
 /// The length of the next stay in milliseconds, drawn from `interval`'s inclusive
@@ -127,9 +154,21 @@ pub fn stay_ms(interval: (u64, u64), roll: u64) -> u64 {
 /// Whether a reply's source port belongs to the hop: the nominal port the
 /// connection was named for, or any port the plan moves between. The wire turns
 /// such a source back to the nominal one so QUIC above sees one server.
+/// `ports` is the sorted distinct set `Hop::ports` hands out, so membership
+/// is one binary search per datagram where the old linear scan paid one
+/// compare per port of the plan.
+///
+/// # Contract
+///
+/// `ports` must be strictly ascending and distinct, as `Hop::ports` returns
+/// and `Hopper::open` restores. An unsorted or duplicate set violates the
+/// contract: in debug builds the `debug_assert` below panics, and in release
+/// builds `binary_search` answers without an error, so callers must not hand
+/// one in.
 #[must_use]
 pub fn is_hop_port(ports: &[u16], nominal: u16, port: u16) -> bool {
-    port == nominal || ports.contains(&port)
+    debug_assert!(ports.windows(2).all(|w| w[0] < w[1]));
+    port == nominal || ports.binary_search(&port).is_ok()
 }
 
 /// The BBR profile a QUIC lane selects, spelled as the reference's `bbrProfile`.
@@ -2217,6 +2256,162 @@ mod tests {
         );
     }
 
+    /// The old form the sort-and-dedup expansion replaced, kept as the bytes
+    /// every plan has to still expand to: one linear check per new port.
+    fn the_contains_expansion(ranges: &[PortRange]) -> Vec<u16> {
+        let mut set: Vec<u16> = Vec::new();
+        for range in ranges {
+            for port in range.start..=range.end {
+                if !set.contains(&port) {
+                    set.push(port);
+                }
+            }
+        }
+        set.sort_unstable();
+        set
+    }
+
+    /// The old form the binary-search pick replaced, kept as the choices every
+    /// roll has to still land: count the survivors once, then walk them.
+    fn the_filter_pick(ports: &[u16], avoid: u16, roll: usize) -> u16 {
+        let candidates = ports.iter().filter(|port| **port != avoid).count();
+        if candidates == 0 {
+            return ports.first().copied().unwrap_or(avoid);
+        }
+        let mut index = roll % candidates;
+        for &port in ports.iter().filter(|port| **port != avoid) {
+            if index == 0 {
+                return port;
+            }
+            index -= 1;
+        }
+        avoid
+    }
+
+    /// Every range spelling expands to the set the contains scan expanded to,
+    /// sorted with its overlaps named once, and the plan's temporary never
+    /// outgrows one allocation whose capacity the sort holds.
+    #[test]
+    fn every_plan_expands_to_the_bytes_the_contains_scan_wrote() {
+        let cases: &[&[PortRange]] = &[
+            &[],
+            &[PortRange {
+                start: 443,
+                end: 443,
+            }],
+            &[
+                PortRange {
+                    start: 9000,
+                    end: 9001,
+                },
+                PortRange {
+                    start: 9001,
+                    end: 9002,
+                },
+                PortRange {
+                    start: 443,
+                    end: 443,
+                },
+            ],
+            &[PortRange {
+                start: 9002,
+                end: 9000,
+            }],
+            &[
+                PortRange { start: 0, end: 4 },
+                PortRange { start: 2, end: 6 },
+            ],
+            &[PortRange {
+                start: 20000,
+                end: 20999,
+            }],
+            &[
+                PortRange {
+                    start: 20000,
+                    end: 20010,
+                },
+                PortRange {
+                    start: 10000,
+                    end: 10005,
+                },
+            ],
+        ];
+        for ranges in cases {
+            let hop = Hop {
+                ranges: ranges.to_vec(),
+                interval_ms: (5000, 5000),
+            };
+            let got = hop.ports();
+            assert_eq!(got, the_contains_expansion(ranges), "plan {ranges:?}");
+            assert!(got.is_sorted(), "the rotation's set is ascending");
+            assert!(got.windows(2).all(|w| w[0] < w[1]), "one of each port");
+            assert_eq!(
+                crate::alloc_count::measure(|| hop.ports()).1.allocs,
+                usize::from(!got.is_empty()),
+                "one reserve per plan"
+            );
+        }
+    }
+
+    /// One modulo and one skip lands the same survivor the two filters walked
+    /// to, for the avoided port present and absent, for plans of one port and
+    /// none, and for two hundred rolls that must all stay in the set.
+    #[test]
+    fn every_pick_lands_the_survivor_the_two_filters_walked_to() {
+        let sets: &[&[u16]] = &[
+            &[],
+            &[443],
+            &[443, 8443],
+            &[1000, 1001, 1002, 1003],
+            &[443, 9000, 9001, 9002],
+            &[0, 1, 2, 3, 4, 65535],
+        ];
+        for ports in sets {
+            for avoid in [0u16, 1, 443, 1001, 9000, 65535] {
+                for roll in 0..200usize {
+                    assert_eq!(
+                        pick_next(ports, avoid, roll),
+                        the_filter_pick(ports, avoid, roll),
+                        "ports {ports:?} avoid {avoid} roll {roll}"
+                    );
+                    let next = pick_next(ports, avoid, roll);
+                    assert!(
+                        ports.contains(&next) || ports.is_empty(),
+                        "inside the plan or the empty plan's fallback"
+                    );
+                    if ports.len() > 1 && ports.contains(&avoid) {
+                        assert_ne!(next, avoid, "never the port just left");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The binary membership and the linear scan answer alike on the set
+    /// `Hop::ports` hands out, for the nominal port, every plan port, and the
+    /// ports the plan does not name.
+    #[test]
+    fn every_membership_reads_as_the_linear_scan_read_it() {
+        let ports = [443u16, 9000, 9001, 9002];
+        for port in [9u16, 443, 8999, 9000, 9001, 9002, 9003, 50000, 65535] {
+            assert_eq!(
+                is_hop_port(&ports, 443, port),
+                port == 443 || ports.contains(&port),
+                "query {port}"
+            );
+        }
+        let wide: Vec<u16> = (20000..=21000).collect();
+        for port in [19999u16, 20000, 20500, 21000, 21001] {
+            assert_eq!(
+                is_hop_port(&wide, 443, port),
+                port == 443 || wide.contains(&port),
+                "wide query {port}"
+            );
+        }
+        assert!(is_hop_port(&ports, 443, 443));
+        assert!(!is_hop_port(&ports, 443, 50000));
+    }
+
     #[test]
     fn a_hop_never_lands_back_on_the_port_it_just_left() {
         let ports = [1000u16, 1001, 1002, 1003];
@@ -2228,6 +2423,71 @@ mod tests {
         assert_eq!(pick_next(&[443], 443, 7), 443);
         // An empty plan yields the port to avoid, unchanged.
         assert_eq!(pick_next(&[], 443, 7), 443);
+    }
+
+    /// The linear scan the binary search replaced, folded over the probe's
+    /// 512 picks and memberships, so the probe pair below prices both forms
+    /// over one shape against this oracle.
+    fn linear_pick_fold(ports: &[u16]) -> u32 {
+        let mut fold: u32 = 0;
+        for roll in 0..512usize {
+            let avoid = ports[roll % ports.len()];
+            fold = fold.wrapping_add(u32::from(the_filter_pick(ports, avoid, roll)));
+            fold = fold.wrapping_add(u32::from(ports.contains(&(20000 + (roll % 1001) as u16))));
+        }
+        fold
+    }
+
+    /// 512 picks and memberships over a thousand-port plan, one binary
+    /// search per call and nothing else, so one ops job reports the search's
+    /// cost against the same answer the scan paid for.
+    #[test]
+    fn the_binary_pick_and_membership_costs_the_search_and_nothing_else() {
+        let ports: Vec<u16> = (20000..=21000).collect();
+        let mut fold: u32 = 0;
+        for roll in 0..512usize {
+            let avoid = ports[roll % ports.len()];
+            fold = fold.wrapping_add(u32::from(pick_next(
+                std::hint::black_box(&ports),
+                avoid,
+                std::hint::black_box(roll),
+            )));
+            fold = fold.wrapping_add(u32::from(is_hop_port(
+                std::hint::black_box(&ports),
+                443,
+                20000 + (std::hint::black_box(roll) % 1001) as u16,
+            )));
+        }
+        assert_eq!(
+            fold,
+            linear_pick_fold(&ports),
+            "the same 512 picks and memberships"
+        );
+    }
+
+    /// The same 512 picks and memberships with the two filters and the
+    /// linear scan, so one ops job reports both frames and only their
+    /// difference is a claim about the searches.
+    #[test]
+    fn the_linear_scan_costs_the_same_answer() {
+        let ports: Vec<u16> = (20000..=21000).collect();
+        let mut fold: u32 = 0;
+        for roll in 0..512usize {
+            let avoid = ports[roll % ports.len()];
+            fold = fold.wrapping_add(u32::from(the_filter_pick(
+                std::hint::black_box(&ports),
+                avoid,
+                std::hint::black_box(roll),
+            )));
+            fold = fold.wrapping_add(u32::from(
+                ports.contains(&(20000 + (std::hint::black_box(roll) % 1001) as u16)),
+            ));
+        }
+        assert_eq!(
+            fold,
+            linear_pick_fold(&ports),
+            "the same 512 picks and memberships"
+        );
     }
 
     #[test]

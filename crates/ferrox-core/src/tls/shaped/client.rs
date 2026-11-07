@@ -318,6 +318,9 @@ impl<S: Stream> Session<S> {
             return Err(unexpected(msg[0]));
         }
         let mut sh = ServerHello::parse(&msg[4..])?;
+        if !hello.offers_cipher(sh.suite) {
+            return Err(TlsError::NoSharedCipher);
+        }
         if sh.hrr {
             let suite = Suite::from_id(sh.suite)
                 .filter(|suite| suite.is_tls13())
@@ -346,6 +349,9 @@ impl<S: Stream> Session<S> {
                 return Err(unexpected(msg[0]));
             }
             sh = ServerHello::parse(&msg[4..])?;
+            if !hello.offers_cipher(sh.suite) {
+                return Err(TlsError::NoSharedCipher);
+            }
             if sh.hrr {
                 return Err(TlsError::Other(
                     "a second retry request is not allowed".to_owned(),
@@ -2626,6 +2632,33 @@ mod tests {
             error.contains("did not accept"),
             "a hello that does not confirm must be refused: {error}"
         );
+    }
+
+    /// A server may only select a suite the hello offered, not merely one this tree implements.
+    #[test]
+    fn a_server_may_not_select_an_unoffered_suite() {
+        let profile = Fingerprint::default().profile().expect("profile");
+        let mut hello = Hello::build(profile, "tls.test", &[], false, &[], None).expect("builds");
+        hello.set_ciphers(&[0xc02b, 0xc02c, 0x1301, 0x1302, 0x1303]);
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0x11; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0xc0, 0x09]);
+        body.push(0);
+        body.extend_from_slice(&[0, 0]);
+        let message = message(2, &body);
+        let mut record = vec![HANDSHAKE, 0x03, 0x03];
+        record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+        record.extend_from_slice(&message);
+        let mut session = Session::with_hello(
+            profile,
+            "tls.test".to_owned(),
+            Arc::new(Unverified),
+            hello,
+            Server(record, 0),
+        )
+        .expect("session");
+        assert_eq!(session.handshake(), Err(TlsError::NoSharedCipher));
     }
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]

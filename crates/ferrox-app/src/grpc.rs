@@ -1716,7 +1716,35 @@ fn frame_prefix(data_len: usize, out: &mut [u8; 16]) -> usize {
 }
 
 /// Writes `value` as a protobuf varint into `out`, returning its length.
-fn write_varint(out: &mut [u8], mut value: u64) -> usize {
+fn write_varint(out: &mut [u8], value: u64) -> usize {
+    if value < 0x80 {
+        out[0] = value as u8;
+        return 1;
+    }
+    if value < 0x4000 {
+        out[0] = (value as u8 & 0x7F) | 0x80;
+        out[1] = (value >> 7) as u8;
+        return 2;
+    }
+    if value < 0x20_0000 {
+        out[0] = (value as u8 & 0x7F) | 0x80;
+        out[1] = ((value >> 7) as u8 & 0x7F) | 0x80;
+        out[2] = (value >> 14) as u8;
+        return 3;
+    }
+    let mut value = value;
+    let mut at = 0;
+    while value >= 0x80 {
+        out[at] = (value as u8 & 0x7F) | 0x80;
+        value >>= 7;
+        at += 1;
+    }
+    out[at] = value as u8;
+    at + 1
+}
+
+#[cfg(test)]
+fn write_varint_byte(out: &mut [u8], mut value: u64) -> usize {
     let mut at = 0;
     while value >= 0x80 {
         out[at] = (value as u8 & 0x7F) | 0x80;
@@ -2951,6 +2979,68 @@ mod tests {
             }
         }
         std::hint::black_box(acc);
+    }
+
+    #[test]
+    fn the_direct_write_is_the_byte_loop_at_every_width() {
+        for value in [
+            0,
+            1,
+            0x7F,
+            0x80,
+            0x3FFF,
+            0x4000,
+            0x1F_FFFF,
+            0x20_0000,
+            u64::MAX,
+        ] {
+            let mut direct = [0u8; 10];
+            let mut byte = [0u8; 10];
+            let direct_len = write_varint(&mut direct, value);
+            let byte_len = write_varint_byte(&mut byte, value);
+            assert_eq!(direct_len, byte_len, "{value}");
+            assert_eq!(direct[..direct_len], byte[..byte_len], "{value}");
+        }
+    }
+
+    #[inline(never)]
+    fn direct_write_probe(out: &mut [u8]) -> u64 {
+        let mut sum = 0u64;
+        for _ in 0..4096 {
+            sum = sum.wrapping_add(write_varint(
+                std::hint::black_box(&mut *out),
+                std::hint::black_box(16375),
+            ) as u64);
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn walk_write_probe(out: &mut [u8]) -> u64 {
+        let mut sum = 0u64;
+        for _ in 0..4096 {
+            sum = sum.wrapping_add(write_varint_byte(
+                std::hint::black_box(&mut *out),
+                std::hint::black_box(16375),
+            ) as u64);
+        }
+        sum
+    }
+
+    #[test]
+    fn the_direct_write_costs_the_second_byte_and_nothing_else() {
+        let mut direct = [0u8; 16];
+        let mut byte = [0u8; 16];
+        assert_eq!(direct_write_probe(&mut direct), walk_write_probe(&mut byte));
+        assert_eq!(direct, byte);
+    }
+
+    #[test]
+    fn the_walk_write_costs_the_same_answer() {
+        let mut direct = [0u8; 16];
+        let mut byte = [0u8; 16];
+        assert_eq!(walk_write_probe(&mut byte), direct_write_probe(&mut direct));
+        assert_eq!(direct, byte);
     }
 
     #[test]

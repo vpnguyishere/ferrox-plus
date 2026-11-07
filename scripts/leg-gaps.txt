@@ -36,6 +36,8 @@ vless-xhttp-duplex-8|server-threads|1.29|696
 vless-xhttp-down-8|server-threads|1.27|696
 # A stream-up GET runs on its own thread so it never parks a setup lane; eight flows peak 18 against xray's 14.
 vless-xhttp-streamup-down-8|server-threads|1.29|696
+# Stream-one relays now that the poll is armed, but an idle xray client still leaves the server leg at 0.59x of its ceiling.
+vless-xhttp-streamone-down-8|server|0.59|486|ceiling
 vless-tls-xhttp-h2-down-8|server-threads|1.85|696
 trojan-tls-xhttp-h2-down-8|server-threads|1.70|696
 vmess-tls-xhttp-h2-down-8|server-threads|1.70|696

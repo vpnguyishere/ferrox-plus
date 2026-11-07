@@ -480,6 +480,25 @@ impl H2StreamReader {
     }
 }
 
+/// The next body wait: the remaining arrival budget when one is set, bounded by the stall.
+fn body_wait(stall: std::time::Duration) -> std::time::Duration {
+    let Some(until) = crate::proxy::body_deadline() else {
+        return stall;
+    };
+    until
+        .saturating_duration_since(std::time::Instant::now())
+        .min(stall)
+}
+
+/// The error a body wait ends with: a poll grain while the arrival budget remains, else the stall's end.
+fn body_wait_timeout() -> std::io::Error {
+    if crate::proxy::body_deadline().is_some_and(|until| std::time::Instant::now() >= until) {
+        std::io::Error::from(std::io::ErrorKind::WouldBlock)
+    } else {
+        std::io::Error::other("h2 body stalled")
+    }
+}
+
 impl Read for H2StreamReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
@@ -562,16 +581,17 @@ impl Read for H2StreamReader {
                 }
                 continue;
             }
+            // A body read carries its arrival deadline, so a withheld DATA frame ends there instead of at the stall.
             let (next, wait) = self
                 .stream
                 .cv
-                .wait_timeout(st, crate::budgets::relay_stall())
+                .wait_timeout(st, body_wait(crate::budgets::relay_stall()))
                 .unwrap_or_else(PoisonError::into_inner);
             st = next;
             if wait.timed_out() {
                 drop(st);
                 self.conn.forget_upload(self.id);
-                return Err(std::io::Error::other("h2 body stalled"));
+                return Err(body_wait_timeout());
             }
         }
     }
@@ -5854,6 +5874,39 @@ mod tests {
         };
         crate::budgets::clear();
         assert!(!crate::proxy::is_timeout(&error), "{error:?}");
+    }
+
+    /// A body read outside a lane waits only until its arrival deadline, not the whole relay stall.
+    #[test]
+    fn a_read_outside_a_lane_ends_at_the_body_deadline() {
+        let (conn, _written, _slices) = streaming_conn(0);
+        let stream = conn
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&1)
+            .cloned()
+            .expect("the stream");
+        let mut reader = H2StreamReader {
+            conn,
+            stream,
+            id: 1,
+            at: 0,
+            cur: Vec::new(),
+            idle_since: None,
+        };
+        let mut buf = [0u8; 8];
+        crate::proxy::set_body_deadline(Some(
+            std::time::Instant::now() + Duration::from_millis(20),
+        ));
+        let started = std::time::Instant::now();
+        let error = reader.read(&mut buf).expect_err("no body arrived");
+        crate::proxy::set_body_deadline(None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the read ends at the body deadline, not the stall"
+        );
+        assert!(crate::proxy::is_timeout(&error), "{error:?}");
     }
 
     /// A sender the peer never credits gives up at the relay stall, so a downlink cannot park its thread on a window that never arrives.

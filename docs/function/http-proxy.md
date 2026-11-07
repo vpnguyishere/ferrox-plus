@@ -6,6 +6,8 @@ A forwarded request's head is walked twice before it leaves — the credential's
 
 A front whose settings name `accounts` (or `users`) demands `Proxy-Authorization: Basic` and answers a missing or unknown credential in xray's own 407 head; the credential is consumed before the head leaves for the origin, and the `mixed` front lends the same accounts its SOCKS side carries, which is what xray's socks server does (`server.go:44-50`).
 
+The hop also arrives as the reference's `xray.proxy.http.ClientConfig` protobuf: `xray_pb.rs` decodes the one `ServerEndpoint`, its optional `Account` and the repeated `Header` list into the same `servers` entry the JSON parser reads, and `a_socks_http_fallback_scenario_decodes_both_sides` holds the translation. That decode is what lets `TestSocksWithHttpRequest` drive the socks front's HTTP fallback unmodified in `conformance.yml`.
+
 ## Data path
 
 ```mermaid
@@ -29,6 +31,7 @@ graph TD
 | connect-request-allocations | 0 | ferrox-app-proxy::tests::the_connect_request_builds_in_one_buffer |
 | forwarded-head-allocations | 0 | ferrox-app-proxy::tests::an_origin_form_head_reaches_the_uplink_where_it_landed |
 | forwarded-head-copies | 0 | ferrox-app-proxy::tests::a_forwarded_head_is_the_head_that_was_read |
+| pb-client-endpoints-decoded | 1 | ferrox-app-xray_pb::tests::a_socks_http_fallback_scenario_decodes_both_sides |
 <!-- counts:end -->
 
 `connect-request-allocations` is gated on base and capacity held steady over a four-target sweep of the caller's `Vec` (name, bracketed name, v4 literal, v6 literal): the request reserve counts the authority without materialising it, so no CONNECT grows or replaces the buffer it was handed. `forwarded-head-allocations` is the moved head's own pointer and capacity asserted at the uplink writer — a rebuilt head would not be the same allocation. Copies the rows do not see stay out of the table: the in-buffer `Host` duplication is one copy per authority byte with no allocation to witness, and the front's head read is still `peek` then re-read, so two syscalls per request stand — named below, not blessed as a number.
@@ -78,6 +81,6 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: -
-- symbols: serve_http, http_proxy, http_proxy_request, http_request_parses, http_connect, connect_request, connect_grant, connect_authority, origin_head, origin_form, grant_line, direct_grant, SOCKS_GRANTED, authority_len, push_authority, authority_target, http_outbound, http_accounts, http_credential_account, drop_header, forward_headers, connection_named, crlf_in, hop_by_hop, request_line_attributes, HTTP_AUTH_REQUIRED
+- symbols: serve_http, http_proxy, http_proxy_request, http_request_parses, http_connect, connect_request, connect_grant, connect_authority, origin_head, origin_form, grant_line, direct_grant, SOCKS_GRANTED, authority_len, push_authority, authority_target, http_outbound, http_accounts, http_credential_account, drop_header, forward_headers, connection_named, crlf_in, hop_by_hop, request_line_attributes, HTTP_AUTH_REQUIRED, http_outbound_settings, credential_endpoint, credential_user, credential_account, http_header, client_servers
 - go: ./proxy/http/...
 <!-- scope:end -->

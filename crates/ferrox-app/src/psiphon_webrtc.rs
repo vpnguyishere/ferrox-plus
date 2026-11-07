@@ -45,7 +45,7 @@ impl WebRtc {
         destination: IpAddr,
         stun_servers: &[String],
         timeout: Duration,
-        servers: &[SocketAddr],
+        dns: &crate::psiphon_dns::Config,
         unreliable: bool,
     ) -> Result<(Self, String), String> {
         let socket = bind_socket(destination)?;
@@ -58,7 +58,7 @@ impl WebRtc {
         let _ = rtc.add_local_candidate(host);
         let stun_timeout = timeout.min(Duration::from_secs(3));
         for server in stun_servers.iter().take(2) {
-            if let Ok(Some(mapped)) = stun_binding(&socket, local, server, stun_timeout, servers) {
+            if let Ok(Some(mapped)) = stun_binding(&socket, local, server, stun_timeout, dns) {
                 if let Ok(candidate) = Candidate::server_reflexive(mapped, local, "udp") {
                     let _ = rtc.add_local_candidate(candidate);
                 }
@@ -296,7 +296,7 @@ fn stun_binding(
     local: SocketAddr,
     server: &str,
     timeout: Duration,
-    servers: &[SocketAddr],
+    dns: &crate::psiphon_dns::Config,
 ) -> Result<Option<SocketAddr>, String> {
     let ipv6 = local.is_ipv6();
     let same_family = |address: &SocketAddr| address.is_ipv6() == ipv6;
@@ -312,7 +312,7 @@ fn stun_binding(
     } else {
         (server.to_owned(), 3478)
     };
-    let target = crate::psiphon_dns::resolve(&host, port, servers)
+    let target = crate::psiphon_dns::resolve_with(dns, &host, port)
         .map_err(|error| format!("psiphon webrtc STUN {server}: {error}"))?
         .into_iter()
         .find(same_family)
@@ -791,7 +791,7 @@ pub(crate) struct Conduit {
     protocols: Vec<String>,
     timeout: Duration,
     headers: Vec<(String, String)>,
-    dns: Vec<SocketAddr>,
+    dns_config: crate::psiphon_dns::Config,
     reject: Vec<Cidr>,
     geoip: Option<crate::psiphon_geoip::GeoIp>,
 }
@@ -808,7 +808,7 @@ impl Conduit {
         protocols: Vec<String>,
         timeout: Duration,
         headers: Vec<(String, String)>,
-        dns: Vec<SocketAddr>,
+        dns_config: crate::psiphon_dns::Config,
         reject_cidrs: &[String],
         geoip: Option<crate::psiphon_geoip::GeoIp>,
     ) -> Self {
@@ -831,7 +831,7 @@ impl Conduit {
             protocols,
             timeout,
             headers,
-            dns,
+            dns_config,
             reject,
             geoip,
         }
@@ -889,7 +889,7 @@ impl Conduit {
                 address,
                 &self.stun_servers,
                 self.timeout,
-                &self.dns,
+                &self.dns_config,
                 unreliable,
             ) {
                 Ok(offer) => offer,
@@ -904,7 +904,7 @@ impl Conduit {
                 self.timeout,
                 None,
                 &self.headers,
-                &self.dns,
+                &self.dns_config,
             ) {
                 Ok(client) => client,
                 Err(error) => {
@@ -1089,7 +1089,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &[],
             Duration::from_secs(1),
-            &[],
+            &crate::psiphon_dns::Config::from_servers(&[]),
             false,
         )
         .expect("offer");
@@ -1176,7 +1176,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &[],
             Duration::from_secs(1),
-            &[],
+            &crate::psiphon_dns::Config::from_servers(&[]),
             false,
         )
         .expect("offer");

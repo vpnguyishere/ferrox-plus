@@ -240,6 +240,18 @@ impl Engine {
         super::seal_impl_from(&self.rk, &self.h, nonce, aad, src, dst)
     }
 
+    /// Seal `src` into uninitialized `dst` and return the tag.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3")]
+    pub(crate) unsafe fn seal_from_uninit(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        src: &[u8],
+        dst: *mut u8,
+    ) -> [u8; 16] {
+        unsafe { super::seal_impl_from_uninit(&self.rk, &self.h, nonce, aad, src, dst) }
+    }
+
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn open(
         &self,

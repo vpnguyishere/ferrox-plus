@@ -150,6 +150,12 @@ pub(crate) fn offers_tls13(ids: &[u16]) -> bool {
     ids.iter().any(|id| (0x1301..=0x1303).contains(id))
 }
 
+/// Whether a list names both halves, where `BoringSSL` leads with the trio and rustls adds SCSV,
+/// so neither stock lane writes the reference's field.
+pub(crate) fn mixed(ids: &[u16]) -> bool {
+    offers_tls13(ids) && ids.iter().any(|id| !(0x1301..=0x1303).contains(id))
+}
+
 /// The suites neither ring nor the legacy lane carries on either role.
 const SHAPED_ONLY: [u16; 5] = [0x003c, 0xc012, 0x0005, 0xc007, 0xc011];
 

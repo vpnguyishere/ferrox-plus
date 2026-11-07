@@ -39,16 +39,14 @@ def between(text, begin, end, fails, label):
     return text[start + len(begin):stop]
 
 
-def without_comment(line, in_block):
+def without_comment(line, in_block, quote=None, escaped=False):
     out = []
-    quote = None
-    escaped = False
     index = 0
     while index < len(line):
         if in_block:
             end = line.find("*/", index)
             if end < 0:
-                return "".join(out), True
+                return "".join(out), True, quote, escaped
             index = end + 2
             in_block = False
             continue
@@ -73,7 +71,27 @@ def without_comment(line, in_block):
         else:
             out.append(char)
         index += 1
-    return "".join(out), in_block
+    return "".join(out), in_block, quote, escaped
+
+
+def brace_delta(line, quote=None, escaped=False):
+    delta = 0
+    for char in line:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote != "`":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in ('"', "'", '`'):
+            quote = char
+        elif char == "{":
+            delta += 1
+        elif char == "}":
+            delta -= 1
+    return delta, quote, escaped
 
 
 def upstream_fields(root):
@@ -86,9 +104,48 @@ def upstream_fields(root):
     start = text.find(marker)
     if start < 0:
         return None
+    # Count braces outside Go comments so a brace in a comment cannot hide the end.
     depth = 0
-    end = start + len(marker) - 1
-    for index in range(start + len(marker) - 1, len(text)):
+    end = len(text)
+    in_block = False
+    in_line = False
+    quote = None
+    escaped = False
+    index = start + len(marker) - 1
+    while index < len(text):
+        if in_block:
+            if text[index:index + 2] == "*/":
+                in_block = False
+                index += 2
+                continue
+            index += 1
+            continue
+        if in_line:
+            if text[index] == "\n":
+                in_line = False
+            index += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif text[index] == "\\" and quote != "`":
+                escaped = True
+            elif text[index] == quote:
+                quote = None
+            index += 1
+            continue
+        if text[index:index + 2] == "//":
+            in_line = True
+            index += 2
+            continue
+        if text[index:index + 2] == "/*":
+            in_block = True
+            index += 2
+            continue
+        if text[index] in ('"', "'", '`'):
+            quote = text[index]
+            index += 1
+            continue
         if text[index] == "{":
             depth += 1
         elif text[index] == "}":
@@ -96,15 +153,22 @@ def upstream_fields(root):
             if depth == 0:
                 end = index
                 break
+        index += 1
     body = text[start + len(marker):end]
     fields = []
     depth = 0
     in_block = False
+    quote = None
+    escaped = False
     for line in body.splitlines():
-        line, in_block = without_comment(line, in_block)
+        start_quote, start_escaped = quote, escaped
+        line, in_block, quote, escaped = without_comment(
+            line, in_block, quote, escaped
+        )
         line = line.strip()
         top = depth == 0
-        depth += line.count("{") - line.count("}")
+        delta, _, _ = brace_delta(line, start_quote, start_escaped)
+        depth += delta
         if not top or not line:
             continue
         match = re.match(r"^([A-Z]\w*)\s+[^`]*(?:`([^`]*)`)?", line)
@@ -426,15 +490,26 @@ def selftest():
                 "\t// {\n"
                 "\tE bool\n"
                 "\t/* } */ F string `json:\"-\"`\n"
+                "\tG string `json:\"g\" {\n"
+                "// } {\n"
+                "`\n"
+                "\tH string `json:\",omitempty\"`\n"
+                "\tNested struct {\n"
+                "\t\tInner string `json:\"inner\"`\n"
+                "\t}\n"
+                "\tK string `json:\",omitempty\"`\n"
                 "}\n"
             )
         fails, _ = run_check(root)
-        if not any("unclassified upstream field(s): D, E" in line
+        if not any("unclassified upstream field(s): D, E, G, H, K" in line
                    for line in fails):
             print("check-psiphon-parity: self-test untagged field still passes")
             return 1
         if any("F" in line for line in fails):
             print("check-psiphon-parity: self-test json:\"-\" field is listed")
+            return 1
+        if any("Inner" in line for line in fails):
+            print("check-psiphon-parity: self-test nested field is listed")
             return 1
         print("check-psiphon-parity: self-test passed (ten mutations refused)")
         return 0

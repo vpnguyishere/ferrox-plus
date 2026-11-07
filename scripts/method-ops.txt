@@ -115,6 +115,8 @@ carrier-foxy  foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer 
 carrier-grpc  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
 carrier-grpc  grpc::tests::the_varint_length_over_every_boundary  grpc::tests::the_varint_length_over_every_boundary
 carrier-grpc  grpc::tests::the_varint_shift_loop_over_every_boundary  grpc::tests::the_varint_shift_loop_over_every_boundary
+carrier-grpc  grpc::tests::the_direct_write_costs_the_second_byte_and_nothing_else  grpc::tests::direct_write_probe
+carrier-grpc  grpc::tests::the_walk_write_costs_the_same_answer  grpc::tests::walk_write_probe
 engine-api  accesslog::tests::the_ascii_scan_over_a_bulk_field  accesslog::tests::the_ascii_scan_over_a_bulk_field
 engine-api  accesslog::tests::the_swar_scan_over_a_bulk_field  accesslog::tests::the_swar_scan_over_a_bulk_field
 engine-api  accesslog::tests::the_codepoint_walk_over_a_bulk_field  accesslog::tests::the_codepoint_walk_over_a_bulk_field
@@ -164,6 +166,11 @@ carrier-hysteria  hysteria::tests::the_word_extension_key_costs_the_word_and_not
 carrier-hysteria  hysteria::tests::the_lowercase_extension_key_costs_the_same_answer  ferrox_core::hysteria::tests::the_lowercase_extension_key_costs_the_same_answer
 carrier-hysteria  hysteria::tests::the_block_answer_costs_the_bytes_it_copies  ferrox_core::hysteria::tests::the_block_answer_costs_the_bytes_it_copies
 carrier-hysteria  hysteria::tests::the_direct_answer_costs_the_same_bytes_once  ferrox_core::hysteria::tests::the_direct_answer_costs_the_same_bytes_once
+# The hop pick and reply membership, 512 picks and memberships over a thousand-port plan, and
+# the two filters with the linear scan that walked the same 512: one ops job reports both
+# frames, and only their difference is a claim about the searches.
+carrier-hysteria  hysteria::tests::the_binary_pick_and_membership_costs_the_search_and_nothing_else  ferrox_core::hysteria::tests::the_binary_pick_and_membership_costs_the_search_and_nothing_else
+carrier-hysteria  hysteria::tests::the_linear_scan_costs_the_same_answer  ferrox_core::hysteria::tests::the_linear_scan_costs_the_same_answer
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Chain::write
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Fragment::write_hello
 finalmask  finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies  ferrox_core::finalmask::write_record
@@ -211,6 +218,15 @@ front-healthcheck  proxy::hc_tests::the_seam_scan_costs_the_bytes_it_has_not_wal
 # difference is a claim about the decode.
 carrier-psiphon  psiphon_quic::tests::the_word_varint_read_costs_the_load_and_nothing_else  ferrox_app::psiphon_quic::tests::word_varint_probe
 carrier-psiphon  psiphon_quic::tests::the_byte_varint_walk_costs_the_same_answer  ferrox_app::psiphon_quic::tests::byte_varint_probe
+# The same four SSH packet slices sealed 4096 times directly and after
+# flattening: one ops job reports both probe frames. Their difference includes
+# the flatten copy and the effect of passing four slices versus one to the same
+# writer; it is not a measurement of the previous writer.
+carrier-psiphon  psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else  ferrox_app::psiphon_shadowsocks::tests::direct_write_probe
+carrier-psiphon  psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy  ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe
+# The sniff probe's frame is not an exact gate: on the same source it has read
+# 1228 and 1231, so it is reported here and not in expected-ops.
+engine-sniffing-http-tls-quic-fakedns  sniff::tests::a_warm_probe_costs_the_documented_instructions  ferrox_app::sniff::Sniffing::inspect
 carrier-quic  proxy::tests::quic_serves_vless_echo_over_loopback  quic::serve_loop
 wireguard  wireguard::device::tests::a_replayed_transport_counter_is_refused  wireguard::device::Tunnel::send
 wireguard  wg::tests::a_prefix_table_picks_the_peer_the_scan_picks  ferrox_app::wg::tests::route_scan_once

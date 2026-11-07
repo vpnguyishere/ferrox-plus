@@ -14,9 +14,14 @@ graph TD
     V --> T["max>=1.3 appends the<br/>TLS 1.3 trio"]
     T --> F["field bytes: 2-byte length<br/>then each id big-endian"]
     F --> E["carry on TlsConfig.cipher_suites"]
-    E --> S{"an id ring has not?"}
+    E --> M{"names a TLS 1.2<br/>and a TLS 1.3 id?"}
+    M -->|yes| G["shaped stock hello:<br/>the derived field verbatim"]
+    M -->|no| K{"an id neither ring<br/>nor BoringSSL carries?"}
+    K -->|yes| G
+    K -->|no| S{"an id ring has not?"}
     S -->|no| B["rustls provider sorted to<br/>the crafted order"]
     S -->|yes| L["BoringSSL cipher list in<br/>the config's order, capped at<br/>1.2 when no TLS 1.3 id is named"]
+    G --> W
     E --> X{"listener names a<br/>shaped-only id?"}
     X -->|no| B
     X -->|yes| Y{"ClientHello offers<br/>TLS 1.3?"}
@@ -40,6 +45,8 @@ graph TD
 | dialer-hello-cipher-field-equals-reference | 1 | ferrox-core-tls::rustls_backend::tests::a_crafted_list_reorders_the_dialer_hello_to_the_reference |
 | tls12-list-ids-equal-reference-in-order | 1 | ferrox-core-tls::rustls_backend::tests::a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire |
 | tls12-suite-negotiated-by-the-dialer | 1 | ferrox-core-tls::rustls_backend::tests::a_tls12_dial_negotiates_the_configured_suite |
+| mixed-list-dialer-field-equals-reference | 1 | ferrox-core-tls::rustls_backend::tests::a_mixed_list_keeps_the_reference_order_on_the_wire |
+| mixed-list-negotiated-by-the-dialer | 1 | ferrox-core-tls::rustls_backend::tests::a_mixed_list_negotiates_a_tls12_suite |
 | tls12-suite-negotiated-by-the-listener | 1 | ferrox-core-tls::rustls_backend::tests::a_tls_floor_and_suite_reach_the_negotiation |
 | shaped-listener-negotiates-the-five-unreachable-ids | 5 | ferrox-core-tls::rustls_backend::tests::a_shaped_listener_serves_the_five_ids_neither_backend_has |
 | mixed-max-hellos-routed-by-the-peek | 2 | ferrox-core-tls::rustls_backend::tests::a_mixed_max_listener_peeks_the_hello_before_choosing_an_engine |
@@ -64,10 +71,10 @@ graph TD
 
 ## The reachable-set ceiling, and what was not removed
 
-The derivation is byte-identical to `crypto/tls` for every case the oracle reaches. Two
-backends now carry the result: `rustls` for the suites ring has, and BoringSSL (already linked
-for ECH) when the config names one ring does not. Twenty of the reference's twenty-five ids
-are reachable.
+The derivation is byte-identical to `crypto/tls` for every case the oracle reaches. Three lanes
+now carry the result: `rustls` for a TLS 1.3-only list, BoringSSL (already linked for ECH) for
+a TLS 1.2-only list, and the stock shaped hello for a mixed list or one naming an id neither
+backend carries. Twenty of the reference's twenty-five ids are reachable.
 
 - **Nine ids by ring.** `rustls` is built with `tls12`, so the provider is the TLS 1.3 trio
   `0x1301`/`0x1302`/`0x1303` plus ring's six TLS 1.2 AEAD suites `0xc02b`, `0xc02c`, `0xcca9`,
@@ -117,13 +124,15 @@ are reachable.
   carries no version bound, where the reference drops the trio — so a capped list differs by the
   trio too. The legacy lane applies the cap from the list itself. Only a list that offers TLS 1.3
   on both sides matches id-for-id on the rustls lane.
-- **Hello order on the legacy lane.** A list that offers no TLS 1.3 id is the reference's max
-  below 1.3, so the lane caps BoringSSL at TLS 1.2: its fixed trio is absent and the field is
-  the config's TLS 1.2 ids in the reference's order, byte for byte
-  (`a_legacy_dial_offers_the_reference_cipher_ids_in_order`). A list that does offer TLS 1.3
-  keeps BoringSSL's own hello, which writes its trio before the TLS 1.2 ids where `crypto/tls`
-  appends it after, so that mixed field is exact only inside the 1.2 ids
-  (`a_legacy_mixed_list_keeps_boringssls_trio_before_the_tls12_ids`).
+- **Mixed lists ride the stock shaped hello.** A list that names a TLS 1.3 and a TLS 1.2 id
+  cannot use either stock lane: BoringSSL writes its trio first and rustls appends SCSV, so
+  neither writes the reference's field. The stock shaped hello writes the derived field
+  verbatim (`a_mixed_list_keeps_the_reference_order_on_the_wire`) and still finishes a TLS 1.2
+  handshake on the CBC id the list carries (`a_mixed_list_negotiates_a_tls12_suite`). A server
+  pick is checked against that field, so a suite this tree implements but the list omits is
+  refused (`a_server_may_not_select_an_unoffered_suite`). The legacy
+  lane is selected only for a list whose max is below 1.3, so its cap makes that field exact
+  (`a_legacy_dial_offers_the_reference_cipher_ids_in_order`).
 - **Two named limits on the legacy lane.** An ECH config keeps the rustls lane (ECH is stronger
   than the suite list), so a config naming both does not advertise its CBC ids; and the lane
   keeps no session cache, so `enableSessionResumption` does not carry there. Neither is a
@@ -133,12 +142,16 @@ are reachable.
   ML-KEM hybrid is shaped-lane only, so the stock lane never names it.
 
 Not done, deliberately and with the cost named: the five ids on the *dialer's* negotiated path
-when the peer offers TLS 1.3, a mixed TLS 1.2 + TLS 1.3 list on the legacy lane keeps BoringSSL's
-trio position, ECH together with CBC, and resumption on that lane. Each is a ceiling of the
-dispatch rule or a linked backend rather than a rewrite of this derivation.
+when the peer offers TLS 1.3, ECH together with CBC, and resumption on the legacy lane. Each is
+a ceiling of the dispatch rule or a linked backend rather than a rewrite of this derivation.
 
 ## What we removed
 
+- **The mixed-list ceiling.** A list naming both versions no longer reaches BoringSSL, whose
+  fixed trio led the field; it rides the stock shaped hello and keeps the reference's order.
+  The cost that was *not* removed: that dial now runs the hand-written shaped handshake instead
+  of rustls's, so it gives up rustls's session cache on a mixed list until resumption lands on
+  the shaped lane.
 - **The "CBC is unreachable" ceiling, without a new dependency.** The legacy lane adds no
   crate: `boring` was already linked for ECH, so the eleven CBC/static-RSA ids cost one context
   cache and one session wrapper rather than a second TLS implementation baked into the binary.

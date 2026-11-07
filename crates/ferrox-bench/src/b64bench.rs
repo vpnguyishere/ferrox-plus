@@ -147,7 +147,7 @@ fn decode_reference(text: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn iters_for(len: usize) -> u64 {
-    (4 * 1024 * 1024 / len.max(1) as u64).clamp(256, 200_000)
+    (64 * 1024 * 1024 / len.max(1) as u64).clamp(256, 2_000_000)
 }
 
 pub(crate) fn gate_b64() -> Vec<Row> {
