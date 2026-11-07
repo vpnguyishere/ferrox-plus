@@ -97,37 +97,6 @@ const RX_BURST: usize = 256;
 /// about 212 KiB, so a 128-datagram chunk per flow stays under it and does not
 /// lose tail segments, whose retransmit costs a whole RTO.
 const TX_BURST: usize = 128;
-
-#[cfg(target_os = "linux")]
-mod tun_dbg {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Instant;
-
-    pub static IFACE: AtomicU64 = AtomicU64::new(0);
-    pub static SYNC: AtomicU64 = AtomicU64::new(0);
-    pub static PUMP: AtomicU64 = AtomicU64::new(0);
-    pub static TX: AtomicU64 = AtomicU64::new(0);
-    pub static TURNS: AtomicU64 = AtomicU64::new(0);
-
-    pub fn add(counter: &AtomicU64, since: Instant) {
-        counter.fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    }
-
-    pub fn take(counter: &AtomicU64) -> u64 {
-        counter.swap(0, Ordering::Relaxed) / 1_000_000
-    }
-
-    pub fn report() {
-        eprintln!(
-            "TUNDBG2 turns={} iface={}ms sync={}ms pump={}ms tx={}ms",
-            TURNS.swap(0, Ordering::Relaxed),
-            take(&IFACE),
-            take(&SYNC),
-            take(&PUMP),
-            take(&TX)
-        );
-    }
-}
 /// The most server datagram lanes one inbound may hold.
 const UDP_FLOWS: usize = 4096;
 /// The largest inner packet the server's TCP may build, so a read becomes one
@@ -1268,8 +1237,6 @@ pub(crate) fn serve_tun_device(
     stack.device.recycle = recycle;
     let _ = wake.set_nonblocking(true);
     let mut buf = vec![0u8; 64 * 1024];
-    #[cfg(target_os = "linux")]
-    let mut last = std::time::Instant::now();
     loop {
         let mut closed = false;
         for _ in 0..RX_BURST {
@@ -1283,14 +1250,6 @@ pub(crate) fn serve_tun_device(
             }
         }
         let progressed = stack.poll(&mut buf);
-        #[cfg(target_os = "linux")]
-        {
-            tun_dbg::TURNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if last.elapsed() >= std::time::Duration::from_secs(2) {
-                tun_dbg::report();
-                last = std::time::Instant::now();
-            }
-        }
         if closed {
             return;
         }
@@ -1580,18 +1539,8 @@ impl ClientStack {
     fn poll(&mut self, buf: &mut [u8]) -> bool {
         let now = self.now();
         self.reassembly.expire();
-        #[cfg(target_os = "linux")]
-        let started = std::time::Instant::now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        #[cfg(target_os = "linux")]
-        tun_dbg::add(&tun_dbg::IFACE, started);
-        #[cfg(target_os = "linux")]
-        let started = std::time::Instant::now();
         let ready = self.readiness.sync(&self.flows);
-        #[cfg(target_os = "linux")]
-        tun_dbg::add(&tun_dbg::SYNC, started);
-        #[cfg(target_os = "linux")]
-        let started = std::time::Instant::now();
         let mut retiring = std::mem::take(&mut self.retiring);
         let mut moved = false;
         for (flow, &up_ready) in self.flows.iter_mut().zip(ready) {
@@ -1603,15 +1552,7 @@ impl ClientStack {
             );
             moved |= pump(flow, &mut self.sockets, buf, up_ready);
         }
-        #[cfg(target_os = "linux")]
-        tun_dbg::add(&tun_dbg::PUMP, started);
-        #[cfg(target_os = "linux")]
-        let started = std::time::Instant::now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        #[cfg(target_os = "linux")]
-        tun_dbg::add(&tun_dbg::IFACE, started);
-        #[cfg(target_os = "linux")]
-        let started = std::time::Instant::now();
         retire(
             &mut self.sockets,
             &mut self.ports,
@@ -1627,8 +1568,6 @@ impl ClientStack {
                 return moved;
             }
         }
-        #[cfg(target_os = "linux")]
-        tun_dbg::add(&tun_dbg::TX, started);
         let mut retiring = std::mem::take(&mut self.retiring);
         self.flows.retain_mut(|flow| {
             if flow.done {
