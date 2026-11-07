@@ -659,19 +659,22 @@ impl Flow {
             Aead::Aes(_) | Aead::Chacha(_) => {
                 let at = out.len();
                 out.reserve(plain.len() + TAG_LEN);
-                // SAFETY: the reserve is at least `plain.len()` bytes, `seal_from` writes every byte it is handed before anything reads them, and the length is claimed only after the tag is appended.
-                let dst = unsafe {
-                    let spare = out.spare_capacity_mut();
-                    core::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), plain.len())
-                };
-                let (p, d) = (plain.as_ptr() as usize, dst.as_ptr() as usize);
+                // SAFETY: the reserve is at least `plain.len()` bytes; the seal writes every byte it is handed before anything reads them; the length is claimed only after the tag is appended.
+                let dst = out.spare_capacity_mut();
+                let d = dst.as_ptr() as usize;
+                let (p, len) = (plain.as_ptr() as usize, plain.len());
                 debug_assert!(
-                    p + plain.len() <= d || d + plain.len() <= p,
+                    p + len <= d || d + len <= p,
                     "seal_from reads plaintext and writes the caller's staging; those must not overlap"
                 );
                 let tag = match &self.aead {
-                    Aead::Aes(aes) => aes.seal_from(nonce, b"", plain, dst),
+                    Aead::Aes(aes) => aes.seal_from_uninit(nonce, b"", plain, &mut dst[..len]),
                     Aead::Chacha(key) => {
+                        // The ChaCha leg zeroes what it was handed, as `Vec::resize` did before spare capacity.
+                        unsafe { core::ptr::write_bytes(dst.as_mut_ptr(), 0, len) };
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), len)
+                        };
                         ferrox_core::aead::chacha20_poly1305_seal_from(key, nonce, b"", plain, dst)
                     }
                     Aead::Plain => unreachable!("the arm above rules the plain leg out"),

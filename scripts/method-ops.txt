@@ -115,6 +115,8 @@ carrier-foxy  foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer 
 carrier-grpc  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
 carrier-grpc  grpc::tests::the_varint_length_over_every_boundary  grpc::tests::the_varint_length_over_every_boundary
 carrier-grpc  grpc::tests::the_varint_shift_loop_over_every_boundary  grpc::tests::the_varint_shift_loop_over_every_boundary
+carrier-grpc  grpc::tests::the_direct_write_costs_the_second_byte_and_nothing_else  grpc::tests::direct_write_probe
+carrier-grpc  grpc::tests::the_walk_write_costs_the_same_answer  grpc::tests::walk_write_probe
 engine-api  accesslog::tests::the_ascii_scan_over_a_bulk_field  accesslog::tests::the_ascii_scan_over_a_bulk_field
 engine-api  accesslog::tests::the_swar_scan_over_a_bulk_field  accesslog::tests::the_swar_scan_over_a_bulk_field
 engine-api  accesslog::tests::the_codepoint_walk_over_a_bulk_field  accesslog::tests::the_codepoint_walk_over_a_bulk_field

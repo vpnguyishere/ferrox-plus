@@ -5,6 +5,8 @@ use super::Lanes;
 )]
 use core::arch::aarch64::*;
 
+const SHORT_SEAL_BYTES: usize = 512;
+
 pub(crate) struct Engine {
     rk: [uint8x16_t; 11],
     h: [(uint8x16_t, uint8x16_t); 4],
@@ -326,6 +328,10 @@ fn ctr_ghash8(
     mut ctr: u32,
 ) -> uint8x16_t {
     let (h, hp) = (ghash.h(), ghash.hp());
+    if buf.len() <= SHORT_SEAL_BYTES {
+        ctr_only8(rk, template, buf, ctr);
+        return ghash8(ghash, state, buf, tailq);
+    }
     let (blocks, _rest_bytes) = buf.as_chunks_mut::<16>();
     let (groups, _rest_blocks) = blocks.as_chunks_mut::<8>();
     let done = groups.len() * 8;
@@ -470,6 +476,10 @@ fn ctr_ghash8_256(
     mut ctr: u32,
 ) -> uint8x16_t {
     let (h, hp) = (ghash.h(), ghash.hp());
+    if buf.len() <= SHORT_SEAL_BYTES {
+        ctr_only8_256(rk, template, buf, ctr);
+        return ghash8(ghash, state, buf, tailq);
+    }
     let (blocks, _rest_bytes) = buf.as_chunks_mut::<16>();
     let (groups, _rest_blocks) = blocks.as_chunks_mut::<8>();
     let done = groups.len() * 8;
@@ -620,6 +630,70 @@ unsafe fn ctr_ghash8_from_256_uninit(
 }
 
 #[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the cipher state, both directions and the deferred tail are the pass, not a bundle"
+)]
+/// CTR and GHASH writing `src.len()` bytes into uninitialized `dst`.
+unsafe fn ctr_ghash8_from_uninit(
+    rk: &[uint8x16_t; 11],
+    ghash: &impl GhashTables,
+    template: uint8x16_t,
+    mut state: uint8x16_t,
+    src: &[u8],
+    dst: *mut u8,
+    tailq: &mut super::Tail<uint8x16_t>,
+    mut ctr: u32,
+) -> uint8x16_t {
+    let (h, hp) = (ghash.h(), ghash.hp());
+    let (sblocks, _) = src.as_chunks::<16>();
+    let (sgroups, _) = sblocks.as_chunks::<8>();
+    let done = sgroups.len() * 8;
+    for (group, sg) in sgroups.iter().enumerate() {
+        let mut ks = ctr8v_p(template, ctr);
+        <uint8x16_t as Lanes>::encrypt4(rk, &mut ks[0]);
+        <uint8x16_t as Lanes>::encrypt4(rk, &mut ks[1]);
+        let mut ct = load_pairs(sg);
+        for (i, pair) in ct.iter_mut().enumerate() {
+            pair.lo = <uint8x16_t as Lanes>::xor(ks[i / 2][i % 2 * 2], pair.lo);
+            pair.hi = <uint8x16_t as Lanes>::xor(ks[i / 2][i % 2 * 2 + 1], pair.hi);
+        }
+        let at = group * 128;
+        for (i, pair) in ct.iter().enumerate() {
+            // SAFETY: each pair lands inside the caller's `src.len()`-byte destination.
+            unsafe {
+                <uint8x16_t as Lanes>::store_ptr(pair.lo, dst.add(at + i * 32));
+                <uint8x16_t as Lanes>::store_ptr(pair.hi, dst.add(at + i * 32 + 16));
+            }
+        }
+        state = ghash_group8(
+            hp,
+            state,
+            [
+                bswap_p(ct[0]),
+                bswap_p(ct[1]),
+                bswap_p(ct[2]),
+                bswap_p(ct[3]),
+            ],
+        );
+        ctr += 8;
+    }
+    // SAFETY: the tail starts after the full groups and stays inside the destination.
+    unsafe {
+        super::ctr_ghash_from_uninit(
+            rk,
+            h,
+            template,
+            state,
+            &src[done * 16..],
+            dst.add(done * 16),
+            tailq,
+            ctr,
+        )
+    }
+}
+
+#[inline(always)]
 fn ctr_only8_256(rk: &[uint8x16_t; 15], template: uint8x16_t, buf: &mut [u8], mut ctr: u32) {
     let (blocks, _tail_bytes) = buf.as_chunks_mut::<16>();
     let (groups, _rest_blocks) = blocks.as_chunks_mut::<8>();
@@ -750,6 +824,38 @@ impl Engine {
             &mut tailq,
             aad.len() as u64,
             dst.len() as u64,
+            mask,
+        )
+    }
+
+    /// Seal `src` into uninitialized `dst` and return the tag.
+    #[target_feature(enable = "aes,neon")]
+    pub(crate) unsafe fn seal_from_uninit(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        src: &[u8],
+        dst: *mut u8,
+    ) -> [u8; 16] {
+        let template = super::counter_template::<uint8x16_t>(nonce);
+        let mask = <uint8x16_t as Lanes>::encrypt1v(&self.rk, template.ctr_be(1));
+        let mut tailq = super::Tail::new();
+        let state = super::ghash(
+            &self.h,
+            <uint8x16_t as Lanes>::load(&[0u8; 16]),
+            aad,
+            &mut tailq,
+        );
+        let state = super::flush(&self.h, state, &mut tailq);
+        let state = unsafe {
+            ctr_ghash8_from_uninit(&self.rk, self, template, state, src, dst, &mut tailq, 2)
+        };
+        super::finish(
+            &self.h,
+            state,
+            &mut tailq,
+            aad.len() as u64,
+            src.len() as u64,
             mask,
         )
     }

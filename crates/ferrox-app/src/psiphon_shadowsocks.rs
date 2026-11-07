@@ -264,6 +264,7 @@ impl Stream<TcpStream> {
         Self::new(io, key, prefix.unwrap_or_default())
     }
 
+    /// Clone the underlying stream.
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
             io: self.io.try_clone()?,
@@ -272,18 +273,58 @@ impl Stream<TcpStream> {
         })
     }
 
+    /// Forward the timeout to the underlying stream.
     pub(crate) fn set_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.io
             .set_read_timeout(timeout)
             .and_then(|()| self.io.set_write_timeout(timeout))
     }
 
+    /// Forward the read timeout to the underlying stream.
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.io.set_read_timeout(timeout)
     }
 
+    /// Shut down the underlying stream.
     pub(crate) fn shutdown(&self) -> io::Result<()> {
         self.io.shutdown(Shutdown::Both)
+    }
+}
+
+impl Stream<crate::psiphon_fragment::FragmentStream> {
+    /// Dial through the proxy and fragment the first writes beneath it.
+    pub(crate) fn connect_fragment(
+        io: crate::psiphon_fragment::FragmentStream,
+        key: &str,
+        prefix: Option<&[u8]>,
+    ) -> Self {
+        Self::new(io, key, prefix.unwrap_or_default())
+    }
+
+    /// Clone the underlying stream and its fragment plan.
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            io: self.io.try_clone()?,
+            reader: Arc::clone(&self.reader),
+            writer: Arc::clone(&self.writer),
+        })
+    }
+
+    /// Forward the timeout to the underlying stream.
+    pub(crate) fn set_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.io
+            .set_read_timeout(timeout)
+            .and_then(|()| self.io.set_write_timeout(timeout))
+    }
+
+    /// Forward the read timeout to the underlying stream.
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.io.set_read_timeout(timeout)
+    }
+
+    /// Shut down the underlying stream.
+    pub(crate) fn shutdown(&self) -> io::Result<()> {
+        self.io.shutdown(std::net::Shutdown::Both)
     }
 }
 

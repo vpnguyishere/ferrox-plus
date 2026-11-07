@@ -68,6 +68,7 @@ const MAX_REQUEST: usize = 16 * 1024;
 const DIAL_ATTEMPTS: usize = 64;
 const DIAL_WORKERS: usize = 10;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(12);
+const HOLD_OFF_LIMIT: Duration = Duration::from_secs(60);
 const FLOW_STACK: usize = 128 * 1024;
 
 static NO_CREDENTIAL: Credential = Credential {
@@ -99,6 +100,99 @@ struct Inner {
     udpgw: Mutex<Option<Arc<UdpGateway>>>,
     conduit: Mutex<Option<Arc<crate::psiphon_webrtc::Conduit>>>,
     split_untunneled: Mutex<HashMap<String, Instant>>,
+}
+
+/// The reference's protocol hold-off: a jittered delay before a new tunnel is activated.
+#[derive(Clone, Debug, Default)]
+struct HoldOff {
+    names: Vec<String>,
+    probability: f64,
+    min: Duration,
+    max: Duration,
+}
+
+impl HoldOff {
+    /// The hold-off for a protocol, zero when it is not named.
+    fn duration(&self, protocol: &str) -> Duration {
+        if self.names.is_empty()
+            || !self
+                .names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(protocol))
+            || !coin(self.probability)
+        {
+            return Duration::ZERO;
+        }
+        let low = u64::try_from(self.min.as_millis()).unwrap_or(u64::MAX);
+        let high = u64::try_from(self.max.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(low);
+        let span = high.saturating_sub(low).saturating_add(1);
+        Duration::from_millis(low + u64::from_le_bytes(random::<8>()) % span)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LivenessSpec {
+    pattern: String,
+    min_upstream: usize,
+    max_upstream: usize,
+    min_downstream: usize,
+    max_downstream: usize,
+}
+
+/// The reference's liveness probes, keyed by tunnel-protocol pattern.
+#[derive(Clone, Debug, Default)]
+struct Liveness {
+    initial: Vec<LivenessSpec>,
+    periodic: Vec<LivenessSpec>,
+}
+
+impl Liveness {
+    /// The first probe spec naming this protocol in the given state.
+    fn spec(&self, protocol: &str, established: bool) -> Option<LivenessSpec> {
+        let probes = if established {
+            &self.periodic
+        } else {
+            &self.initial
+        };
+        let mut matched: Option<&LivenessSpec> = None;
+        let mut fallback = None;
+        for probe in probes {
+            if probe.pattern.is_empty() {
+                fallback = Some(probe);
+            } else if wildcard_match(&probe.pattern, protocol)
+                && matched.is_none_or(|best| probe.pattern.len() > best.pattern.len())
+            {
+                matched = Some(probe);
+            }
+        }
+        matched.or(fallback).cloned()
+    }
+}
+
+/// The reference's protocol wildcard: `*` matches any run of bytes, everything else is literal.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let first = parts[0];
+    if !text.starts_with(first) {
+        return false;
+    }
+    let mut rest = &text[first.len()..];
+    for (index, part) in parts.iter().enumerate().skip(1) {
+        let part = *part;
+        if index + 1 == parts.len() {
+            return part.is_empty() || rest.ends_with(part);
+        }
+        if part.is_empty() {
+            continue;
+        }
+        let Some(at) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[at + part.len()..];
+    }
+    rest.is_empty()
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -144,12 +238,16 @@ struct Settings {
     reject_cidrs: Vec<String>,
     geoip_path: Option<String>,
     dns_servers: Vec<SocketAddr>,
+    dns: crate::psiphon_dns::Config,
     limit_quic_versions: Vec<String>,
     quic_noise: Option<String>,
     tls_shape: TlsShape,
     meek_padding: (u16, u16),
     limit_meek_buffers: bool,
     relay_buffer: usize,
+    rate: Option<crate::psiphon_rate::Rate>,
+    holdoff: HoldOff,
+    liveness: Liveness,
     dial_ports: Vec<(String, PortList)>,
     dial_ports_probability: f64,
     prioritize_protocols: Vec<String>,
@@ -167,6 +265,8 @@ struct Settings {
     headers: Vec<(String, String)>,
     proxy: Option<Proxy>,
     sponsor: String,
+    session_id: Option<String>,
+    authorizations: Vec<String>,
     proxy_user: Option<String>,
     proxy_pass: Option<String>,
     raw: Option<Json>,
@@ -250,8 +350,12 @@ impl PsiphonOut {
             .map(TcpListener::local_addr)
             .transpose()
             .map_err(|error| format!("psiphon: http listen address: {error}"))?;
+        let session_id = settings
+            .session_id
+            .clone()
+            .unwrap_or_else(|| hex(&random::<16>()));
         let inner = Arc::new(Inner {
-            session_id: hex(&random::<16>()),
+            session_id,
             settings,
             entries,
             sessions: Mutex::new(Vec::new()),
@@ -421,12 +525,14 @@ impl Inner {
         }
     }
 
-    /// Dial and add one tunnel; the caller holds the `connecting` lock.
+    /// Dial and add one tunnel; the pool path passes no guard and the single-dial
+    /// paths hand over the `connecting` guard so the wait below never holds it.
     #[allow(clippy::too_many_lines)]
     fn connect_locked(
         &self,
         start: usize,
         affinity_lead: Duration,
+        mut connecting: Option<std::sync::MutexGuard<'_, ()>>,
     ) -> Result<Arc<Session>, String> {
         if self.stopping.load(Ordering::Acquire) {
             return Err("psiphon: the lane is stopping".to_owned());
@@ -495,6 +601,7 @@ impl Inner {
                 last_delay.saturating_add(timeout).min(remaining)
             };
             let session_id = self.session_id.clone();
+            let authorizations = self.settings.authorizations.clone();
             let sponsor = self.settings.sponsor.clone();
             let propagation = self.settings.propagation.clone();
             let platform = self.settings.platform.clone();
@@ -506,6 +613,7 @@ impl Inner {
             let split_tunnel = self.settings.split_tunnel_own_region;
             let split_tunnel_regions = self.settings.split_tunnel_regions.clone();
             let proxy = self.settings.proxy.clone();
+            let dns = self.settings.dns.clone();
             let keepalive = self.settings.keepalive;
             let limit_meek_buffers = self.settings.limit_meek_buffers;
             let tls_shape = self.settings.tls_shape.clone();
@@ -529,6 +637,7 @@ impl Inner {
                 };
                 let identity = Identity {
                     session_id: &session_id,
+                    authorizations: &authorizations,
                     sponsor: &sponsor,
                     propagation: &propagation,
                     platform: &platform,
@@ -545,6 +654,7 @@ impl Inner {
                     &identity,
                     timeout,
                     proxy.as_ref(),
+                    &dns,
                     conduit.as_deref(),
                     keepalive,
                     &tls_shape,
@@ -553,9 +663,44 @@ impl Inner {
             };
             match race(batch, attempt, budget, stagger, lead) {
                 Ok(session) => {
+                    drop(connecting.take());
                     if self.stopping.load(Ordering::Acquire) {
                         session.close();
                         return Err("psiphon: the lane is stopping".to_owned());
+                    }
+                    let protocol = session.protocol();
+                    let hold_off = self.settings.holdoff.duration(protocol);
+                    if !hold_off.is_zero() {
+                        eprintln!(
+                            "psiphon: holding off {protocol} for {} ms",
+                            hold_off.as_millis()
+                        );
+                        let deadline = Instant::now() + hold_off;
+                        loop {
+                            if self.stopping.load(Ordering::Acquire) {
+                                session.close();
+                                return Err("psiphon: the lane is stopping".to_owned());
+                            }
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            thread::sleep(remaining.min(Duration::from_millis(50)));
+                        }
+                    }
+                    let established = !lock(&self.sessions).is_empty();
+                    if let Some(probe) = self.settings.liveness.spec(protocol, established) {
+                        if let Err(why) = session.liveness_test(
+                            probe.min_upstream,
+                            probe.max_upstream,
+                            probe.min_downstream,
+                            probe.max_downstream,
+                            self.settings.dial_timeout(),
+                        ) {
+                            session.close();
+                            last = format!("psiphon: liveness test on {protocol}: {why}");
+                            continue;
+                        }
                     }
                     let session = Arc::new(session);
                     eprintln!(
@@ -605,7 +750,8 @@ impl Inner {
             None
         };
         let servers = load_tactics_entries(&self.settings)?;
-        let tactics = fetch_tactics_from(&self.settings, &servers)?;
+        let session_id = hex(&random::<16>());
+        let tactics = fetch_tactics_from(&self.settings, &servers, &session_id)?;
         let broker = tactics
             .brokers
             .first()
@@ -633,7 +779,7 @@ impl Inner {
             self.settings.conduit_protocols.clone(),
             self.settings.conduit_timeout,
             self.settings.meek_headers.clone(),
-            self.settings.dns_servers.clone(),
+            self.settings.dns.clone(),
             &self.settings.reject_cidrs,
             geoip,
         ));
@@ -768,7 +914,7 @@ impl Inner {
             return Ok(stream);
         }
         let timeout = self.settings.dial_timeout();
-        let addresses = crate::psiphon_dns::resolve(host, port, &self.settings.dns_servers)
+        let addresses = crate::psiphon_dns::resolve_with(&self.settings.dns, host, port)
             .map_err(|error| format!("psiphon: split tunnel could not resolve {host}: {error}"))?;
         let mut last = format!("no address for {host}");
         for address in addresses {
@@ -790,12 +936,12 @@ impl Inner {
         if let Some(session) = self.pick() {
             return Ok(session);
         }
-        let _connecting = lock(&self.connecting);
+        let connecting = lock(&self.connecting);
         if let Some(session) = self.pick() {
             return Ok(session);
         }
         let (start, lead) = self.start();
-        let session = self.connect_locked(start, lead)?;
+        let session = self.connect_locked(start, lead, Some(connecting))?;
         *lock(&self.affinity) = Some(session.server().to_owned());
         Ok(session)
     }
@@ -813,12 +959,12 @@ impl Inner {
                 return Ok(());
             }
             if missing == 1 {
-                let _connecting = lock(&self.connecting);
+                let connecting = lock(&self.connecting);
                 if self.live() >= self.settings.pool {
                     return Ok(());
                 }
                 let (start, lead) = self.start();
-                let session = self.connect_locked(start, lead)?;
+                let session = self.connect_locked(start, lead, Some(connecting))?;
                 *lock(&self.affinity) = Some(session.server().to_owned());
                 continue;
             }
@@ -836,7 +982,7 @@ impl Inner {
                 handles.push(
                     thread::Builder::new()
                         .name("psiphon-pool".to_owned())
-                        .spawn(move || lane.connect_locked(start, worker_lead))
+                        .spawn(move || lane.connect_locked(start, worker_lead, None))
                         .map_err(|error| format!("psiphon: pool thread: {error}"))?,
                 );
             }
@@ -926,7 +1072,12 @@ fn serve(mut client: TcpStream, inner: &Arc<Inner>) {
                 }
                 let _ = client.set_read_timeout(None);
                 let _ = client.set_write_timeout(None);
-                relay_flow(client, flow, inner.settings.relay_buffer);
+                let rate = inner
+                    .settings
+                    .rate
+                    .as_ref()
+                    .map(|rate| Arc::new(Mutex::new(rate.clone())));
+                relay_flow(client, flow, inner.settings.relay_buffer, rate.as_ref());
             }
             Err(why) => {
                 eprintln!("psiphon: {why}");
@@ -1135,71 +1286,153 @@ fn ask_reply(client: &mut TcpStream, version: Version, result: Result<(), u8>) -
     }
 }
 
-fn relay_flow(client: TcpStream, flow: Flow, buffer: usize) {
+/// Relay one accepted flow through the tunnel, then close it when the tunnel ends.
+fn relay_flow(
+    client: TcpStream,
+    flow: Flow,
+    buffer: usize,
+    rate: Option<&Arc<Mutex<crate::psiphon_rate::Rate>>>,
+) {
     match flow {
-        Flow::Tunnel(channel) => relay(client, channel, buffer),
-        Flow::Direct(remote) => relay_direct(client, remote, buffer),
+        Flow::Tunnel(channel) => relay(client, channel, buffer, rate),
+        Flow::Direct(remote) => relay_direct(client, remote, buffer, rate),
     }
 }
 
+/// Account bytes against the tunnel's rate limits; false means `CloseAfterExhausted` fired.
+fn throttle(
+    rate: Option<&Arc<Mutex<crate::psiphon_rate::Rate>>>,
+    is_read: bool,
+    bytes: usize,
+) -> bool {
+    let Some(rate) = rate else {
+        return true;
+    };
+    let account = {
+        let Ok(mut rate) = rate.lock() else {
+            return true;
+        };
+        if is_read {
+            rate.read(bytes)
+        } else {
+            rate.write(bytes)
+        }
+    };
+    crate::psiphon_rate::settle(account)
+}
+
+/// Relay a flow directly when split tunneling selects it.
 #[allow(clippy::needless_pass_by_value)]
-fn relay_direct(mut client: TcpStream, mut remote: TcpStream, buffer: usize) {
+fn relay_direct(
+    mut client: TcpStream,
+    mut remote: TcpStream,
+    buffer: usize,
+    rate: Option<&Arc<Mutex<crate::psiphon_rate::Rate>>>,
+) {
     let Ok(mut client_read) = client.try_clone() else {
         return;
     };
     let Ok(mut remote_write) = remote.try_clone() else {
         return;
     };
+    let forward_rate = rate.cloned();
     let forward = thread::Builder::new()
         .name("psiphon-direct-forward".to_owned())
         .stack_size(FLOW_STACK)
         .spawn(move || {
-            pump_copy(&mut client_read, &mut remote_write, buffer);
-            let _ = remote_write.shutdown(Shutdown::Write);
+            let done = pump_copy(
+                &mut client_read,
+                &mut remote_write,
+                buffer,
+                forward_rate.as_ref(),
+                false,
+            );
+            let _ = remote_write.shutdown(if done {
+                Shutdown::Write
+            } else {
+                Shutdown::Both
+            });
         })
         .ok();
-    pump_copy(&mut remote, &mut client, buffer);
-    let _ = client.shutdown(Shutdown::Write);
+    let done = pump_copy(&mut remote, &mut client, buffer, rate, true);
+    let _ = client.shutdown(if done {
+        Shutdown::Write
+    } else {
+        Shutdown::Both
+    });
     if let Some(forward) = forward {
         let _ = forward.join();
     }
     let _ = remote.shutdown(Shutdown::Both);
 }
 
-fn pump_copy(source: &mut impl Read, sink: &mut impl Write, buffer: usize) {
+/// Copy one direction until EOF or a terminal error.
+fn pump_copy(
+    source: &mut impl Read,
+    sink: &mut impl Write,
+    buffer: usize,
+    rate: Option<&Arc<Mutex<crate::psiphon_rate::Rate>>>,
+    is_read: bool,
+) -> bool {
     let mut bytes = vec![0u8; buffer];
     loop {
         match source.read(&mut bytes) {
-            Ok(0) => return,
+            Ok(0) => return true,
             Ok(read) => {
+                if !throttle(rate, is_read, read) {
+                    return false;
+                }
                 if sink.write_all(&bytes[..read]).is_err() {
-                    return;
+                    return true;
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return,
+            Err(_) => return true,
         }
     }
 }
 
+/// Relay both directions of an established stream until either side closes.
 #[allow(clippy::needless_pass_by_value)]
-fn relay(mut client: TcpStream, channel: Channel, buffer: usize) {
+fn relay(
+    mut client: TcpStream,
+    channel: Channel,
+    buffer: usize,
+    rate: Option<&Arc<Mutex<crate::psiphon_rate::Rate>>>,
+) {
     let Ok(mut client_read) = client.try_clone() else {
         channel.close();
         return;
     };
     let mut channel_write = channel.clone();
+    let forward_rate = rate.cloned();
     let forward = thread::Builder::new()
         .name("psiphon-flow-forward".to_owned())
         .stack_size(FLOW_STACK)
         .spawn(move || {
-            pump_out(&mut client_read, &mut channel_write, buffer);
-            channel_write.shutdown();
+            let done = pump_out(
+                &mut client_read,
+                &mut channel_write,
+                buffer,
+                forward_rate.as_ref(),
+            );
+            if done {
+                channel_write.shutdown();
+            } else {
+                channel_write.close();
+            }
         })
         .ok();
     let mut channel_read = channel.clone();
-    pump_channel(&mut channel_read, &mut client);
-    let _ = client.shutdown(Shutdown::Write);
+    let done = pump_channel(&mut channel_read, &mut client, rate);
+    if !done {
+        channel_read.close();
+    }
+    let _ = client.shutdown(if done {
+        Shutdown::Write
+    } else {
+        Shutdown::Both
+    });
     if let Some(forward) = forward {
         let _ = forward.join();
     }
@@ -1221,17 +1454,26 @@ fn trace_flow(flow: &Flow) {
 
 /// The download half writes each received packet straight from the SSH buffer,
 /// coalescing the packets already queued into one vectored call.
-fn pump_channel(channel: &mut Channel, sink: &mut impl Write) {
+fn pump_channel(
+    channel: &mut Channel,
+    sink: &mut impl Write,
+    rate: Option<&Arc<Mutex<crate::psiphon_rate::Rate>>>,
+) -> bool {
     let mut batch: Vec<ChannelChunk> = Vec::with_capacity(RELAY_BATCH);
     loop {
         batch.clear();
         match channel.next_batch(&mut batch, RELAY_BATCH) {
             Ok(true) => {
+                let bytes: usize = batch.iter().map(|chunk| chunk.data().len()).sum();
+                if !throttle(rate, true, bytes) {
+                    channel.recycle_chunks(batch.drain(..));
+                    return false;
+                }
                 if !flush_chunks(channel, sink, &mut batch) {
-                    return;
+                    return true;
                 }
             }
-            _ => return,
+            _ => return true,
         }
     }
 }
@@ -1265,23 +1507,31 @@ fn write_all_vectored(sink: &mut impl Write, mut slices: &mut [IoSlice<'_>]) -> 
 }
 
 /// The client-to-tunnel side encrypts the read buffer in place, so the payload is not copied into a packet.
-fn pump_out(source: &mut impl Read, sink: &mut Channel, buffer: usize) {
+fn pump_out(
+    source: &mut impl Read,
+    sink: &mut Channel,
+    buffer: usize,
+    rate: Option<&Arc<Mutex<crate::psiphon_rate::Rate>>>,
+) -> bool {
     let mut buffer = vec![0u8; buffer];
     loop {
         let read = match source.read(&mut buffer) {
-            Ok(0) => return,
+            Ok(0) => return true,
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return,
+            Err(_) => return true,
         };
+        if !throttle(rate, false, read) {
+            return false;
+        }
         // A window or a smaller remote packet can take less than the read, so the remainder leaves next packet.
         let mut at = 0;
         while at < read {
             match sink.write_in_place(&mut buffer[at..read]) {
-                Ok(0) => return,
+                Ok(0) => return true,
                 Ok(written) => at += written,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => return,
+                Err(_) => return true,
             }
         }
     }
@@ -1378,7 +1628,12 @@ fn serve_http(mut client: TcpStream, inner: &Arc<Inner>) {
             }
             let _ = client.set_read_timeout(None);
             let _ = client.set_write_timeout(None);
-            relay_flow(client, flow, inner.settings.relay_buffer);
+            let rate = inner
+                .settings
+                .rate
+                .as_ref()
+                .map(|rate| Arc::new(Mutex::new(rate.clone())));
+            relay_flow(client, flow, inner.settings.relay_buffer, rate.as_ref());
         }
         Err(why) => {
             eprintln!("psiphon: {why}");
@@ -1448,6 +1703,7 @@ impl Settings {
                 parsed
             })
             .collect();
+        let dns = dns_config(settings, &dns_servers);
         if flag(settings, "disableTunnels", "AETHER_PSIPHON_DISABLE_TUNNELS")
             || flag(settings, "DisableTunnels", "AETHER_PSIPHON_DISABLE_TUNNELS")
         {
@@ -1629,6 +1885,22 @@ impl Settings {
             MAX_PADDING,
             obfuscated_min_padding,
         );
+        let meek_limit = |key: &str| {
+            let max = crate::psiphon_meek::MAX_REQUEST_PAYLOAD as u64;
+            let raw = number(settings, key).unwrap_or(max);
+            let value = raw.clamp(1, max) as usize;
+            if raw != value as u64 {
+                eprintln!("psiphon: {key} clamped to {value}");
+            }
+            value
+        };
+        let meek_min_limit_request = meek_limit("MeekMinLimitRequestPayloadLength");
+        let meek_max_limit_request = meek_limit("MeekMaxLimitRequestPayloadLength");
+        if meek_min_limit_request > meek_max_limit_request {
+            eprintln!(
+                "psiphon: MeekMinLimitRequestPayloadLength exceeds MeekMaxLimitRequestPayloadLength; using the minimum for both"
+            );
+        }
         let tls_shape = TlsShape {
             min_padding: u16::try_from(
                 number(settings, "TLSTunnelMinTLSPadding")
@@ -1654,6 +1926,43 @@ impl Settings {
             ossh_prefix: ossh_prefix(settings),
             obfuscated_min_padding,
             obfuscated_max_padding,
+            meek_alternate_cookie_name: decimal(settings, "MeekAlternateCookieNameProbability")
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0),
+            meek_alternate_content_type: decimal(settings, "MeekAlternateContentTypeProbability")
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0),
+            meek_traffic_shaping: decimal(settings, "MeekTrafficShapingProbability")
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0),
+            meek_traffic_shaping_protocols: protocol_list_named(
+                settings,
+                "MeekTrafficShapingLimitProtocols",
+            ),
+            meek_min_limit_request,
+            meek_max_limit_request,
+            meek_redial_tls: decimal(settings, "MeekRedialTLSProbability")
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+            fragmentor: crate::psiphon_fragment::Fragmentor::new(
+                decimal(settings, "FragmentorProbability").unwrap_or(0.5),
+                protocol_list_named(settings, "FragmentorLimitProtocols"),
+                number(settings, "FragmentorMinTotalBytes").unwrap_or(0) as usize,
+                number(settings, "FragmentorMaxTotalBytes").unwrap_or(0) as usize,
+                number(settings, "FragmentorMinWriteBytes").unwrap_or(1) as usize,
+                number(settings, "FragmentorMaxWriteBytes").unwrap_or(1500) as usize,
+                Duration::from_micros(
+                    number(settings, "FragmentorMinDelayMicroseconds").unwrap_or(0),
+                ),
+                Duration::from_micros(
+                    number(settings, "FragmentorMaxDelayMicroseconds").unwrap_or(10_000),
+                ),
+                flag(
+                    settings,
+                    "OSSHPrefixEnableFragmentor",
+                    "AETHER_PSIPHON_FRAGMENT_OSSHPREFIX",
+                ),
+            ),
         };
         let mut cdn_ips: Vec<String> = string_list(settings, "cdnIps")
             .into_iter()
@@ -1753,7 +2062,7 @@ impl Settings {
             .or_else(|| text(settings, "UpstreamProxyURL"))
             .or_else(|| text(settings, "UpstreamProxyUrl"))
             .or_else(|| env("AETHER_PSIPHON_UPSTREAM"))
-            .map(|url| Proxy::parse(&url, &dns_servers))
+            .map(|url| Proxy::parse(&url, &dns))
             .transpose()?;
         let http_listen = if flag(
             settings,
@@ -1955,12 +2264,16 @@ impl Settings {
             reject_cidrs,
             geoip_path,
             dns_servers,
+            dns,
             limit_quic_versions,
             quic_noise,
             tls_shape,
             meek_padding,
             limit_meek_buffers,
             relay_buffer,
+            rate: rate_limits(settings),
+            holdoff: holdoff(settings),
+            liveness: liveness(settings),
             dial_ports,
             dial_ports_probability,
             prioritize_protocols,
@@ -1994,6 +2307,8 @@ impl Settings {
                 .or_else(|| text(settings, "SponsorID"))
                 .or_else(|| env("AETHER_PSIPHON_SPONSOR_ID"))
                 .unwrap_or_else(|| SPONSOR_ID.to_owned()),
+            session_id: client_session_id(settings),
+            authorizations: string_list(settings, "Authorizations"),
             proxy_user,
             proxy_pass,
             raw,
@@ -2079,6 +2394,218 @@ impl Settings {
             .mul_f64(self.latency.multiplier())
             .min(Duration::from_secs(600))
     }
+}
+
+/// Build the DNS fallback config from the reference's `DNSResolver*` fields.
+fn dns_config(raw: Option<&Json>, dns_servers: &[SocketAddr]) -> crate::psiphon_dns::Config {
+    let list = |key: &str| -> Vec<String> { string_list(raw, key) };
+    let clock = |key: &str, default: u64| {
+        Duration::from_millis(number(raw, key).unwrap_or(default).clamp(1, 600_000))
+    };
+    let mut config = crate::psiphon_dns::Config::from_servers(dns_servers);
+    config.preferred = list("DNSResolverPreferredAlternateServers")
+        .iter()
+        .filter_map(|server| dns_server(server))
+        .collect();
+    config.attempts_per_server = usize::try_from(
+        number(raw, "DNSResolverAttemptsPerServer")
+            .unwrap_or(2)
+            .clamp(1, 16),
+    )
+    .unwrap_or(1);
+    config.attempts_per_preferred = usize::try_from(
+        number(raw, "DNSResolverAttemptsPerPreferredServer")
+            .unwrap_or(1)
+            .clamp(1, 16),
+    )
+    .unwrap_or(1);
+    config.request_timeout = clock("DNSResolverRequestTimeoutMilliseconds", 5_000);
+    config.await_timeout = clock("DNSResolverAwaitTimeoutMilliseconds", 10);
+    config.prefer_alternate_probability =
+        decimal(raw, "DNSResolverPreferAlternateServerProbability")
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+    config.edns0_probability = decimal(raw, "DNSResolverIncludeEDNS0Probability")
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    config.qname_casing_probability = decimal(raw, "DNSResolverQNameRandomizeCasingProbability")
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    config.cache_extension = Duration::from_millis(
+        number(raw, "DNSResolverCacheExtensionInitialTTLMilliseconds").unwrap_or(0),
+    );
+    config.preresolved_labels = if let Some(Json::Obj(labels)) =
+        raw.and_then(|settings| settings.get("DNSResolverPreresolvedIPAddressCIDRs"))
+    {
+        labels
+            .iter()
+            .filter_map(|(label, value)| {
+                let texts: Vec<String> = match value {
+                    Json::Arr(items) => items
+                        .iter()
+                        .filter_map(Json::as_str)
+                        .map(str::to_owned)
+                        .collect(),
+                    Json::Str(text) => vec![text.clone()],
+                    _ => return None,
+                };
+                let networks = crate::psiphon_dns::Config::cidrs(&texts);
+                (!networks.is_empty()).then(|| (label.to_ascii_lowercase(), networks))
+            })
+            .collect()
+    } else {
+        let networks =
+            crate::psiphon_dns::Config::cidrs(&list("DNSResolverPreresolvedIPAddressCIDRs"));
+        if networks.is_empty() {
+            HashMap::new()
+        } else {
+            HashMap::from([(String::new(), networks)])
+        }
+    };
+    config.preresolved_probability = decimal(raw, "DNSResolverPreresolvedIPAddressProbability")
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    config
+}
+
+/// The reference's `RateLimits`: a shared token bucket for both directions.
+fn rate_limits(settings: Option<&Json>) -> Option<crate::psiphon_rate::Rate> {
+    let limits = settings.and_then(|settings| settings.get("RateLimits"))?;
+    let amount = |key: &str| {
+        limits
+            .get(key)
+            .and_then(Json::as_u32)
+            .map(u64::from)
+            .or_else(|| {
+                limits
+                    .get(key)
+                    .and_then(Json::as_i64)
+                    .and_then(|value| u64::try_from(value).ok())
+            })
+            .unwrap_or(0)
+    };
+    let close = matches!(limits.get("CloseAfterExhausted"), Some(Json::Bool(true)));
+    let rate = crate::psiphon_rate::Rate::new(
+        amount("ReadBytesPerSecond"),
+        amount("ReadUnthrottledBytes"),
+        amount("WriteBytesPerSecond"),
+        amount("WriteUnthrottledBytes"),
+        close,
+    );
+    rate.active().then_some(rate)
+}
+
+/// The reference's tactics timing: how long establishment waits, how it retries, and one dial's deadline.
+#[derive(Clone, Copy, Debug, Default)]
+struct TacticsTiming {
+    wait: Duration,
+    retry: Duration,
+    jitter: f64,
+    timeout: Option<Duration>,
+}
+
+/// The reference tactics timing: establishment wait, retry period, jitter, and one dial's deadline.
+fn tactics_timing(settings: Option<&Json>) -> TacticsTiming {
+    let millis = |key: &str, minimum: u64| {
+        number(settings, key)
+            .filter(|millis| *millis >= minimum)
+            .map(|millis| Duration::from_millis(millis.min(3_600_000)))
+    };
+    TacticsTiming {
+        wait: millis("TacticsWaitPeriodMilliseconds", 0).unwrap_or(Duration::ZERO),
+        retry: millis("TacticsRetryPeriodMilliseconds", 1).unwrap_or(Duration::from_secs(2)),
+        jitter: decimal(settings, "TacticsRetryPeriodJitter")
+            .unwrap_or(0.3)
+            .clamp(0.0, 1.0),
+        timeout: number(settings, "TacticsTimeoutMilliseconds").and_then(|millis| {
+            if millis < 1_000 {
+                eprintln!(
+                    "psiphon: TacticsTimeoutMilliseconds {millis} is below the 1000 ms floor; using the default"
+                );
+                None
+            } else {
+                Some(Duration::from_millis(millis.min(3_600_000)))
+            }
+        }),
+    }
+}
+
+/// The reference protocol hold-off, empty when no protocol is named.
+fn holdoff(settings: Option<&Json>) -> HoldOff {
+    let names = string_list(settings, "HoldOffTunnelProtocolNames");
+    if names.is_empty() {
+        return HoldOff::default();
+    }
+    let clock = |key: &str| Duration::from_millis(number(settings, key).unwrap_or(0));
+    let min = clock("HoldOffTunnelProtocolMinDurationMilliseconds").min(HOLD_OFF_LIMIT);
+    let max = clock("HoldOffTunnelProtocolMaxDurationMilliseconds")
+        .min(HOLD_OFF_LIMIT)
+        .max(min);
+    HoldOff {
+        names,
+        probability: decimal(settings, "HoldOffTunnelProtocolProbability")
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        min,
+        max,
+    }
+}
+
+/// The reference initial and periodic liveness probes.
+fn liveness(settings: Option<&Json>) -> Liveness {
+    let flat = LivenessSpec {
+        pattern: String::new(),
+        min_upstream: usize::try_from(
+            number(settings, "LivenessTestMinUpstreamBytes").unwrap_or(0),
+        )
+        .unwrap_or(0),
+        max_upstream: usize::try_from(
+            number(settings, "LivenessTestMaxUpstreamBytes").unwrap_or(0),
+        )
+        .unwrap_or(0),
+        min_downstream: usize::try_from(
+            number(settings, "LivenessTestMinDownstreamBytes").unwrap_or(0),
+        )
+        .unwrap_or(0),
+        max_downstream: usize::try_from(
+            number(settings, "LivenessTestMaxDownstreamBytes").unwrap_or(0),
+        )
+        .unwrap_or(0),
+    };
+    let active = flat.max_upstream > 0 || flat.max_downstream > 0;
+    let mut initial = liveness_specs(settings, "InitialLivenessTest");
+    let mut periodic = liveness_specs(settings, "LivenessTest");
+    if active {
+        if initial.is_empty() {
+            initial.push(flat.clone());
+        }
+        if periodic.is_empty() {
+            periodic.push(flat);
+        }
+    }
+    Liveness { initial, periodic }
+}
+
+/// Read one probe list, keeping only entries with a usable pattern.
+fn liveness_specs(settings: Option<&Json>, key: &str) -> Vec<LivenessSpec> {
+    let Some(Json::Obj(probes)) = settings.and_then(|settings| settings.get(key)) else {
+        return Vec::new();
+    };
+    probes
+        .iter()
+        .map(|(pattern, probe)| {
+            let amount = |field: &str| {
+                usize::try_from(probe.get(field).and_then(Json::as_u32).unwrap_or(0)).unwrap_or(0)
+            };
+            LivenessSpec {
+                pattern: pattern.clone(),
+                min_upstream: amount("MinUpstreamBytes"),
+                max_upstream: amount("MaxUpstreamBytes"),
+                min_downstream: amount("MinDownstreamBytes"),
+                max_downstream: amount("MaxDownstreamBytes"),
+            }
+        })
+        .collect()
 }
 
 fn port_number(settings: Option<&Json>, key: &str) -> Option<u16> {
@@ -2510,6 +3037,8 @@ const KNOWN_SETTINGS: &[&str] = &[
     "DataRootDirectory",
     "SponsorId",
     "SponsorID",
+    "SessionID",
+    "Authorizations",
     "sponsorId",
     "localProxyUsername",
     "LocalProxyUsername",
@@ -2611,6 +3140,13 @@ const KNOWN_SETTINGS: &[&str] = &[
     "TLSTunnelMaxTLSPadding",
     "MeekMinTLSPadding",
     "MeekMaxTLSPadding",
+    "MeekTrafficShapingProbability",
+    "MeekTrafficShapingLimitProtocols",
+    "MeekMinLimitRequestPayloadLength",
+    "MeekMaxLimitRequestPayloadLength",
+    "MeekRedialTLSProbability",
+    "MeekAlternateCookieNameProbability",
+    "MeekAlternateContentTypeProbability",
     "TLSTunnelTrafficShapingProbability",
     "SelectRandomizedTLSProfileProbability",
     "TLSOSSHSNIServerName",
@@ -2633,6 +3169,41 @@ const KNOWN_SETTINGS: &[&str] = &[
     "OSSHPrefixSplitMaxDelay",
     "ObfuscatedSSHMinPadding",
     "ObfuscatedSSHMaxPadding",
+    "RateLimits",
+    "HoldOffTunnelProtocolMinDurationMilliseconds",
+    "HoldOffTunnelProtocolMaxDurationMilliseconds",
+    "HoldOffTunnelProtocolNames",
+    "HoldOffTunnelProtocolProbability",
+    "TacticsWaitPeriodMilliseconds",
+    "TacticsRetryPeriodMilliseconds",
+    "TacticsRetryPeriodJitter",
+    "TacticsTimeoutMilliseconds",
+    "InitialLivenessTest",
+    "LivenessTest",
+    "LivenessTestMinUpstreamBytes",
+    "LivenessTestMaxUpstreamBytes",
+    "LivenessTestMinDownstreamBytes",
+    "LivenessTestMaxDownstreamBytes",
+    "FragmentorProbability",
+    "FragmentorLimitProtocols",
+    "FragmentorMinTotalBytes",
+    "FragmentorMaxTotalBytes",
+    "FragmentorMinWriteBytes",
+    "FragmentorMaxWriteBytes",
+    "FragmentorMinDelayMicroseconds",
+    "FragmentorMaxDelayMicroseconds",
+    "OSSHPrefixEnableFragmentor",
+    "DNSResolverAttemptsPerPreferredServer",
+    "DNSResolverAttemptsPerServer",
+    "DNSResolverAwaitTimeoutMilliseconds",
+    "DNSResolverCacheExtensionInitialTTLMilliseconds",
+    "DNSResolverIncludeEDNS0Probability",
+    "DNSResolverPreferAlternateServerProbability",
+    "DNSResolverPreferredAlternateServers",
+    "DNSResolverPreresolvedIPAddressCIDRs",
+    "DNSResolverPreresolvedIPAddressProbability",
+    "DNSResolverQNameRandomizeCasingProbability",
+    "DNSResolverRequestTimeoutMilliseconds",
 ];
 
 /// Report settings fields this lane does not consume.
@@ -2665,6 +3236,19 @@ fn dns_server(text: &str) -> Option<SocketAddr> {
             .ok()
             .map(|ip| SocketAddr::new(ip, 53))
     })
+}
+
+/// The reference's `SessionID`: 32 lowercase hex digits, or one generated per client session.
+fn client_session_id(settings: Option<&Json>) -> Option<String> {
+    let session = text(settings, "SessionID")?;
+    let valid = session.len() == 32
+        && session
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !valid {
+        eprintln!("psiphon: SessionID must be 32 lowercase hex digits; generating one");
+    }
+    valid.then_some(session)
 }
 
 fn text(settings: Option<&Json>, key: &str) -> Option<String> {
@@ -2890,14 +3474,19 @@ fn webrtc_offer(
     stun_servers: &[String],
     sdp: Option<&str>,
     timeout: std::time::Duration,
-    dns: &[SocketAddr],
+    dns_config: &crate::psiphon_dns::Config,
     unreliable: bool,
 ) -> Result<(Option<crate::psiphon_webrtc::WebRtc>, String), String> {
     if let Some(sdp) = sdp {
         return Ok((None, sdp.to_owned()));
     }
-    let (webrtc, sdp) =
-        crate::psiphon_webrtc::WebRtc::offer(address, stun_servers, timeout, dns, unreliable)?;
+    let (webrtc, sdp) = crate::psiphon_webrtc::WebRtc::offer(
+        address,
+        stun_servers,
+        timeout,
+        dns_config,
+        unreliable,
+    )?;
     Ok((Some(webrtc), sdp))
 }
 
@@ -2929,7 +3518,8 @@ pub(crate) fn broker_offer(
         eprintln!("psiphon broker: generated WebRTC uses direct UDP; the proxy carries only broker requests");
     }
     let servers = load_tactics_entries(&settings)?;
-    let tactics = fetch_tactics_from(&settings, &servers)?;
+    let session_id = hex(&random::<16>());
+    let tactics = fetch_tactics_from(&settings, &servers, &session_id)?;
     let broker = tactics
         .brokers
         .first()
@@ -2948,9 +3538,9 @@ pub(crate) fn broker_offer(
         .map(|compartment| compartment32(compartment, "tactics compartment"))
         .collect::<Result<_, _>>()?;
     let personal: [u8; 32] = compartment32(&settings.compartment, "personal compartment")?;
-    let session_id = hex(&random::<16>());
     let identity = Identity {
         session_id: &session_id,
+        authorizations: &settings.authorizations,
         sponsor: &settings.sponsor,
         propagation: &settings.propagation,
         platform: &settings.platform,
@@ -2974,7 +3564,7 @@ pub(crate) fn broker_offer(
             &tactics.stun_servers,
             sdp,
             timeout,
-            &settings.dns_servers,
+            &settings.dns,
             server.inproxy.as_ref().is_some_and(inproxy_uses_quic),
         )?;
         let mut client = match crate::psiphon_broker::Client::connect(
@@ -2986,7 +3576,7 @@ pub(crate) fn broker_offer(
             settings.ready,
             settings.proxy.as_ref(),
             &settings.meek_headers,
-            &settings.dns_servers,
+            &settings.dns,
         ) {
             Ok(client) => client,
             Err(error) => {
@@ -3023,12 +3613,14 @@ fn fetch_tactics(settings: &Settings) -> Result<crate::psiphon_tactics::Tactics,
         );
     }
     let servers = load_tactics_entries(settings)?;
-    fetch_tactics_from(settings, &servers)
+    let session_id = hex(&random::<16>());
+    fetch_tactics_from(settings, &servers, &session_id)
 }
 
 fn fetch_tactics_from(
     settings: &Settings,
     servers: &[Server],
+    session_id: &str,
 ) -> Result<crate::psiphon_tactics::Tactics, String> {
     if settings.disable_tactics {
         return Err(
@@ -3039,9 +3631,9 @@ fn fetch_tactics_from(
         .iter()
         .find(|server| server.tactics.is_some())
         .ok_or_else(|| "psiphon: the server list holds no tactics entry".to_owned())?;
-    let session_id = hex(&random::<16>());
     let identity = Identity {
-        session_id: &session_id,
+        session_id,
+        authorizations: &settings.authorizations,
         sponsor: &settings.sponsor,
         propagation: &settings.propagation,
         platform: &settings.platform,
@@ -3053,12 +3645,33 @@ fn fetch_tactics_from(
         split_tunnel: settings.split_tunnel_own_region,
         split_tunnel_regions: &settings.split_tunnel_regions,
     };
-    crate::psiphon_tactics::Tactics::fetch(
-        server,
-        &identity,
-        settings.ready,
-        settings.proxy.as_ref(),
-    )
+    let timing = tactics_timing(settings.raw.as_ref());
+    let timeout = timing.timeout.unwrap_or(settings.ready);
+    let deadline = (!timing.wait.is_zero()).then(|| Instant::now() + timing.wait);
+    loop {
+        match crate::psiphon_tactics::Tactics::fetch(
+            server,
+            &identity,
+            timeout,
+            settings.proxy.as_ref(),
+            &settings.dns,
+        ) {
+            Ok(tactics) => return Ok(tactics),
+            Err(why) => {
+                let Some(deadline) = deadline else {
+                    return Err(why);
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(why);
+                }
+                let base = timing.retry.min(remaining);
+                let span = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+                let delay = base.mul_f64(1.0 + timing.jitter * span).min(remaining);
+                thread::sleep(delay);
+            }
+        }
+    }
 }
 
 /// Decode every tactics compartment without echoing a value.
@@ -4754,6 +5367,7 @@ fn meek_hosts(entry: &Json, fallback: &str) -> (String, Vec<String>) {
 }
 
 /// The transport settings a meek capability selects.
+#[allow(clippy::too_many_lines)]
 fn meek_entry(
     entry: &Json,
     host: &str,
@@ -4798,6 +5412,7 @@ fn meek_entry(
             protocol,
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         });
     }
@@ -4849,6 +5464,12 @@ fn meek_entry(
         quic: protocol.contains("-QUIC-"),
         fronted: true,
         protocol,
+        provider_id: entry
+            .get("FrontingProviderID")
+            .or_else(|| entry.get("frontingProviderID"))
+            .and_then(Json::as_str)
+            .filter(|provider| !provider.is_empty())
+            .map(str::to_owned),
         headers: Vec::new(),
         dns: Vec::new(),
         shape: TlsShape::default(),
@@ -6100,6 +6721,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         });
         let mut servers = vec![server];
@@ -6145,6 +6767,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         });
         let mut servers = vec![server];
@@ -6195,6 +6818,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         });
         let mut servers = vec![server];
@@ -6232,6 +6856,7 @@ mod tests {
                 protocol: "FRONTED-MEEK-OSSH",
                 headers: Vec::new(),
                 dns: Vec::new(),
+                provider_id: None,
                 shape: TlsShape::default(),
             });
             servers.push(server);
@@ -6282,6 +6907,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         });
         let mut servers = vec![server];
@@ -6348,6 +6974,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         });
         let mut servers = vec![server];
@@ -6388,6 +7015,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         });
         let selected = select_protocols(vec![test_server(false), fronted], &[], &[], 0, true);
@@ -6414,6 +7042,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         };
         let mut direct = test_server(true);
@@ -6448,6 +7077,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         });
         let selected = select_protocols_with(
@@ -6484,6 +7114,7 @@ mod tests {
             protocol: "UNFRONTED-MEEK-HTTPS-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         });
         let selected = select_protocols(vec![test_server(false), unfronted], &[], &[], 0, false);
@@ -6699,6 +7330,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         });
         let https = vec![(
@@ -7593,7 +8225,7 @@ mod tests {
             calls: 0,
             bytes: Vec::new(),
         };
-        pump_channel(&mut channel, &mut sink);
+        pump_channel(&mut channel, &mut sink, None);
         assert_eq!(sink.calls, 1);
         assert_eq!(sink.bytes, b"aabbcc");
     }
@@ -7884,6 +8516,7 @@ mod tests {
         );
     }
 
+    /// Limited TLS profiles and meek padding reach every TLS shape.
     #[test]
     fn a_limited_tls_profile_reaches_every_tls_shape() {
         let settings = Settings::from_json(Some(
@@ -7916,6 +8549,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         });
         apply_session_settings(&mut servers, &settings);
@@ -7927,6 +8561,28 @@ mod tests {
             .padding()
             .expect("meek padding");
         assert!((23..=29).contains(&padding));
+    }
+
+    /// The reference meek shaping keys reach the lane shape.
+    #[test]
+    fn the_meek_shaping_settings_reach_the_shape() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"MeekAlternateCookieNameProbability":0.25,"MeekAlternateContentTypeProbability":0.5,"MeekTrafficShapingProbability":0.75,"MeekTrafficShapingLimitProtocols":["fronted-meek-ossh"],"MeekMinLimitRequestPayloadLength":1024,"MeekMaxLimitRequestPayloadLength":4096,"MeekRedialTLSProbability":0.125}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.tls_shape.meek_alternate_cookie_name, 0.25);
+        assert_eq!(settings.tls_shape.meek_alternate_content_type, 0.5);
+        assert_eq!(settings.tls_shape.meek_traffic_shaping, 0.75);
+        assert_eq!(
+            settings.tls_shape.meek_traffic_shaping_protocols,
+            vec!["FRONTED-MEEK-OSSH"]
+        );
+        assert_eq!(settings.tls_shape.meek_min_limit_request, 1024);
+        assert_eq!(settings.tls_shape.meek_max_limit_request, 4096);
+        assert_eq!(settings.tls_shape.meek_redial_tls, 0.125);
     }
 
     #[test]
@@ -8281,6 +8937,130 @@ mod tests {
         assert_eq!(&frame[5..21], &octets);
         assert_eq!(u16::from_be_bytes([frame[21], frame[22]]), 53);
         assert_eq!(&frame[23..], b"hi");
+    }
+
+    #[test]
+    /// The fragmentor window, protocol list, and OSSH prefix switch are read and clamped.
+    fn the_fragmentor_window_and_prefix_switch_are_read() {
+        let settings = json::parse(
+            r#"{"FragmentorProbability":1.0,"FragmentorMinTotalBytes":16,"FragmentorMaxTotalBytes":64,"FragmentorMaxWriteBytes":8,"FragmentorLimitProtocols":["SSH"]}"#,
+        )
+        .expect("settings");
+        let settings = Settings::from_json(Some(&settings)).expect("settings");
+        assert!(settings.tls_shape.may_fragment("SSH"));
+        assert!(!settings.tls_shape.may_fragment("TLS-OSSH"));
+        let quiet = json::parse(r#"{"FragmentorMaxTotalBytes":0}"#).expect("settings");
+        assert!(!Settings::from_json(Some(&quiet))
+            .expect("settings")
+            .tls_shape
+            .may_fragment("SSH"));
+    }
+
+    #[test]
+    /// A rate config that cannot throttle leaves the lane on its fast path.
+    fn the_rate_limits_are_read_only_when_they_do_something() {
+        let settings = json::parse(
+            r#"{"RateLimits":{"ReadBytesPerSecond":1000,"ReadUnthrottledBytes":10,"WriteBytesPerSecond":500}}"#,
+        )
+        .expect("settings");
+        assert!(Settings::from_json(Some(&settings))
+            .expect("settings")
+            .rate
+            .is_some());
+        let quiet = json::parse(r#"{"RateLimits":{"ReadBytesPerSecond":0}}"#).expect("settings");
+        assert!(Settings::from_json(Some(&quiet))
+            .expect("settings")
+            .rate
+            .is_none());
+    }
+
+    #[test]
+    /// Only 32 lowercase hex digits are accepted as a session ID.
+    fn a_session_id_is_read_only_as_32_lowercase_hex_digits() {
+        let valid =
+            json::parse(r#"{"SessionID":"0123456789abcdef0123456789abcdef"}"#).expect("settings");
+        assert_eq!(
+            client_session_id(Some(&valid)).as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let upper =
+            json::parse(r#"{"SessionID":"0123456789ABCDEF0123456789ABCDEF"}"#).expect("settings");
+        assert!(client_session_id(Some(&upper)).is_none());
+        let short = json::parse(r#"{"SessionID":"00"}"#).expect("settings");
+        assert!(client_session_id(Some(&short)).is_none());
+    }
+
+    #[test]
+    /// Tactics timing fields are read, floored, and defaulted as the reference does.
+    fn the_tactics_timing_is_read_and_clamped() {
+        let settings = json::parse(
+            r#"{"TacticsWaitPeriodMilliseconds":5000,"TacticsRetryPeriodMilliseconds":250,"TacticsRetryPeriodJitter":0.5,"TacticsTimeoutMilliseconds":60000}"#,
+        )
+        .expect("settings");
+        let timing = tactics_timing(Some(&settings));
+        assert_eq!(timing.wait, Duration::from_secs(5));
+        assert_eq!(timing.retry, Duration::from_millis(250));
+        assert!((timing.jitter - 0.5).abs() < f64::EPSILON);
+        assert_eq!(timing.timeout, Some(Duration::from_secs(60)));
+        let quiet = tactics_timing(None);
+        assert_eq!(quiet.wait, Duration::ZERO);
+        assert_eq!(quiet.timeout, None);
+        let hostile = json::parse(r#"{"TacticsRetryPeriodJitter":9.0}"#).expect("settings");
+        assert!((tactics_timing(Some(&hostile)).jitter - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    /// Hold-off names match exactly and durations stay inside the cap.
+    fn the_protocol_hold_off_is_read_and_matches_exact_names() {
+        let settings = json::parse(
+            r#"{"HoldOffTunnelProtocolNames":["SSH"],"HoldOffTunnelProtocolProbability":1.0,"HoldOffTunnelProtocolMinDurationMilliseconds":5,"HoldOffTunnelProtocolMaxDurationMilliseconds":10}"#,
+        )
+        .expect("settings");
+        let delay = holdoff(Some(&settings));
+        assert_eq!(delay.duration("TLS-OSSH"), Duration::ZERO);
+        let wait = u64::try_from(delay.duration("SSH").as_millis()).expect("millis");
+        assert!((5..=10).contains(&wait));
+        let off = json::parse(r#"{"HoldOffTunnelProtocolNames":["SSH"]}"#).expect("settings");
+        assert_eq!(holdoff(Some(&off)).duration("SSH"), Duration::ZERO);
+    }
+
+    #[test]
+    /// Liveness probes are read and selected by their protocol pattern.
+    fn the_liveness_probes_are_read_and_matched_by_pattern() {
+        let settings = json::parse(
+            r#"{"InitialLivenessTest":{"*":{"MinUpstreamBytes":0,"MaxUpstreamBytes":10},"SSH":{"MaxUpstreamBytes":20}},"LivenessTest":{"SSH":{"MaxDownstreamBytes":30}}}"#,
+        )
+        .expect("settings");
+        let liveness = liveness(Some(&settings));
+        assert_eq!(
+            liveness
+                .spec("SSH", false)
+                .expect("SSH initial probe")
+                .max_upstream,
+            20
+        );
+        assert_eq!(
+            liveness
+                .spec("TLS-OSSH", false)
+                .expect("fallback probe")
+                .max_upstream,
+            10
+        );
+        assert_eq!(
+            liveness
+                .spec("SSH", true)
+                .expect("SSH periodic probe")
+                .max_downstream,
+            30
+        );
+        assert!(liveness.spec("TLS-OSSH", true).is_none());
+        assert!(wildcard_match("TLS-*", "TLS-OSSH"));
+        assert!(wildcard_match("*@psiphon.ca", "random@psiphon.ca"));
+        assert!(!wildcard_match("TLS-*", "SSH"));
+        assert!(wildcard_match("A*B", "AxBzB"));
+        assert!(wildcard_match("A*B", "AB"));
+        assert!(!wildcard_match("A*B", "AxBzC"));
+        assert!(!wildcard_match("A*B", "BA"));
     }
 
     #[test]

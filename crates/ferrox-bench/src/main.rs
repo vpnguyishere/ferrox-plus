@@ -36,9 +36,9 @@ fn lengths() -> Vec<usize> {
 
 const BAR: f64 = 0.95;
 
-const ROUNDS: usize = 5;
+const ROUNDS: usize = 7;
 
-const CONFIRMATIONS: usize = 3;
+const CONFIRMATIONS: usize = 5;
 
 const _: () = assert!(CONFIRMATIONS >= 3);
 
@@ -1012,7 +1012,7 @@ fn main() {
         .chain(framing::gated_seals(&seals))
         .chain(muxframe::gated(&muxed))
         .chain(early.iter())
-        .chain(aes_gcm_rows.iter())
+        .chain(aesgcm::gated_rows(&aes_gcm_rows))
         .filter(|r| r.ratio() < BAR)
         .collect();
     let slow_b64: Vec<&framing::Row> = b64_rows

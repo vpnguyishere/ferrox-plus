@@ -79,9 +79,9 @@ impl H3 {
         port: u16,
         sni: &str,
         timeout: Duration,
-        servers: &[SocketAddr],
+        dns: &crate::psiphon_dns::Config,
     ) -> Result<Self, String> {
-        let peer = crate::psiphon_dns::resolve(dial, port, servers)
+        let peer = crate::psiphon_dns::resolve_with(dns, dial, port)
             .map_err(|error| format!("psiphon h3 resolve {dial}: {error}"))?
             .into_iter()
             .next()
