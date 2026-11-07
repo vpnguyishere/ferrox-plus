@@ -480,6 +480,25 @@ impl H2StreamReader {
     }
 }
 
+/// The next body wait: the remaining arrival budget when one is set, bounded by the stall.
+fn body_wait(stall: std::time::Duration) -> std::time::Duration {
+    let Some(until) = crate::proxy::body_deadline() else {
+        return stall;
+    };
+    until
+        .saturating_duration_since(std::time::Instant::now())
+        .min(stall)
+}
+
+/// The error a body wait ends with: a poll grain while the arrival budget remains, else the stall's end.
+fn body_wait_timeout() -> std::io::Error {
+    if crate::proxy::body_deadline().is_some_and(|until| std::time::Instant::now() >= until) {
+        std::io::Error::from(std::io::ErrorKind::WouldBlock)
+    } else {
+        std::io::Error::other("h2 body stalled")
+    }
+}
+
 impl Read for H2StreamReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
@@ -562,16 +581,17 @@ impl Read for H2StreamReader {
                 }
                 continue;
             }
+            // A body read carries its arrival deadline, so a withheld DATA frame ends there instead of at the stall.
             let (next, wait) = self
                 .stream
                 .cv
-                .wait_timeout(st, crate::budgets::relay_stall())
+                .wait_timeout(st, body_wait(crate::budgets::relay_stall()))
                 .unwrap_or_else(PoisonError::into_inner);
             st = next;
             if wait.timed_out() {
                 drop(st);
                 self.conn.forget_upload(self.id);
-                return Err(std::io::Error::other("h2 body stalled"));
+                return Err(body_wait_timeout());
             }
         }
     }
@@ -2276,6 +2296,7 @@ fn serve_stream(
     );
 }
 
+/// Opens one H2 request stream and hands its body to the session, choosing the frame window when the request carries no sequence.
 fn open_stream(
     conn: &Arc<H2Conn>,
     settings: &XhttpSettings,
@@ -2342,13 +2363,26 @@ fn open_stream(
         head: Vec::new(),
         headed: false,
     };
+    let windowed = std::str::from_utf8(&head)
+        .ok()
+        .zip(std::str::from_utf8(&target).ok())
+        .is_some_and(|(text, target)| {
+            crate::xhttp::extract_meta(text, target, settings)
+                .1
+                .is_none()
+        });
+    let upload = if windowed {
+        crate::xhttp::Upload::Window(Box::new(reader))
+    } else {
+        crate::xhttp::Upload::Read(reader)
+    };
     let settings = settings.clone();
     let decryption = conn.decryption.clone();
     crate::budgets::spawn(move || {
         match crate::xhttp::accept_core(
             &head,
             Vec::new(),
-            reader,
+            upload,
             writer,
             &settings,
             Some(h2out.clone()),
@@ -3748,6 +3782,60 @@ mod tests {
         );
         drop(client);
         server.join().expect("joins");
+    }
+
+    /// The h2 body is selected by the request's shape, not its method: a hub configured for a PUT uplink still hands a POST stream-up body over as a window instead of chunk-framing it.
+    #[test]
+    fn a_stream_up_post_under_a_put_uplink_method_keeps_its_body() {
+        const BODY: &[u8] = b"put-uplink body";
+        let front = test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let got = Arc::clone(&seen);
+        let server = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let read = stream.try_clone().expect("clone");
+            let mut settings = test_settings("stream-up");
+            settings.uplink_method = "PUT".to_owned();
+            let service = XhttpSessionService::new(
+                settings,
+                Arc::new(move |mut reader, mut writer, _decryption| {
+                    let mut body = Vec::new();
+                    let mut chunk = [0u8; 32];
+                    while body.len() < BODY.len() {
+                        match reader.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => body.extend_from_slice(&chunk[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) if crate::proxy::is_timeout(&e) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    *got.lock().expect("seen") = body.clone();
+                    let _ = writer.write_all(&body);
+                    writer.finish();
+                }),
+            );
+            serve_h2_service(read, stream, &service, None);
+        });
+        let mut client = H2Client::connect(addr);
+        let pad = padding();
+        let down = client.headers("GET", "/up/put-uplink", &[("referer", pad.as_str())], true);
+        assert_eq!(client.response_head(down), 200);
+        let up = client.headers(
+            "POST",
+            "/up/put-uplink",
+            &[
+                ("referer", pad.as_str()),
+                ("content-type", "application/grpc"),
+            ],
+            false,
+        );
+        client.data(up, BODY, true);
+        assert_eq!(client.response_head(up), 200);
+        drop(client);
+        server.join().expect("joins");
+        assert_eq!(seen.lock().expect("seen").as_slice(), BODY);
     }
 
     /// A padded DATA frame is queued as exactly its payload: the pad-length byte and the pad tail are gone before the chunk reaches the session, so an echo over the padded uplink round-trips the payload untouched.
@@ -5854,6 +5942,39 @@ mod tests {
         };
         crate::budgets::clear();
         assert!(!crate::proxy::is_timeout(&error), "{error:?}");
+    }
+
+    /// A body read outside a lane waits only until its arrival deadline, not the whole relay stall.
+    #[test]
+    fn a_read_outside_a_lane_ends_at_the_body_deadline() {
+        let (conn, _written, _slices) = streaming_conn(0);
+        let stream = conn
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&1)
+            .cloned()
+            .expect("the stream");
+        let mut reader = H2StreamReader {
+            conn,
+            stream,
+            id: 1,
+            at: 0,
+            cur: Vec::new(),
+            idle_since: None,
+        };
+        let mut buf = [0u8; 8];
+        crate::proxy::set_body_deadline(Some(
+            std::time::Instant::now() + Duration::from_millis(20),
+        ));
+        let started = std::time::Instant::now();
+        let error = reader.read(&mut buf).expect_err("no body arrived");
+        crate::proxy::set_body_deadline(None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the read ends at the body deadline, not the stall"
+        );
+        assert!(crate::proxy::is_timeout(&error), "{error:?}");
     }
 
     /// A sender the peer never credits gives up at the relay stall, so a downlink cannot park its thread on a window that never arrives.

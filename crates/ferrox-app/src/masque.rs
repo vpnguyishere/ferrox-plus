@@ -27,10 +27,11 @@ use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpRoutes};
 use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
+/// A held datagram retries inside one poll grain, so a full queue never waits out a tick.
+const RETRY: Duration = Duration::from_millis(1);
 /// The reference's quiet-period keepalive when `xmux.hKeepAlivePeriod` is absent.
 const H3_KEEPALIVE: Duration = Duration::from_secs(10);
 const H2_KEEPALIVE: Duration = Duration::from_secs(45);
-const RETRY: Duration = Duration::from_millis(1);
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
@@ -2369,10 +2370,11 @@ fn worker(
         if conn.is_closed() {
             return;
         }
+        let wait = conn.timeout().unwrap_or(TICK).min(TICK);
         let wait = if tunnel.unsent.is_some() {
-            RETRY
+            wait.min(RETRY)
         } else {
-            conn.timeout().unwrap_or(TICK).min(TICK)
+            wait
         };
         match rx.recv_timeout(wait) {
             Ok(Arrival::Datagram(mut bytes, from)) => {
@@ -2394,7 +2396,7 @@ fn worker(
             }
             service(&mut conn, &shared, &spec, &mut tunnel);
         }
-        while let Some(packet) = tunnel
+        'packets: while let Some(packet) = tunnel
             .unsent
             .take()
             .or_else(|| tunnel.outgoing.try_recv().ok())
@@ -2402,18 +2404,26 @@ fn worker(
             let Some(stream) = tunnel.stream else {
                 continue;
             };
-            match send_datagram(&mut conn, stream, &packet) {
-                Emission::Queued => {}
-                Emission::Full => {
-                    tunnel.unsent = Some(packet);
-                    break;
-                }
-                Emission::TooLarge(icmp) => {
-                    let _ = shared.packets.send(Packet {
-                        peer: [0u8; 32],
-                        bytes: icmp,
-                        at: 0,
-                    });
+            let mut flushed = false;
+            loop {
+                match send_datagram(&mut conn, stream, &packet) {
+                    Emission::Queued => break,
+                    Emission::TooLarge(icmp) => {
+                        let _ = shared.packets.send(Packet {
+                            peer: [0u8; 32],
+                            bytes: icmp,
+                            at: 0,
+                        });
+                        break;
+                    }
+                    Emission::Full if !flushed => {
+                        quic::flush_egress(&mut conn, &sock);
+                        flushed = true;
+                    }
+                    Emission::Full => {
+                        tunnel.unsent = Some(packet);
+                        break 'packets;
+                    }
                 }
             }
         }
@@ -3435,6 +3445,13 @@ mod tests {
         .expect("a masque outbound")
     }
 
+    fn outbound_large(port: u16) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"settings":{{"address":"127.0.0.1","port":{port},"largeSegments":true}},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true}},"masqueSettings":{{"headers":{{"Authorization":"Basic dUBleGFtcGxlLmNvbTpw"}}}}}}}}"#
+        ))
+        .expect("a masque outbound")
+    }
+
     fn outbound_h2(port: u16) -> Json {
         crate::json::parse(&format!(
             r#"{{"settings":{{"address":"127.0.0.1","port":{port}}},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true,"alpn":["h2"]}},"masqueSettings":{{"headers":{{"Authorization":"Basic dUBleGFtcGxlLmNvbTpw"}}}}}}}}"#
@@ -3661,6 +3678,15 @@ mod tests {
     }
 
     fn tcp_flow(serve: fn(&str) -> (Json, u16), outbound: fn(u16) -> Json) {
+        echo_flow(serve, outbound, 5, 1);
+    }
+
+    fn echo_flow(
+        serve: fn(&str) -> (Json, u16),
+        outbound: fn(u16) -> Json,
+        chunk: usize,
+        rounds: usize,
+    ) {
         use std::io::{Read as _, Write as _};
         let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("echo");
         let echo_address = echo.local_addr().expect("address");
@@ -3692,10 +3718,73 @@ mod tests {
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
         masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
-        app.write_all(b"hello").expect("write");
-        let mut answer = [0u8; 5];
-        app.read_exact(&mut answer).expect("read");
-        assert_eq!(&answer, b"hello");
+        let pattern: Vec<u8> = (0..chunk).map(|byte| (byte % 251) as u8).collect();
+        let mut answer = vec![0u8; chunk];
+        for _ in 0..rounds {
+            app.write_all(&pattern).expect("write");
+            app.read_exact(&mut answer).expect("read");
+            assert_eq!(answer, pattern);
+        }
+    }
+
+    #[test]
+    fn a_tcp_flow_crosses_the_tunnel_with_large_segments() {
+        tcp_flow(serve, outbound_large);
+    }
+
+    #[test]
+    fn a_large_upload_crosses_the_tunnel_with_large_segments() {
+        echo_flow(serve, outbound_large, 64 * 1024, 16);
+    }
+
+    #[test]
+    fn a_large_download_crosses_the_tunnel_with_large_segments() {
+        download_flow(1024 * 1024, outbound_large);
+    }
+
+    #[test]
+    fn a_large_download_crosses_the_tunnel_with_the_default_mss() {
+        download_flow(1024 * 1024, outbound);
+    }
+
+    fn download_flow(size: usize, client_outbound: fn(u16) -> Json) {
+        use std::io::{Read as _, Write as _};
+        let payload = vec![0xab; size];
+        let sink = std::net::TcpListener::bind("127.0.0.1:0").expect("sink");
+        let sink_address = sink.local_addr().expect("address");
+        let target: SocketAddr = format!("192.0.2.1:{}", sink_address.port())
+            .parse()
+            .expect("a target");
+        let served = payload.clone();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = sink.accept() else {
+                return;
+            };
+            let _ = stream.write_all(&served);
+        });
+        let (_inbound, port) = serve(&sink_address.to_string());
+        let masque = MasqueOut::new(&client_outbound(port)).expect("outbound");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pair");
+        let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
+            .expect("connect");
+        let (mut app, _) = listener.accept().expect("accept");
+        app.set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        let mut answer = vec![0u8; payload.len()];
+        let mut got = 0;
+        while got < answer.len() {
+            match app.read(&mut answer[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(error) => panic!(
+                    "download stalled after {got} of {} bytes: {error}",
+                    answer.len()
+                ),
+            }
+        }
+        assert_eq!(got, payload.len(), "the download ended early");
+        assert_eq!(answer, payload);
     }
 
     #[test]

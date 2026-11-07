@@ -54,6 +54,7 @@ The connection's own demux resumes the same way. `xhttp_h2::Frames` keeps the pr
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | 73251 | scripts/count-ops.sh |
+| varint-write-probe-ops | 102414 | scripts/count-ops.sh |
 | hunk-payload-bytes | 16375 | ferrox-app-grpc::tests::a_hunk_fits_the_frame_that_carries_it |
 | user-space-copies-per-byte-written | 0 | ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer |
 | writes-per-relay-read | 1 | ferrox-app-grpc::tests::a_relay_read_gathers_its_frames_into_one_write |
@@ -103,6 +104,14 @@ The connection's own demux resumes the same way. `xhttp_h2::Frames` keeps the pr
 ```
 
 `73251`, measured by the `ops.yml` run on the same base that read `86563` before this change. The two per-message math steps — a gRPC envelope assembled and a `Hunk` parsed — now take a straight path for the common one-byte varint and sub-128 envelope length instead of the loop, and the same row reads `13312` (`15.4%`) fewer instructions. The row is a probe, not a fixture test: it runs over buffers the compiler cannot fold, so the frame is the loops and the methods and the number is read as the difference between two runs of the same row, never as the cost of a method alone. The two-byte envelope path the `16375`-byte payload uses is the same straight form, but this probe's messages do not walk it.
+
+```bash
+./scripts/count-ops.sh report \
+  grpc::tests::the_direct_write_costs_the_second_byte_and_nothing_else \
+  grpc::tests::direct_write_probe
+```
+
+`102414` for the direct write against `118798` for the byte loop on the same run: `4096` two-byte `Hunk` lengths of `16375`, `16384` (`13.8%`) fewer instructions. The read keeps its loop: a direct two/three-byte read moved the one-byte row above to `84003`, so that rewrite did not land; the write path does not touch that row.
 
 ## Time
 

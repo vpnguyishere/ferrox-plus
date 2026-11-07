@@ -111,8 +111,12 @@ const MSG_CHANNEL_FAILURE: u8 = 100;
 /// One transport below SSH: a TCP socket or an in-proxy WebRTC data channel.
 pub(crate) enum Stream {
     Tcp(TcpStream),
+    Fragment(crate::psiphon_fragment::FragmentStream),
     Quic(crate::psiphon_quic::QuicStream),
     Shadowsocks(crate::psiphon_shadowsocks::Stream<TcpStream>),
+    ShadowsocksFragment(
+        crate::psiphon_shadowsocks::Stream<crate::psiphon_fragment::FragmentStream>,
+    ),
     WebRtcShadowsocks(crate::psiphon_shadowsocks::Stream<WebRtcStream>),
     WebRtc(WebRtcStream),
 }
@@ -129,8 +133,10 @@ impl Stream {
     fn try_clone(&self) -> io::Result<Self> {
         match self {
             Self::Tcp(socket) => socket.try_clone().map(Self::Tcp),
+            Self::Fragment(stream) => stream.try_clone().map(Self::Fragment),
             Self::Quic(stream) => Ok(Self::Quic(stream.clone())),
             Self::Shadowsocks(stream) => stream.try_clone().map(Self::Shadowsocks),
+            Self::ShadowsocksFragment(stream) => stream.try_clone().map(Self::ShadowsocksFragment),
             Self::WebRtcShadowsocks(stream) => Ok(Self::WebRtcShadowsocks(stream.try_clone())),
             Self::WebRtc(stream) => Ok(Self::WebRtc(stream.clone())),
         }
@@ -141,11 +147,15 @@ impl Stream {
             Self::Tcp(socket) => socket
                 .set_read_timeout(timeout)
                 .and_then(|()| socket.set_write_timeout(timeout)),
+            Self::Fragment(stream) => stream
+                .set_read_timeout(timeout)
+                .and_then(|()| stream.set_write_timeout(timeout)),
             Self::Quic(stream) => {
                 stream.set_timeout(timeout);
                 Ok(())
             }
             Self::Shadowsocks(stream) => stream.set_timeout(timeout),
+            Self::ShadowsocksFragment(stream) => stream.set_timeout(timeout),
             Self::WebRtcShadowsocks(stream) => {
                 stream.set_timeout(timeout);
                 Ok(())
@@ -161,11 +171,13 @@ impl Stream {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         match self {
             Self::Tcp(socket) => socket.set_read_timeout(timeout),
+            Self::Fragment(stream) => stream.set_read_timeout(timeout),
             Self::Quic(stream) => {
                 stream.set_read_timeout(timeout);
                 Ok(())
             }
             Self::Shadowsocks(stream) => stream.set_read_timeout(timeout),
+            Self::ShadowsocksFragment(stream) => stream.set_read_timeout(timeout),
             Self::WebRtcShadowsocks(stream) => {
                 stream.set_read_timeout(timeout);
                 Ok(())
@@ -180,11 +192,13 @@ impl Stream {
     fn shutdown(&self) -> io::Result<()> {
         match self {
             Self::Tcp(socket) => socket.shutdown(Shutdown::Both),
+            Self::Fragment(stream) => stream.shutdown(Shutdown::Both),
             Self::Quic(stream) => {
                 stream.shutdown();
                 Ok(())
             }
             Self::Shadowsocks(stream) => stream.shutdown(),
+            Self::ShadowsocksFragment(stream) => stream.shutdown(),
             Self::WebRtcShadowsocks(stream) => {
                 stream.shutdown();
                 Ok(())
@@ -201,8 +215,10 @@ impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(socket) => socket.read(buf),
+            Self::Fragment(stream) => stream.read(buf),
             Self::Quic(stream) => stream.read(buf),
             Self::Shadowsocks(stream) => stream.read(buf),
+            Self::ShadowsocksFragment(stream) => stream.read(buf),
             Self::WebRtcShadowsocks(stream) => stream.read(buf),
             Self::WebRtc(stream) => stream.read(buf),
         }
@@ -213,8 +229,10 @@ impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(socket) => socket.write(buf),
+            Self::Fragment(stream) => stream.write(buf),
             Self::Quic(stream) => stream.write(buf),
             Self::Shadowsocks(stream) => stream.write(buf),
+            Self::ShadowsocksFragment(stream) => stream.write(buf),
             Self::WebRtcShadowsocks(stream) => stream.write(buf),
             Self::WebRtc(stream) => stream.write(buf),
         }
@@ -223,8 +241,10 @@ impl Write for Stream {
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         match self {
             Self::Tcp(socket) => socket.write_vectored(bufs),
+            Self::Fragment(stream) => stream.write_vectored(bufs),
             Self::Quic(stream) => stream.write_vectored(bufs),
             Self::Shadowsocks(stream) => stream.write_vectored(bufs),
+            Self::ShadowsocksFragment(stream) => stream.write_vectored(bufs),
             Self::WebRtcShadowsocks(stream) => stream.write_vectored(bufs),
             Self::WebRtc(stream) => {
                 let parts: Vec<&[u8]> = bufs.iter().map(|buf| &buf[..]).collect();
@@ -236,8 +256,10 @@ impl Write for Stream {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Tcp(socket) => socket.flush(),
+            Self::Fragment(stream) => stream.flush(),
             Self::Quic(stream) => stream.flush(),
             Self::Shadowsocks(stream) => stream.flush(),
+            Self::ShadowsocksFragment(stream) => stream.flush(),
             Self::WebRtcShadowsocks(stream) => stream.flush(),
             Self::WebRtc(stream) => stream.flush(),
         }
@@ -411,8 +433,24 @@ pub(crate) struct TlsShape {
     pub(crate) ossh_prefix: OsshPrefix,
     pub(crate) obfuscated_min_padding: usize,
     pub(crate) obfuscated_max_padding: usize,
+    pub(crate) fragmentor: crate::psiphon_fragment::Fragmentor,
+    /// The chance a relay names its cookie with a cover word.
+    pub(crate) meek_alternate_cookie_name: f64,
+    /// The chance a relay draws a cover request content type.
+    pub(crate) meek_alternate_content_type: f64,
+    /// The chance a relay applies the request-shaping profile.
+    pub(crate) meek_traffic_shaping: f64,
+    /// The protocols that admit the request-shaping profile; empty admits all.
+    pub(crate) meek_traffic_shaping_protocols: Vec<String>,
+    /// The smallest shaped request cap.
+    pub(crate) meek_min_limit_request: usize,
+    /// The largest shaped request cap.
+    pub(crate) meek_max_limit_request: usize,
+    /// The chance a shaped connection drops after a successful round trip.
+    pub(crate) meek_redial_tls: f64,
 }
 
+/// The reference defaults for one lane's TLS shape.
 impl Default for TlsShape {
     fn default() -> Self {
         Self {
@@ -428,6 +466,14 @@ impl Default for TlsShape {
             ossh_prefix: OsshPrefix::default(),
             obfuscated_min_padding: MIN_PADDING,
             obfuscated_max_padding: MAX_PADDING,
+            fragmentor: crate::psiphon_fragment::Fragmentor::default(),
+            meek_alternate_cookie_name: 0.5,
+            meek_alternate_content_type: 0.5,
+            meek_traffic_shaping: 1.0,
+            meek_traffic_shaping_protocols: Vec::new(),
+            meek_min_limit_request: crate::psiphon_meek::MAX_REQUEST_PAYLOAD,
+            meek_max_limit_request: crate::psiphon_meek::MAX_REQUEST_PAYLOAD,
+            meek_redial_tls: 0.0,
         }
     }
 }
@@ -457,6 +503,15 @@ impl TlsShape {
     /// The generated OSSH prefix for one dial, or `None` to write the bare seed message.
     pub(crate) fn ossh_prefix(&self, port: &str, keyword: &str) -> Option<OsshPrefixBytes> {
         self.ossh_prefix.generate(port, keyword)
+    }
+
+    /// Whether this dial may fragment. An OSSH or Shadowsocks prefix suppresses the
+    /// fragmentor unless `OSSHPrefixEnableFragmentor` turns it back on.
+    pub(crate) fn may_fragment(&self, protocol: &str) -> bool {
+        self.fragmentor.may_fragment(
+            protocol,
+            self.shadowsocks_prefix.configured() || self.ossh_prefix.configured(),
+        )
     }
 
     /// The OSSH preamble padding for one dial: the reference's configurable window, with
@@ -511,6 +566,11 @@ impl TlsShape {
 }
 
 impl ShadowsocksPrefix {
+    /// Whether the prefix is applied at all, by probability and by a configured probe.
+    fn configured(&self) -> bool {
+        self.probability > 0.0 && !self.specs.is_empty()
+    }
+
     fn generate(&self, port: &str) -> Option<Vec<u8>> {
         if self.probability <= 0.0 || self.specs.is_empty() {
             return None;
@@ -535,6 +595,11 @@ impl ShadowsocksPrefix {
 }
 
 impl OsshPrefix {
+    /// Whether the OSSH prefix is applied at all, by probability and by a configured probe.
+    fn configured(&self) -> bool {
+        self.probability > 0.0 && !self.specs.is_empty()
+    }
+
     fn generate(&self, port: &str, keyword: &str) -> Option<OsshPrefixBytes> {
         if self.probability <= 0.0 || self.specs.is_empty() {
             return None;
@@ -887,12 +952,12 @@ pub(crate) struct Proxy {
     port: u16,
     user: String,
     pass: String,
-    dns: Vec<SocketAddr>,
+    dns: crate::psiphon_dns::Config,
 }
 
 impl Proxy {
     /// `http://`, `socks5://` or `socks5h://`, with optional `user:pass@` credentials.
-    pub(crate) fn parse(text: &str, dns: &[SocketAddr]) -> Result<Self, String> {
+    pub(crate) fn parse(text: &str, dns: &crate::psiphon_dns::Config) -> Result<Self, String> {
         let text = text.trim();
         let (http, rest) = text
             .strip_prefix("http://")
@@ -929,7 +994,7 @@ impl Proxy {
             port,
             user,
             pass,
-            dns: dns.to_vec(),
+            dns: dns.clone(),
         })
     }
 
@@ -970,7 +1035,7 @@ impl Proxy {
             return Err("psiphon: upstream proxy host name is not valid".to_owned());
         }
         let mut last = String::new();
-        for address in crate::psiphon_dns::resolve(&self.host, self.port, &self.dns)
+        for address in crate::psiphon_dns::resolve_with(&self.dns, &self.host, self.port)
             .map_err(|error| format!("psiphon: upstream proxy resolve {}: {error}", self.host))?
         {
             match TcpStream::connect_timeout(&address, timeout) {
@@ -1224,6 +1289,7 @@ struct Chunk {
 pub(crate) struct Channel {
     session: Arc<Inner>,
     state: Arc<ChannelState>,
+    deadline: Option<Instant>,
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -1249,6 +1315,7 @@ impl std::fmt::Debug for Channel {
 /// The fields the server's auth and handshake read, taken from the lane's settings.
 pub(crate) struct Identity<'a> {
     pub(crate) session_id: &'a str,
+    pub(crate) authorizations: &'a [String],
     pub(crate) sponsor: &'a str,
     pub(crate) propagation: &'a str,
     pub(crate) platform: &'a str,
@@ -1269,6 +1336,7 @@ impl Session {
         identity: &Identity<'_>,
         timeout: Duration,
         proxy: Option<&Proxy>,
+        dns: &crate::psiphon_dns::Config,
         conduit: Option<&Conduit>,
         keepalive: Option<KeepAlive>,
         shape: &TlsShape,
@@ -1340,7 +1408,7 @@ impl Session {
                 (stream, Some(relay), destination.protocol, base)
             } else {
                 let (stream, protocol) =
-                    direct_stream(server, timeout, proxy, shape, limit_meek_buffers)?;
+                    direct_stream(server, timeout, proxy, dns, shape, limit_meek_buffers)?;
                 (stream, None, protocol, protocol)
             };
 
@@ -1445,6 +1513,89 @@ impl Session {
         port: u16,
         channel_type: &[u8],
     ) -> Result<Option<Channel>, String> {
+        let mut extra = Vec::with_capacity(host.len() + 16);
+        put_str(&mut extra, host.as_bytes());
+        put_u32(&mut extra, u32::from(port));
+        put_str(&mut extra, b"127.0.0.1");
+        put_u32(&mut extra, 0);
+        self.open_payload(channel_type, &extra, &format!("{host}:{port}"))
+    }
+
+    /// The reference's liveness test: a random stream the server echoes and discards.
+    pub(crate) fn liveness_test(
+        &self,
+        min_upstream: usize,
+        max_upstream: usize,
+        min_downstream: usize,
+        max_downstream: usize,
+        limit: Duration,
+    ) -> Result<(), String> {
+        let upstream = random_size(min_upstream, max_upstream);
+        let downstream = random_size(min_downstream, max_downstream);
+        let request = format!(r#"{{"u":{upstream},"d":{downstream}}}"#);
+        let mut channel = self
+            .open_payload(b"random@psiphon.ca", request.as_bytes(), "liveness stream")?
+            .ok_or_else(|| "psiphon ssh refused the liveness stream".to_owned())?;
+        channel.deadline = Some(Instant::now() + limit);
+        let mut reader = channel.clone();
+        let writer = std::thread::Builder::new()
+            .name("psiphon-liveness".to_owned())
+            .spawn(move || -> Result<(), String> {
+                let mut writer = channel;
+                let mut buf = [0u8; 4096];
+                let mut left = upstream;
+                while left > 0 {
+                    let take = left.min(buf.len());
+                    getrandom::fill(&mut buf[..take])
+                        .map_err(|error| format!("psiphon liveness entropy: {error}"))?;
+                    writer
+                        .write_all(&buf[..take])
+                        .map_err(|error| format!("psiphon liveness write: {error}"))?;
+                    left -= take;
+                }
+                Ok(())
+            })
+            .map_err(|error| format!("psiphon liveness thread: {error}"))?;
+        let mut buf = [0u8; 4096];
+        let mut left = downstream;
+        let mut failure = None;
+        while left > 0 {
+            let take = left.min(buf.len());
+            match reader.read(&mut buf[..take]) {
+                Ok(0) => {
+                    failure = Some("psiphon liveness read: stream closed early".to_owned());
+                    break;
+                }
+                Ok(read) => left -= read,
+                Err(error) => {
+                    failure = Some(format!("psiphon liveness read: {error}"));
+                    break;
+                }
+            }
+        }
+        if failure.is_some() {
+            self.close();
+        }
+        let joined = writer
+            .join()
+            .map_err(|_| "psiphon liveness writer panicked".to_owned())?;
+        if failure.is_none() {
+            reader.close();
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        joined?;
+        Ok(())
+    }
+
+    /// The payload a probe sends on a freshly opened channel.
+    fn open_payload(
+        &self,
+        channel_type: &[u8],
+        extra: &[u8],
+        target: &str,
+    ) -> Result<Option<Channel>, String> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err("psiphon ssh is closed".to_owned());
         }
@@ -1475,10 +1626,7 @@ impl Session {
         put_u32(&mut payload, local);
         put_u32(&mut payload, self.inner.channel_window);
         put_u32(&mut payload, CHANNEL_PACKET);
-        put_str(&mut payload, host.as_bytes());
-        put_u32(&mut payload, u32::from(port));
-        put_str(&mut payload, b"127.0.0.1");
-        put_u32(&mut payload, 0);
+        payload.extend_from_slice(extra);
         if let Err(why) = self.inner.send(&payload) {
             lock(&self.inner.channels).remove(&local);
             self.inner.close();
@@ -1489,17 +1637,18 @@ impl Session {
             Ok(Ok(OpenResult::Confirmed)) => Ok(Some(Channel {
                 session: Arc::clone(&self.inner),
                 state,
+                deadline: None,
             })),
             Ok(Ok(OpenResult::SplitTunnel)) => Ok(None),
             // A refusal names the target, not the tunnel, so the session stays open for other flows.
             Ok(Err(why)) => Err(why),
             Err(RecvTimeoutError::Timeout) => {
                 self.inner.close();
-                Err(format!("psiphon ssh channel to {host}:{port} timed out"))
+                Err(format!("psiphon ssh channel to {target} timed out"))
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.inner.retire(local, &state);
-                Err(format!("psiphon ssh channel to {host}:{port} closed"))
+                Err(format!("psiphon ssh channel to {target} closed"))
             }
         }
     }
@@ -1982,10 +2131,20 @@ impl Read for Channel {
             if recv.eof || recv.closed || self.session.closed.load(Ordering::Acquire) {
                 return Ok(0);
             }
+            let wait = match self.deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(liveness_timeout());
+                    }
+                    remaining.min(IO_TIMEOUT)
+                }
+                None => IO_TIMEOUT,
+            };
             let (guard, _) = self
                 .state
                 .cond
-                .wait_timeout(recv, IO_TIMEOUT)
+                .wait_timeout(recv, wait)
                 .unwrap_or_else(PoisonError::into_inner);
             recv = guard;
             if recv.chunks.is_empty() && (recv.eof || recv.closed) {
@@ -2020,10 +2179,20 @@ impl Channel {
                 *window -= u64::try_from(take).unwrap_or(0);
                 return Ok(take);
             }
+            let wait = match self.deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(liveness_timeout());
+                    }
+                    remaining.min(IO_TIMEOUT)
+                }
+                None => IO_TIMEOUT,
+            };
             let (guard, _) = self
                 .state
                 .window_cond
-                .wait_timeout(window, IO_TIMEOUT)
+                .wait_timeout(window, wait)
                 .unwrap_or_else(PoisonError::into_inner);
             window = guard;
             if self.state.remote.load(Ordering::Acquire) == NO_CHANNEL
@@ -2064,6 +2233,11 @@ impl Write for Channel {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// The error a liveness probe returns when its deadline passes.
+fn liveness_timeout() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "psiphon liveness deadline")
 }
 
 impl Drop for Channel {
@@ -2120,6 +2294,7 @@ fn direct_stream(
     server: &Server,
     timeout: Duration,
     proxy: Option<&Proxy>,
+    dns: &crate::psiphon_dns::Config,
     shape: &TlsShape,
     limit_meek_buffers: bool,
 ) -> Result<(Stream, &'static str), String> {
@@ -2130,7 +2305,7 @@ fn direct_stream(
     let address = SocketAddr::new(server.address, server.port);
     let tls = server.tls && server.meek.is_none() && !server.ss;
     let socket = match &server.meek {
-        Some(meek) => crate::psiphon_meek::connect(meek, timeout, proxy, limit_meek_buffers)?,
+        Some(meek) => crate::psiphon_meek::connect(meek, timeout, proxy, dns, limit_meek_buffers)?,
         None => direct_socket(address, server, timeout, proxy)?,
     };
     socket
@@ -2162,22 +2337,40 @@ fn direct_stream(
             .filter(|key| !key.is_empty())
             .ok_or_else(|| "psiphon ssh: shadowsocks entry has no key".to_owned())?;
         let prefix = shape.shadowsocks_prefix(&server.port.to_string());
-        Stream::Shadowsocks(crate::psiphon_shadowsocks::Stream::connect(
-            socket,
-            key,
-            prefix.as_deref(),
-        ))
-    } else if tls {
-        tls_tunnel(
-            Stream::Tcp(socket),
-            &server.host,
-            tls_passthrough_key(server),
-            timeout,
-            shape,
-            protocol,
-        )?
+        if shape.may_fragment(protocol) {
+            Stream::ShadowsocksFragment(crate::psiphon_shadowsocks::Stream::connect_fragment(
+                crate::psiphon_fragment::FragmentStream::new(socket, shape.fragmentor.clone()),
+                key,
+                prefix.as_deref(),
+            ))
+        } else {
+            Stream::Shadowsocks(crate::psiphon_shadowsocks::Stream::connect(
+                socket,
+                key,
+                prefix.as_deref(),
+            ))
+        }
     } else {
-        Stream::Tcp(socket)
+        let base = if server.meek.is_none() && shape.may_fragment(protocol) {
+            Stream::Fragment(crate::psiphon_fragment::FragmentStream::new(
+                socket,
+                shape.fragmentor.clone(),
+            ))
+        } else {
+            Stream::Tcp(socket)
+        };
+        if tls {
+            tls_tunnel(
+                base,
+                &server.host,
+                tls_passthrough_key(server),
+                timeout,
+                shape,
+                protocol,
+            )?
+        } else {
+            base
+        }
     };
     Ok((stream, protocol))
 }
@@ -2395,6 +2588,17 @@ pub(crate) fn random<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).expect("psiphon: system entropy");
     bytes
+}
+
+/// A random payload size in the inclusive range.
+fn random_size(min: usize, max: usize) -> usize {
+    if max <= min {
+        return min;
+    }
+    let span = u64::try_from(max - min)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    min + usize::try_from(u64::from_le_bytes(random::<8>()) % span).unwrap_or(0)
 }
 
 pub(crate) fn derive_key(seed: &[u8], keyword: &[u8], iv: &[u8]) -> [u8; KEY_LENGTH] {
@@ -3303,6 +3507,16 @@ fn handshake_body(relay_protocol: &str, identity: &Identity<'_>, relay: Option<&
         }
         body.push(']');
     }
+    if !identity.authorizations.is_empty() {
+        body.push_str(r#","authorizations":["#);
+        for (index, authorization) in identity.authorizations.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            let _ = write!(body, "\"{}\"", json_escape(authorization));
+        }
+        body.push(']');
+    }
     if let Some(relay) = relay {
         let connection_id = ferrox_core::b64::encode(relay.connection_id());
         let packet = ferrox_core::b64::encode(relay.initial());
@@ -3741,6 +3955,7 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
     Channel {
         session: inner,
         state,
+        deadline: None,
     }
 }
 
@@ -4002,6 +4217,7 @@ mod tests {
         let mut channel = Channel {
             session: Arc::clone(&inner),
             state: Arc::clone(&state),
+            deadline: None,
         };
         let mut buffer = vec![0u8; PACKET_CHUNK];
         let pointer = buffer.as_ptr();
@@ -4081,6 +4297,7 @@ mod tests {
         let mut channel = Channel {
             session: Arc::clone(&inner),
             state: Arc::clone(&state),
+            deadline: None,
         };
         let mut buffer = vec![0u8; PACKET_CHUNK];
         let pointer = buffer.as_ptr();
@@ -4184,6 +4401,7 @@ mod tests {
         let mut channel = Channel {
             session: Arc::clone(&inner),
             state,
+            deadline: None,
         };
         let mut out = [0u8; 2];
         channel.read_exact(&mut out).expect("read");
@@ -4268,6 +4486,7 @@ mod tests {
         let mut channel = Channel {
             session: Arc::clone(&inner),
             state,
+            deadline: None,
         };
         let mut out = [0u8; 2];
         channel.read_exact(&mut out).expect("read the queued bytes");
@@ -4363,6 +4582,7 @@ mod tests {
         let mut channel = Channel {
             session: Arc::clone(&inner),
             state,
+            deadline: None,
         };
         channel.close();
         let mut head = [0u8; 4];
@@ -4411,6 +4631,7 @@ mod tests {
         let features = vec!["coarse-location".to_owned(), "unsafe\"feature".to_owned()];
         let identity = Identity {
             session_id: "session",
+            authorizations: &[],
             sponsor: "sponsor",
             propagation: "propagation",
             platform: "Android",
@@ -4432,6 +4653,7 @@ mod tests {
     fn the_handshake_omits_absent_device_identity() {
         let identity = Identity {
             session_id: "session",
+            authorizations: &[],
             sponsor: "sponsor",
             propagation: "propagation",
             platform: "Android",
@@ -4478,13 +4700,21 @@ mod tests {
 
     #[test]
     fn an_upstream_proxy_url_names_its_scheme_and_credentials() {
-        let proxy = Proxy::parse("http://user:p%40ss@127.0.0.1:8080", &[]).expect("proxy");
+        let proxy = Proxy::parse(
+            "http://user:p%40ss@127.0.0.1:8080",
+            &crate::psiphon_dns::Config::from_servers(&[]),
+        )
+        .expect("proxy");
         assert!(proxy.http);
         assert_eq!(proxy.host, "127.0.0.1");
         assert_eq!(proxy.port, 8080);
         assert_eq!(proxy.user, "user");
         assert_eq!(proxy.pass, "p@ss");
-        assert!(Proxy::parse("socks4://127.0.0.1:1", &[]).is_err());
+        assert!(Proxy::parse(
+            "socks4://127.0.0.1:1",
+            &crate::psiphon_dns::Config::from_servers(&[])
+        )
+        .is_err());
     }
 
     #[test]

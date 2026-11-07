@@ -54,7 +54,7 @@ A claim is either checked by something that runs or it is not made — name its 
 
 Before landing a rewrite, ask what the worst input does: the length that is not a multiple of the vector width, the window already full, the cursor this change moves. The arithmetic finds the regression a green suite hides.
 
-Local before every push: `./scripts/check.sh` runs fmt, clippy, doc, the policy checks, exact operation counts, and the workspace tests. Never local: anything connection-dependent — benchmarks, parity, upstream suites, Miri — because every contributor sits behind a VPN and a proxy, so a local dial measures a tunnel, not the reference. On a platform without valgrind the count gate is CI-only there; name that rather than skipping it silently.
+Local before every push: `./scripts/check.sh` runs fmt, clippy, doc, the policy checks, exact operation counts, and the workspace tests. Never local: anything connection-dependent — benchmarks, parity, upstream suites, Miri — because every contributor sits behind a VPN and a proxy, so a local dial measures a tunnel, not the reference. Where the counting userspace cannot be provisioned the count stays `UNBLESSED`, never a silently skipped gate, and no slice waits on `ops.yml` for it.
 
 Simpler with less code wins every tie at equal performance: no abstraction with one implementor, no second way of doing something, no debt left for a later slice. Unsafe only for a measured win; if the safe form ties, the safe form ships.
 
@@ -93,7 +93,7 @@ Implement {method} — matrix row {index} of table {section}, currently "{state}
 **Leverage:** 5
 **Effort:** medium
 **Targets:** implemented
-**Gates:** `./scripts/check.sh`; CI: `bench.yml`; CI: `ops.yml`; CI: `compare.yml`
+**Gates:** `./scripts/check.sh`; CI: `bench.yml`; CI: §ops.yml; CI: `compare.yml`
 **Random weight:** 9
 
 ```text
@@ -112,7 +112,7 @@ Move {method} — matrix row {index} of table {section}, state "{state}" — tow
 **Leverage:** 4
 **Effort:** medium
 **Targets:** implemented
-**Gates:** `./scripts/check.sh`; CI: `bench.yml`; CI: `ops.yml`
+**Gates:** `./scripts/check.sh`; CI: `bench.yml`; CI: §ops.yml
 **Random weight:** 6
 
 ```text
@@ -196,7 +196,7 @@ Give matrix row {index} of table {section} — the implemented method {method} �
 **Leverage:** 4
 **Effort:** medium
 **Targets:** implemented
-**Gates:** `./scripts/check.sh`; CI: `bench.yml`; CI: `ops.yml`
+**Gates:** `./scripts/check.sh`; CI: `bench.yml`; CI: §ops.yml
 **Random weight:** 5
 
 ```text
@@ -228,11 +228,11 @@ For {method} — matrix row {index} of table {section} — confirm each width ba
 **Leverage:** 3
 **Effort:** medium
 **Targets:** implemented
-**Gates:** CI: `ops.yml`; CI: `bench.yml`; `./scripts/check.sh`
+**Gates:** CI: §ops.yml; CI: `bench.yml`; `./scripts/check.sh`
 **Random weight:** 3
 
 ```text
-For {method} — matrix row {index} of table {section} — measure the operation count of its hot symbol with `scripts/count-ops.sh` across every length and boundary the method reaches; read `scripts/method-ops.txt` for the CI number before deciding anything. A connection-dependent count belongs to `ops.yml`, not to a laptop run.
+For {method} — matrix row {index} of table {section} — measure the operation count of its hot symbol with `scripts/count-ops.sh` across every length and boundary the method reaches; read `scripts/method-ops.txt` for the CI number before deciding anything. A connection-dependent count belongs to `ops.yml`, not to a laptop run. If the runner cannot provision the counting userspace the count stays `UNBLESSED`: never quote a figure, never wait on `ops.yml` for it.
 ```
 
 ## P11 · Make a test that loses to the runner fail on a defect
@@ -326,7 +326,7 @@ Take one engine-adjacent surface {references} carry that this tree names but can
 **Leverage:** 5
 **Effort:** large
 **Targets:** implemented
-**Gates:** `./scripts/check.sh`; CI: `bench.yml`; CI: `ops.yml`; CI: `compare.yml`; CI: `parity.yml`
+**Gates:** `./scripts/check.sh`; CI: `bench.yml`; CI: §ops.yml; CI: `compare.yml`; CI: `parity.yml`
 **Random weight:** 9
 
 ```text
@@ -334,7 +334,7 @@ Make {method} — matrix row {index} of table {section} — faster, leaner and m
 
 Think like a math paper, not a patch: change the basis or the order, factor, recast the computation, and prove the new form equivalent before shipping it. Mine every lens — algebraic structure and hot inner loops; bit tricks and SIMD across every width the ladder runs; microarchitecture (cache locality, branch prediction, IPC); I/O (batching, zero-copy, vectored and kernel offloads, ring buffers, lock-free handoffs, segment offloads); outright elimination of ops, copies, allocations, syscalls, locks, atomics, branches, zeroing, checks and dead code nothing reads; and the method-specific tricks — codec tables and DFA walks, one's-complement folding where the modulus allows, varint and padding shapes, multiplexing, and the crypto primitives' hardware paths.
 
-Prove the win or discard it: the exact count from `scripts/count-ops.sh` and the benchmark gate in CI. Re-measure the byte-differential before and after — bit-identical means the block, byte, counter and panic-threshold counts are unchanged, not only the output. Where the wire shape is fixed, say so.
+Prove the win or discard it: the exact count from `scripts/count-ops.sh` where the runner can provision it (`UNBLESSED` otherwise), and the benchmark gate in CI. Re-measure the byte-differential before and after — bit-identical means the block, byte, counter and panic-threshold counts are unchanged, not only the output. Where the wire shape is fixed, say so.
 ```
 
 **Add-on — novel-idea:** An idea none of the lenses above names is welcome; it is proved the same way or discarded.
@@ -397,7 +397,7 @@ Prove the decision, not the intent: a test that drives each failure kind and ass
 **Leverage:** 5
 **Effort:** medium
 **Targets:** implemented
-**Gates:** `./scripts/check.sh`; `cargo test --workspace --all-features`; CI: `safety.yml`; CI: `ops.yml`
+**Gates:** `./scripts/check.sh`; `cargo test --workspace --all-features`; CI: `safety.yml`; CI: §ops.yml
 **Random weight:** 7
 
 ```text
@@ -439,7 +439,7 @@ Prove the surface, not the struct: a config-named test per knob that asserts the
 **Leverage:** 5
 **Effort:** medium
 **Targets:** none
-**Gates:** `./scripts/check.sh`; `cargo test --workspace --all-features`; CI: `conformance.yml`; CI: `bench.yml`
+**Gates:** `./scripts/check.sh`; `cargo test --workspace --all-features`; CI: `conformance.yml`; CI: `bench.yml`; CI: §ops.yml
 **Random weight:** 0
 
 ```text
@@ -447,7 +447,7 @@ Phase 1 — Fix and land issue #{issue}, a {priority=P0 or P1} regression. Read 
 
 Phase 2 — Study upstream. Read the relevant pinned implementations in {references} and find how each handles this path. Name which one is best, and why, with the evidence that decides it.
 
-Phase 3 — Performance passes. First, the focused pass: move the thing the issue touched towards the best upstream form without changing a wire byte: fewer retired instructions, copies, branches, locks and allocations. Re-measure the exact count with `scripts/count-ops.sh`; land only the changes that count proves, and write down the arithmetic for any regression you revert. Then the open-ended pass: make it faster, leaner and more capable than every reference in {references} together. Carry each winner as far as it goes rather than stopping after one; change the basis or the order, factor, recast and prove equivalence. Mine hot loops and algebraic structure, every SIMD width the ladder runs, cache locality and branch prediction, batched or vectored I/O and lock-free handoffs, and remove ops, copies, allocations, syscalls, atomics, zeroing and checks nothing reads. Sweep the bytes both ways after the change: the block, byte, counter and panic-threshold totals must stay put, not merely agree at one length. Where the wire shape is fixed, say so.
+Phase 3 — Performance passes. First, the focused pass: move the thing the issue touched towards the best upstream form without changing a wire byte: fewer retired instructions, copies, branches, locks and allocations. Re-measure the exact count with `scripts/count-ops.sh` where the runner can provision it; land only the changes that count proves (`UNBLESSED` otherwise), and write down the arithmetic for any regression you revert. Then the open-ended pass: make it faster, leaner and more capable than every reference in {references} together. Carry each winner as far as it goes rather than stopping after one; change the basis or the order, factor, recast and prove equivalence. Mine hot loops and algebraic structure, every SIMD width the ladder runs, cache locality and branch prediction, batched or vectored I/O and lock-free handoffs, and remove ops, copies, allocations, syscalls, atomics, zeroing and checks nothing reads. Sweep the bytes both ways after the change: the block, byte, counter and panic-threshold totals must stay put, not merely agree at one length. Where the wire shape is fixed, say so.
 
 Phase 4 — Before every push, run the shared local gate. Nothing connection-dependent is local evidence; the CI jobs are where a dial, a benchmark and Miri count.
 ```

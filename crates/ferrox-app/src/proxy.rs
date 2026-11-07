@@ -8194,9 +8194,9 @@ fn serve_vless_xhttp(
         return;
     };
     if !h2 {
+        chained.arm_relay_poll();
         // An H1 stream-up GET waits for its POST, the POST for the session's end: neither keeps a setup lane.
         if settings.mode == crate::xhttp::XhttpMode::StreamUp {
-            chained.arm_relay_poll();
             let settings = settings.clone();
             let users = shared.cloned().unwrap_or_else(|| Arc::from(users));
             spawn_carried(move || {
@@ -9381,10 +9381,10 @@ fn relay_vless_reply<S>(
         ReverseAsk::Refused => return,
         ReverseAsk::NotReverse => {}
     }
-    if !vless_flow_ok(user, header.1, header.2, vision) {
+    if !vless_reply_ok(user, header.1, header.2, vision) {
         return;
     }
-    if header.2 == 3 {
+    if header.2 == 2 {
         if !freedom {
             return;
         }
@@ -9415,6 +9415,46 @@ fn relay_vless_reply<S>(
                         Box::new(SharedRead(Arc::clone(&shared))),
                         Box::new(SharedWrite(shared)),
                     )
+                }
+            };
+        serve_udp_stream(reader, writer, &header.3, carried, &close);
+        return;
+    }
+    if header.2 == 3 {
+        if !freedom {
+            return;
+        }
+        if session.write_all(&[0, 0]).is_err() {
+            return;
+        }
+        let close = raw
+            .as_ref()
+            .map_or_else(|| Arc::new(|| {}), connection_closer);
+        let (reader, writer): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+            if header.1 == Flow::Vision {
+                vision_stream(session, raw, &header.0)
+            } else {
+                match driven_halves(session, RELAY_POLL) {
+                    Ok(Half::Split { read, write }) => (
+                        Box::new(
+                            read.into_inner()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        ),
+                        Box::new(
+                            write
+                                .into_inner()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        ),
+                    ),
+                    Ok(_) => return,
+                    Err(session) => {
+                        let shared: Arc<Mutex<Box<dyn ReadWrite + Send>>> =
+                            Arc::new(Mutex::new(Box::new(session)));
+                        (
+                            Box::new(SharedRead(Arc::clone(&shared))),
+                            Box::new(SharedWrite(shared)),
+                        )
+                    }
                 }
             };
         spawn_carried(move || {
@@ -10025,7 +10065,10 @@ pub(crate) fn read_into_tail(
 }
 
 pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::Interrupted || ferrox_core::tls::TlsError::is_timeout(error)
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+    ) || ferrox_core::tls::TlsError::is_timeout(error)
 }
 
 /// A UDP socket reports a peer's ICMP as a reset on Windows; that is one lost datagram, not the lane's end.
@@ -10066,6 +10109,21 @@ thread_local! {
 
 pub(crate) fn relay_step_owns_poll() -> bool {
     RELAY_STEP.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// The instant a request body must have arrived by: a framed or carrier read that keeps timing out past it ends the body instead of sleeping in an unauthenticated handler.
+    static BODY_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The body arrival deadline this thread is enforcing, if a body read is in progress.
+pub(crate) fn body_deadline() -> Option<std::time::Instant> {
+    BODY_DEADLINE.with(std::cell::Cell::get)
+}
+
+/// Arms or clears the body arrival deadline the reads on this thread honour.
+pub(crate) fn set_body_deadline(until: Option<std::time::Instant>) {
+    BODY_DEADLINE.with(|slot| slot.set(until));
 }
 
 thread_local! {
@@ -11312,6 +11370,23 @@ fn kcp_tls_connect(
     shake_tls(&mut session).then_some(session)
 }
 
+fn kcp_tls_session(
+    carrier: &Carrier,
+    address: &str,
+    port: u16,
+    cfg: &ferrox_core::tls::TlsConfig,
+) -> Option<(
+    Arc<ferrox_core::kcp::Connection>,
+    ferrox_core::tls::ClientSession<KcpIo>,
+)> {
+    let conn = kcp_dial_session(carrier, address, port)?;
+    let Some(session) = kcp_tls_connect(&conn, cfg) else {
+        conn.close();
+        return None;
+    };
+    Some((conn, session))
+}
+
 /// KCP is the transport and the security rides it, as it does upstream: the session carries the header and both relay legs, not the connection.
 fn relay_kcp_under<S>(
     client: &Connection,
@@ -11329,12 +11404,15 @@ fn relay_kcp_under<S>(
         + 'static,
 {
     if session.write_all(header).is_err() || !ready(&mut session) {
+        conn.close();
         return;
     }
     let Ok(downstream) = client.try_clone() else {
+        conn.close();
         return;
     };
     if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        conn.close();
         return;
     }
     let close: Arc<dyn Fn() + Send + Sync> = {
@@ -11348,7 +11426,7 @@ fn relay_kcp_under<S>(
         })
     };
     let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
-    relay_shared(
+    relay_shared_late(
         Half::socket(downstream),
         Half::split(reader, writer),
         &close,
@@ -13733,11 +13811,38 @@ fn dial_udp_uplink(
     let header = vless_header(&vless.id, 2, &Destination::from(*dest));
     let (read, write, close, deferred): (Box<dyn Read + Send>, Box<dyn Write + Send>, _, bool) =
         if let Carrier::Raw(_) = &vless.carrier {
-            if vless.reality.is_some() {
-                return None;
-            }
             let uplink = dial_or_report(&server)?.with_mask(mask);
-            if let Some(encryption) = &vless.encryption {
+            if let Some(reality) = vless.reality.as_deref() {
+                let raw = uplink.try_clone().ok()?;
+                let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+                let limiter = ferrox_core::tls::reality::RecordLimiter::new(uplink);
+                let mut session =
+                    ferrox_core::tls::RealityClientSession::connect(reality, now, limiter).ok()?;
+                session
+                    .get_ref()
+                    .get_ref()
+                    .set_read_timeout(Some(SESSION_POLL))
+                    .ok()?;
+                raw.set_read_timeout(Some(SESSION_POLL)).ok()?;
+                session.write_all(&header).ok()?;
+                let close = connection_closer(&raw);
+                let (read, write): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+                    match driven_halves_answering(session, RELAY_POLL, Arc::new(|| {})) {
+                        Ok(Half::Split { read, write }) => (
+                            Box::new(
+                                read.into_inner()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            ),
+                            Box::new(
+                                write
+                                    .into_inner()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            ),
+                        ),
+                        _ => return None,
+                    };
+                (read, write, close, false)
+            } else if let Some(encryption) = &vless.encryption {
                 let close = connection_closer(&uplink);
                 let mut sealed = match encryption.handshake(uplink) {
                     Ok(sealed) => sealed,
@@ -17433,6 +17538,65 @@ where
     let write = DrivenHalf::new(session, cipher, out);
     let (read, write) = crate::vision::Link::split(read, write, raw_read, raw_write, uuid);
     Ok(Half::split(read, write))
+}
+
+/// The server's Vision link split into a reader and a writer, so the mux decoder's read never holds
+/// its sibling's seal. A session that cannot be driven keeps the shared shape, armed on both handles.
+fn vision_stream<S>(
+    session: S,
+    raw: Option<Connection>,
+    uuid: &[u8; 16],
+) -> (Box<dyn Read + Send>, Box<dyn Write + Send>)
+where
+    S: Read + Write + Send + ferrox_core::tls::RecordAlignment + Drivable + CipherOpen + 'static,
+{
+    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL) {
+        Ok(vision) => split_stream(vision),
+        Err(session) => {
+            let transport = session.transport();
+            split_stream(Half::shared_armed_capped(
+                crate::vision::Link::new(session, raw, uuid),
+                move |link, grain| {
+                    link.arm_read_timeout(grain)?;
+                    match &transport {
+                        Some(transport) => transport.set_read_timeout(Some(grain)),
+                        None => Ok(()),
+                    }
+                },
+                SESSION_POLL,
+            ))
+        }
+    }
+}
+
+fn split_stream<T>(half: Half<T>) -> (Box<dyn Read + Send>, Box<dyn Write + Send>)
+where
+    T: Read + Write + Send + 'static,
+{
+    match half {
+        Half::Split { read, write } => (
+            Box::new(
+                read.into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            Box::new(
+                write
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+        ),
+        Half::Shared { inner, .. } => {
+            let shared: Arc<Mutex<Box<dyn ReadWrite + Send>>> = Arc::new(Mutex::new(Box::new(
+                inner
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )));
+            (
+                Box::new(SharedRead(Arc::clone(&shared))),
+                Box::new(SharedWrite(shared)),
+            )
+        }
+    }
 }
 
 /// One Vision relay for both roles: the read drives the transport, so its wait holds no session
@@ -21421,6 +21585,21 @@ fn dial_socks_tls_client(
     let Some(cfg) = socks.tls.as_ref() else {
         return;
     };
+    if matches!(socks.carrier, Carrier::Kcp(_)) {
+        let Some((conn, session)) =
+            kcp_tls_session(&socks.carrier, &socks.address, socks.port, cfg)
+        else {
+            return;
+        };
+        let Some(tunnel) =
+            crate::socks::connect(session, &socks.credential, destination, socks.version)
+        else {
+            conn.close();
+            return;
+        };
+        relay_kcp_under(client, &conn, tunnel, &[], |_| true);
+        return;
+    }
     if matches!(socks.carrier, Carrier::Raw(_)) {
         let Some(session) = dial_tls_session(server, cfg, socks.carrier.tcp_mask()) else {
             return;
@@ -25752,6 +25931,58 @@ fn dial_http_tls_carried(
     relay_sink(reader, &sink, &downstream, |_| {});
 }
 
+fn http_connect<S, L>(
+    client: &Connection,
+    mut stream: S,
+    http: &HttpOut,
+    target: &Destination,
+    lane: L,
+) -> bool
+where
+    S: std::io::Read + std::io::Write + Send + 'static,
+    L: FnOnce(S, Connection, std::sync::Arc<dyn Fn() + Send + Sync>) + Send + 'static,
+{
+    use std::io::Write;
+    let mut req = Vec::new();
+    http_connect_request(target, http, &mut req);
+    if stream.write_all(&req).is_err() {
+        return false;
+    }
+    // Whole reads, not octets: a byte reader over TLS decrypts one record per byte.
+    let Some((head, at)) = read_exact_head(&mut stream, HTTP_HEAD_LIMIT, budgets::head_arrival())
+    else {
+        return false;
+    };
+    let code = head[..at]
+        .split(|b| *b == b'\n')
+        .next()
+        .and_then(|line| line.split(|b| *b == b' ').nth(1))
+        .and_then(|code| std::str::from_utf8(code).ok())
+        .and_then(|code| code.trim().parse::<u16>().ok())
+        .unwrap_or(0);
+    if code != 200 {
+        return false;
+    }
+    let Ok(mut downstream) = client.try_clone() else {
+        return false;
+    };
+    // A read with no bound never notices that its sibling ended, so this leg is armed before it is relayed.
+    if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return false;
+    }
+    if at < head.len() && downstream.write_all(&head[at..]).is_err() {
+        return false;
+    }
+    let close_downstream = downstream.try_clone().ok();
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        if let Some(d) = close_downstream.as_ref() {
+            let _ = d.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    lane(stream, downstream, close);
+    true
+}
+
 fn dial_http_outbound(
     client: &Connection,
     server: &SocketAddr,
@@ -25760,58 +25991,28 @@ fn dial_http_outbound(
     _ladder: &Ladder,
 ) {
     use ferrox_core::vless_encryption::SplitIo as _;
-    fn do_connect<S, L>(
-        client: &Connection,
-        mut stream: S,
-        http: &HttpOut,
-        target: &Destination,
-        lane: L,
-    ) where
-        S: std::io::Read + std::io::Write + Send + 'static,
-        L: FnOnce(S, Connection, std::sync::Arc<dyn Fn() + Send + Sync>) + Send + 'static,
-    {
-        use std::io::Write;
-        let mut req = Vec::new();
-        http_connect_request(target, http, &mut req);
-        if stream.write_all(&req).is_err() {
-            return;
-        }
-        // Whole reads, not octets: a byte reader over TLS decrypts one record per byte.
-        let Some((head, at)) =
-            read_exact_head(&mut stream, HTTP_HEAD_LIMIT, budgets::head_arrival())
-        else {
-            return;
-        };
-        let code = head[..at]
-            .split(|b| *b == b'\n')
-            .next()
-            .and_then(|line| line.split(|b| *b == b' ').nth(1))
-            .and_then(|code| std::str::from_utf8(code).ok())
-            .and_then(|code| code.trim().parse::<u16>().ok())
-            .unwrap_or(0);
-        if code != 200 {
-            return;
-        }
-        let Ok(mut downstream) = client.try_clone() else {
-            return;
-        };
-        // A read with no bound never notices that its sibling ended, so this leg is armed before it is relayed.
-        if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
-            return;
-        }
-        if at < head.len() && downstream.write_all(&head[at..]).is_err() {
-            return;
-        }
-        let close_downstream = downstream.try_clone().ok();
-        let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-            if let Some(d) = close_downstream.as_ref() {
-                let _ = d.shutdown(std::net::Shutdown::Both);
-            }
-        });
-        lane(stream, downstream, close);
-    }
-
     if let Some(cfg) = http.tls.as_deref() {
+        if matches!(http.carrier, Carrier::Kcp(_)) {
+            let Some((conn, session)) =
+                kcp_tls_session(&http.carrier, &http.address, http.port, cfg)
+            else {
+                return;
+            };
+            let relay_conn = Arc::clone(&conn);
+            let relayed = http_connect(
+                client,
+                session,
+                http,
+                target,
+                move |stream, downstream, _| {
+                    relay_kcp_under(&downstream, &relay_conn, stream, &[], |_| true);
+                },
+            );
+            if !relayed {
+                conn.close();
+            }
+            return;
+        }
         if matches!(http.carrier, Carrier::Raw(_)) {
             let Some(session) = dial_tls_session(server, cfg, http.carrier.tcp_mask()) else {
                 return;
@@ -25819,7 +26020,7 @@ fn dial_http_outbound(
             let Some((reader, writer, _)) = session.into_halves() else {
                 return;
             };
-            do_connect(
+            let _ = http_connect(
                 client,
                 CarrierStream { reader, writer },
                 http,
@@ -25843,7 +26044,7 @@ fn dial_http_outbound(
     if s.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
-    do_connect(client, s, http, target, |stream, downstream, close| {
+    let _ = http_connect(client, s, http, target, |stream, downstream, close| {
         relay_shared(Half::socket(stream), Half::socket(downstream), &close);
     });
 }
@@ -32292,6 +32493,12 @@ fn vless_flow_ok(user: &VlessUser, wire: Flow, cmd: u8, vision: bool) -> bool {
     }
 }
 
+/// The reality/tls front also serves xray's XUDP shape: a Vision UDP association rides a mux request.
+fn vless_reply_ok(user: &VlessUser, wire: Flow, cmd: u8, vision: bool) -> bool {
+    vless_flow_ok(user, wire, cmd, vision)
+        || (vision && wire == Flow::Vision && cmd == 3 && user.flow == Flow::Vision)
+}
+
 /// A front that does not frame Vision still speaks the account's flow: the id must be served and the wire flow the account's own.
 fn vless_user_allows(
     users: &[VlessUser],
@@ -34562,7 +34769,7 @@ fn find_socks_outbound(root: &Json) -> Option<SocksOut> {
             })
             .unwrap_or_default();
         let (carrier, host, tls) = if stream_security(outbound) == "tls" {
-            let Some((c, h, t)) = tls_parts(outbound, &address) else {
+            let Some((c, h, t)) = tls_carried_parts(outbound, &address) else {
                 continue;
             };
             (c, h, Some(t))
@@ -35056,7 +35263,7 @@ fn find_http_outbound(root: &Json) -> Option<HttpOut> {
             let port = server.get("port").and_then(Json::as_port)?;
             let security = stream_security(outbound);
             let (carrier, host, tls) = if security == "tls" {
-                let Some((c, h, t)) = tls_parts(outbound, &address) else {
+                let Some((c, h, t)) = tls_carried_parts(outbound, &address) else {
                     continue;
                 };
                 (c, h, Some(t))
@@ -39209,9 +39416,7 @@ mod tests {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
                 self.reads += 1;
                 if self.reads < 4 {
-                    if self.reads == 2 {
-                        self.progress.fetch_add(1, Ordering::Relaxed);
-                    }
+                    self.progress.fetch_add(1, Ordering::Relaxed);
                     thread::sleep(Duration::from_millis(60));
                     return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
@@ -42388,6 +42593,57 @@ mod tests {
         );
     }
 
+    /// An H1 stream-one session arms the relay poll on its socket before it relays, so an upload leg
+    /// waiting for payload parks instead of pinning one of the few relay workers the download legs need.
+    #[cfg(unix)]
+    fn assert_h1_arms(settings: Box<crate::xhttp::XhttpSettings>) {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let users = one_vless_user(&[0xaau8; 16]);
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            probe_tx
+                .send(stream.try_clone().expect("probe"))
+                .expect("probe");
+            serve_vless_xhttp(stream, &settings, &users, None, true, None);
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        xhttp_post_head(&mut peer, "/share", true);
+        let probe = probe_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("probe");
+        let until = Instant::now() + Duration::from_secs(5);
+        while probe.read_timeout().ok().flatten() != Some(budgets::RELAY_POLL) {
+            assert!(
+                Instant::now() < until,
+                "the H1 session never armed the relay poll"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_h1_xhttp_session_arms_the_relay_poll_before_it_relays() {
+        assert_h1_arms(xhttp_settings("/share"));
+    }
+
+    /// Automatic mode resolves to packet-up, yet the same hub serves a stream-one POST; its upload must not pin a worker either.
+    #[cfg(unix)]
+    #[test]
+    fn an_automatic_h1_stream_one_post_arms_the_relay_poll() {
+        assert_h1_arms(Box::new(crate::xhttp::XhttpSettings {
+            mode: crate::xhttp::XhttpMode::PacketUp,
+            mode_source: crate::xhttp::ModeSource::Auto,
+            ..*xhttp_settings("/share")
+        }));
+    }
+
     /// Raw HTTP/1.1 clients for the three xhttp modes, padded, with session and seq in the path.
     fn xhttp_get(stream: &mut Connection, target: &str) {
         stream
@@ -43344,37 +43600,101 @@ mod tests {
         Some(Box::new(CarrierStream { reader, writer }))
     }
 
+    fn kcp_tls_serve(
+        server_config: Arc<ferrox_core::tls::TlsServerConfig>,
+        serve: impl FnOnce(&mut FakeStream) + Send + 'static,
+    ) -> (u16, std::sync::mpsc::Sender<()>, thread::JoinHandle<()>) {
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let port = listener.local_addr().port();
+        let (done, wait) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            let Ok(mut tls) =
+                ferrox_core::tls::accept(&server_config, KcpIo::new(Arc::clone(&conn)))
+            else {
+                return;
+            };
+            if !shake_tls(&mut tls) {
+                return;
+            }
+            let mut stream: FakeStream = Box::new(tls);
+            serve(&mut stream);
+            let _ = wait.recv();
+        });
+        (port, done, server)
+    }
+
+    fn read_exact_stream(stream: &mut FakeStream, mut buf: &mut [u8]) -> Option<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !buf.is_empty() {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            match stream.read(buf) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(0) | Err(_) => return None,
+                Ok(read) => buf = &mut buf[read..],
+            }
+        }
+        Some(())
+    }
+
     fn serve_fake_socks(stream: &mut FakeStream) -> Option<()> {
+        socks_grant(stream)?;
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(0) | Err(_) => return None,
+                Ok(read) => {
+                    stream.write_all(&buf[..read]).ok()?;
+                }
+            }
+        }
+    }
+
+    fn serve_fake_socks_once(stream: &mut FakeStream) -> Option<()> {
+        socks_grant(stream)?;
+        let mut ping = [0u8; 4];
+        read_exact_stream(stream, &mut ping)?;
+        stream.write_all(&ping).ok()?;
+        Some(())
+    }
+
+    fn serve_fake_socks_late(stream: &mut FakeStream) -> Option<()> {
+        socks_grant(stream)?;
+        let mut ping = [0u8; 4];
+        read_exact_stream(stream, &mut ping)?;
+        thread::sleep(Duration::from_millis(200));
+        stream.write_all(&ping).ok()?;
+        Some(())
+    }
+
+    fn socks_grant(stream: &mut FakeStream) -> Option<()> {
         let mut greeting = [0u8; 3];
-        stream.read_exact(&mut greeting).ok()?;
+        read_exact_stream(stream, &mut greeting)?;
         if greeting != [5, 1, 0] {
             return None;
         }
         stream.write_all(&[5, 0]).ok()?;
         let mut head = [0u8; 4];
-        stream.read_exact(&mut head).ok()?;
+        read_exact_stream(stream, &mut head)?;
         match head[3] {
-            1 => stream.read_exact(&mut [0u8; 6]).ok()?,
+            1 => read_exact_stream(stream, &mut [0u8; 6])?,
             3 => {
                 let mut len = [0u8; 1];
-                stream.read_exact(&mut len).ok()?;
-                stream
-                    .read_exact(&mut vec![0u8; len[0] as usize + 2])
-                    .ok()?;
+                read_exact_stream(stream, &mut len)?;
+                read_exact_stream(stream, &mut vec![0u8; len[0] as usize + 2])?;
             }
-            4 => stream.read_exact(&mut [0u8; 18]).ok()?,
+            4 => read_exact_stream(stream, &mut [0u8; 18])?,
             _ => return None,
         }
         stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).ok()?;
-        let mut buf = [0u8; 1024];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) | Err(_) => return None,
-                Ok(n) => {
-                    stream.write_all(&buf[..n]).ok()?;
-                }
-            }
-        }
+        Some(())
     }
 
     fn socks_tls_over_carrier_reaches_echo(path: Option<&str>) {
@@ -43459,6 +43779,18 @@ mod tests {
         }
     }
 
+    fn serve_fake_http_proxy_once(stream: &mut FakeStream) -> Option<()> {
+        let (head, at) = read_exact_head(stream, HTTP_HEAD_LIMIT, budgets::head_arrival())?;
+        stream.write_all(b"HTTP/1.1 200 OK\r\n\r\nboot").ok()?;
+        if at < head.len() {
+            stream.write_all(&head[at..]).ok()?;
+        }
+        let mut ping = [0u8; 4];
+        read_exact_stream(stream, &mut ping)?;
+        stream.write_all(&ping).ok()?;
+        Some(())
+    }
+
     fn http_tls_over_carrier_reaches_echo(path: Option<&str>) {
         let (server_config, client_config) = carried_tls_configs();
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -43520,6 +43852,113 @@ mod tests {
     #[test]
     fn http_tls_over_ws_reaches_echo() {
         http_tls_over_carrier_reaches_echo(Some("/w"));
+    }
+
+    fn socks_tls_over_kcp_echo(half_close: bool) {
+        let (server_config, client_config) = carried_tls_configs();
+        let (kcp_port, done, server) = kcp_tls_serve(server_config, move |stream| {
+            let _ = if half_close {
+                serve_fake_socks_late(stream)
+            } else {
+                serve_fake_socks_once(stream)
+            };
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (client, _) = front.accept().expect("front accepts");
+            let socks = SocksOut {
+                address: "127.0.0.1".to_owned(),
+                port: kcp_port,
+                credential: crate::socks::Credential::default(),
+                version: crate::socks::Version::V5,
+                tls: Some(Arc::new(client_config)),
+                carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+                host: "carrier.test".to_owned(),
+                carrier_headers: Vec::new(),
+                heartbeat: 0,
+            };
+            let server_addr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
+            dial_socks_outbound(
+                &client,
+                &Outbound::Socks(socks),
+                &server_addr,
+                &Destination::from(server_addr),
+            );
+        });
+        let mut client = Connection::connect(front_addr).expect("front connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        if half_close {
+            client.shutdown(Shutdown::Write).expect("half-closes");
+        }
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        let _ = done.send(());
+        server.join().expect("server joins");
+        relaying.join().expect("relaying joins");
+    }
+
+    #[test]
+    fn socks_tls_over_kcp_reaches_echo() {
+        socks_tls_over_kcp_echo(false);
+    }
+
+    #[test]
+    fn socks_tls_over_kcp_answers_after_the_client_half_closes() {
+        socks_tls_over_kcp_echo(true);
+    }
+
+    #[test]
+    fn http_tls_over_kcp_reaches_echo() {
+        let (server_config, client_config) = carried_tls_configs();
+        let (kcp_port, done, server) = kcp_tls_serve(server_config, |stream| {
+            let _ = serve_fake_http_proxy_once(stream);
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (client, _) = front.accept().expect("front accepts");
+            let http = HttpOut {
+                address: "127.0.0.1".to_owned(),
+                port: kcp_port,
+                tls: Some(Arc::new(client_config)),
+                carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+                host: "carrier.test".to_owned(),
+                carrier_headers: Vec::new(),
+                heartbeat: 0,
+                headers: Vec::new(),
+                user: None,
+                pass: None,
+            };
+            let server_addr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
+            dial_http_outbound(
+                &client,
+                &server_addr,
+                &http,
+                &Destination::from(server_addr),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(front_addr).expect("front connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut early = [0u8; 4];
+        client.read_exact(&mut early).expect("early bytes");
+        assert_eq!(&early, b"boot");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        let _ = done.send(());
+        server.join().expect("server joins");
+        relaying.join().expect("relaying joins");
     }
 
     #[test]
@@ -45012,6 +45451,12 @@ mod tests {
                 ),
             ),
             (
+                "kcp".to_owned(),
+                format!(
+                    r#""network": "kcp", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+            (
                 "ws".to_owned(),
                 format!(
                     r#""network": "ws", "security": "tls", "wsSettings": {{"path": "/w"}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
@@ -45052,6 +45497,7 @@ mod tests {
             Carrier::Grpc(_) => "grpc",
             Carrier::Xhttp { .. } => "xhttp",
             Carrier::HttpHeader { .. } => "httpheader",
+            Carrier::Kcp(_) => "kcp",
             _ => "other",
         }
     }
@@ -45275,7 +45721,7 @@ mod tests {
             assert_eq!(carrier_tag(&out.carrier), want, "{want}");
             assert!(out.tls.is_some(), "{want}");
         }
-        for network in ["quic", "kcp", "hysteria"] {
+        for network in ["quic", "hysteria"] {
             let stream = format!(
                 r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
             );
@@ -45306,7 +45752,7 @@ mod tests {
             assert_eq!(carrier_tag(&out.carrier), want, "{want}");
             assert!(out.tls.is_some(), "{want}");
         }
-        for network in ["quic", "kcp", "hysteria"] {
+        for network in ["quic", "hysteria"] {
             let stream = format!(
                 r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
             );
@@ -51099,6 +51545,9 @@ mod tests {
         assert!(!vless_flow_ok(&plain, Flow::Vision, 1, true));
         assert!(!vless_flow_ok(&plain, Flow::Other, 1, true));
         assert!(!vless_flow_ok(&vision, Flow::Vision, 1, false));
+        assert!(vless_reply_ok(&vision, Flow::Vision, 3, true));
+        assert!(!vless_reply_ok(&vision, Flow::Vision, 2, true));
+        assert!(!vless_reply_ok(&plain, Flow::Vision, 3, true));
     }
 
     #[test]
@@ -63036,6 +63485,41 @@ mod tests {
             headers: Vec::new(),
             user: None,
             pass: None,
+        }));
+        let mut client = socks_tcp_client(front, echo);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The shape `TestSocksWithHttpRequest` dials: the hop's CONNECT reaches a socks
+    /// front, whose first byte is not a greeting, so it serves the request as the http
+    /// front and checks the credential the socks front already holds.
+    #[test]
+    fn a_socks_front_serves_an_http_outbound_that_offers_its_account() {
+        let echo = echo_loop();
+        let accounts = SocksAccounts {
+            password: true,
+            pairs: vec![SocksAccount {
+                user: "Test Account".to_owned(),
+                pass: "Test Password".to_owned(),
+                email: String::new(),
+                level: 0,
+            }],
+        };
+        let upstream = socks_front_with_accounts(freedom(), accounts);
+        let front = socks_front_with(Outbound::Http(HttpOut {
+            address: "127.0.0.1".to_owned(),
+            port: upstream,
+            tls: None,
+            carrier: Carrier::Raw(ferrox_core::finalmask::Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            carrier_headers: Vec::new(),
+            heartbeat: 0,
+            headers: Vec::new(),
+            user: Some("Test Account".to_owned()),
+            pass: Some("Test Password".to_owned()),
         }));
         let mut client = socks_tcp_client(front, echo);
         client.write_all(b"ping").expect("writes");

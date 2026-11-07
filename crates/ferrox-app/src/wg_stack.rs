@@ -987,6 +987,30 @@ fn set_tcp_mss(packet: &mut [u8], at: usize, mss: u16) -> bool {
     true
 }
 
+/// Cap a client's advertised MSS to what the tunnel's own MTU can carry, so the
+/// server never writes a segment it must fragment.
+fn lower_syn_mss(packet: &mut [u8], at: usize, mtu: usize) {
+    let Some((ip_header, _, total)) = tcp_view(&packet[at..]) else {
+        return;
+    };
+    if packet[at + ip_header + 13] & 0x02 == 0 {
+        return;
+    }
+    let Ok(mss) = u16::try_from(mtu.saturating_sub(ip_header + 20).max(536)) else {
+        return;
+    };
+    let Some(offset) = tcp_mss_option(&packet[at + ip_header..at + total]) else {
+        return;
+    };
+    let advertised = u16::from_be_bytes([
+        packet[at + ip_header + offset],
+        packet[at + ip_header + offset + 1],
+    ]);
+    if advertised > mss {
+        let _ = set_tcp_mss(packet, at, mss);
+    }
+}
+
 fn lower_syn_ack_mss(packet: &mut [u8], at: usize, mtu: usize) {
     let Some((ip_header, _, _)) = tcp_view(&packet[at..]) else {
         return;
@@ -1345,6 +1369,7 @@ impl ClientStack {
             return;
         }
         if self.device.absorb(packet) {
+            self.fragment = self.fragment.min(self.device.mtu);
             self.reset_iface();
         }
     }
@@ -1581,7 +1606,7 @@ impl ServerStack {
     /// Route one packet to TCP, a UDP lane, or the server echo path.
     fn receive(&mut self, packet: Packet) {
         let at = packet.at;
-        let bytes = match self.reassembly.accept(packet.peer, &packet.bytes[at..], at) {
+        let mut bytes = match self.reassembly.accept(packet.peer, &packet.bytes[at..], at) {
             Reassembled::Pass => packet.bytes,
             Reassembled::Held => {
                 self.device.recycle(packet.bytes, at);
@@ -1594,13 +1619,20 @@ impl ServerStack {
         };
         let protocol = inner_protocol(&bytes[at..]);
         match protocol {
-            Some(PROTOCOL_TCP) => self.device.push(bytes, at),
+            Some(PROTOCOL_TCP) => {
+                lower_syn_mss(&mut bytes, at, self.mtu);
+                self.device.push(bytes, at);
+            }
             Some(PROTOCOL_UDP) => {
                 self.datagram(packet.peer, &bytes[at..]);
                 self.device.recycle(bytes, at);
             }
             _ => {
-                // A client's ICMP must not narrow the MTU every tunnel shares.
+                // Only the lane's own oversize answer, which carries no peer, may narrow the shared MTU.
+                if packet.peer == [0u8; 32] && self.device.absorb(&bytes[at..]) {
+                    self.fragment = self.fragment.min(self.device.mtu);
+                    self.reset_iface();
+                }
                 self.answer_echo(&bytes[at..]);
                 self.device.recycle(bytes, at);
             }
@@ -1814,6 +1846,15 @@ impl ServerStack {
             }
             self.flows.push(Flow::new(handle, tun, 0));
         }
+    }
+
+    /// Rebuild the interface so smoltcp's cached capabilities carry the learned MTU.
+    fn reset_iface(&mut self) {
+        let now = self.now();
+        self.iface = Interface::new(iface_config(0x5eed_5678), &mut self.device, now);
+        add_addresses(&mut self.iface, &self.addresses);
+        add_default_routes(&mut self.iface, &self.addresses);
+        self.iface.set_any_ip(true);
     }
 
     fn now(&self) -> Instant {
@@ -3942,6 +3983,21 @@ mod tests {
         assert!(tcp_checksum_verifies(&answer));
     }
 
+    #[test]
+    fn the_server_caps_a_larger_syn_mss_to_its_mtu() {
+        let (to_tunnel, _tunneled) = std::sync::mpsc::channel();
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let mut stack = ServerStack::new(&device(&["10.13.0.1"], false), to_tunnel, out, 0);
+        stack.receive(Packet {
+            peer: [0x11; 32],
+            bytes: syn_with_mss(65_495, 0x02),
+            at: 0,
+        });
+        let (queued, at) = stack.device.rx.front().expect("the SYN reaches the stack");
+        assert_eq!(tcp_mss(&queued[*at..]), 1_380);
+        assert!(tcp_checksum_verifies(&queued[*at..]));
+    }
+
     /// A completed fragment is handed to the lane that asked for the datagram.
     #[test]
     fn a_fragmented_udp_reply_reaches_its_lane() {
@@ -4320,7 +4376,7 @@ mod tests {
         let too_big =
             ferrox_core::foxy::connectip::icmp_too_large(&inner, 1170).expect("a v4 answer");
         stack.receive(Packet {
-            peer: [0u8; 32],
+            peer: [7u8; 32],
             bytes: too_big,
             at: 0,
         });
@@ -4685,6 +4741,19 @@ mod client_tests {
             .expect("lane")
             .send(reply)
             .expect("reply");
+
+        app.send_to(&frame, relay_address).expect("send again");
+        let inner = packets.recv_timeout(LANE_WAIT).unwrap_or_else(|error| {
+            let alive = routes
+                .lock()
+                .is_ok_and(|table| table.contains_key(&source_port));
+            panic!("inner: {error} (lane alive: {alive})");
+        });
+        let datagram = udp_from_packet(&inner).expect("packet");
+        assert_eq!(
+            socket_addr(datagram.destination, 53).expect("target"),
+            winner
+        );
         app.set_read_timeout(Some(Duration::from_millis(150)))
             .expect("timeout");
         assert!(
@@ -4693,14 +4762,6 @@ mod client_tests {
         );
         app.set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
-
-        app.send_to(&frame, relay_address).expect("send again");
-        let inner = packets.recv_timeout(LANE_WAIT).expect("inner");
-        let datagram = udp_from_packet(&inner).expect("packet");
-        assert_eq!(
-            socket_addr(datagram.destination, 53).expect("target"),
-            winner
-        );
         assert!(
             packets.recv_timeout(Duration::from_millis(150)).is_err(),
             "a replied lane must not fan the next datagram out"

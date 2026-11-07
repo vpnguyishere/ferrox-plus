@@ -824,14 +824,17 @@ pub fn connect<S: Stream + RecordAlignment>(
         Some(_) => Ok(ClientSession::Shaped(Box::new(shaped::Session::connect(
             cfg, io,
         )?))),
-        // A list naming an id ring and BoringSSL both lack rides Go's stock shaped hello.
-        None if cfg.ech_config_list.is_none() && shaped::needs_stock_hello(&cfg.cipher_suites) => {
+        // A list naming an id both backends lack, or both versions, rides the shaped stock hello.
+        None if cfg.ech_config_list.is_none()
+            && (shaped::needs_stock_hello(&cfg.cipher_suites)
+                || cipher_suites::mixed(&cfg.cipher_suites)) =>
+        {
             Ok(ClientSession::Shaped(Box::new(
                 shaped::Session::connect_stock(cfg, io)?,
             )))
         }
         // ECH is rustls's lane here, so a config naming both keeps ECH and leaves CBC to it.
-        None if cfg.ech_config_list.is_none() && legacy::needed(&cfg.cipher_suites) => Ok(
+        None if cfg.ech_config_list.is_none() && legacy::dial_needed(&cfg.cipher_suites) => Ok(
             ClientSession::Legacy(Box::new(legacy::Session::connect(cfg, io)?)),
         ),
         None => Ok(ClientSession::Stock(Box::new(RustlsProvider::connect(

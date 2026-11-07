@@ -1,3 +1,5 @@
+use std::mem::MaybeUninit;
+
 use crate::poly1305::Poly1305;
 use crate::record::{fill_exact, fill_exact_with_head};
 
@@ -65,6 +67,31 @@ pub fn chacha20_poly1305_seal_from(
 
     let mut state = Poly1305::new(&one_time);
     mac(&mut state, aad, dst);
+    state.finish()
+}
+
+/// Seal `src` into `dst`, which may be uninitialized: every byte is written before this returns, so a caller holding spare capacity pays no zeroing pass beside the fill, and no staging copy of the plaintext — the payload register file is read through `xor_chunk_from`, which never writes `src`.
+#[must_use]
+pub fn chacha20_poly1305_seal_from_uninit(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    src: &[u8],
+    dst: &mut [MaybeUninit<u8>],
+) -> [u8; 16] {
+    assert_eq!(
+        src.len(),
+        dst.len(),
+        "the source and the wire are the same message"
+    );
+    let mut one_time = [0u8; 32];
+    // `fill_exact_with_head_from` writes every wrapped byte through `xor_chunk_from`, so every byte is initialized before this slice is formed.
+    let dst_initialized =
+        unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len()) };
+    crate::record::fill_exact_with_head_from(key, nonce, 0, &mut one_time, src, dst_initialized);
+
+    let mut state = Poly1305::new(&one_time);
+    mac(&mut state, aad, dst_initialized);
     state.finish()
 }
 
@@ -140,6 +167,13 @@ mod tests {
             let got = chacha20_poly1305_seal_from(&key, &nonce, aad, &plain, &mut dst);
             assert_eq!(got, want, "tag at length {len}");
             assert_eq!(dst, in_place, "ciphertext at length {len}");
+            let mut uninit = vec![std::mem::MaybeUninit::new(0xa5u8); len];
+            let got = chacha20_poly1305_seal_from_uninit(&key, &nonce, aad, &plain, &mut uninit);
+            assert_eq!(got, want, "uninit tag at length {len}");
+            // SAFETY: seal_from_uninit wrote every byte of the destination.
+            let uninit =
+                unsafe { std::slice::from_raw_parts(uninit.as_ptr().cast::<u8>(), uninit.len()) };
+            assert_eq!(uninit, in_place, "uninit ciphertext at length {len}");
             assert_eq!(plain, original, "source at length {len}");
         }
     }

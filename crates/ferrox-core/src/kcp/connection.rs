@@ -493,14 +493,16 @@ impl Connection {
                         self.data_input.signal();
                         self.data_output.signal();
                     }
-                    self.sending
-                        .lock()
-                        .unwrap()
-                        .process_receiving_next(c.receiving_next);
-                    self.receiving
-                        .lock()
-                        .unwrap()
-                        .process_sending_next(c.sending_next);
+                    let mut receiving = self.receiving.lock().unwrap();
+                    #[cfg(test)]
+                    self.pass_lock_gate("receiving");
+                    receiving.process_sending_next(c.sending_next);
+                    drop(receiving);
+                    let mut sending = self.sending.lock().unwrap();
+                    #[cfg(test)]
+                    self.pass_lock_gate("sending");
+                    sending.process_receiving_next(c.receiving_next);
+                    drop(sending);
                     self.ctx
                         .round_trip
                         .lock()
@@ -842,6 +844,47 @@ mod tests {
             "idle poll returned {:?}, not a tick",
             next.saturating_duration_since(now)
         );
+    }
+
+    #[test]
+    fn a_command_takes_the_receiving_lock_before_the_sending_lock() {
+        let local = ([127, 0, 0, 1], 1).into();
+        let conn = Connection::new_unstarted(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 4,
+            },
+            Box::new(|_| Ok(())),
+            Box::new(|| {}),
+            Config::default(),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        let weak = Arc::downgrade(&conn);
+        conn.set_lock_gate(Some(Arc::new(move |site: &'static str| {
+            let conn = weak.upgrade().expect("the connection is alive");
+            match site {
+                "receiving" => {
+                    assert!(
+                        conn.sending.try_lock().is_ok(),
+                        "input held the sending lock while taking the receiving lock"
+                    );
+                }
+                "sending" => {
+                    assert!(
+                        conn.receiving.try_lock().is_ok(),
+                        "input held the receiving lock while taking the sending lock"
+                    );
+                }
+                _ => unreachable!("unknown lock site"),
+            }
+            recorded.lock().unwrap().push(site);
+        })));
+        let mut command = CmdOnlySegment::new();
+        command.conv = 4;
+        conn.input(&mut vec![Segment::CmdOnly(command)]);
+        assert_eq!(*events.lock().unwrap(), ["receiving", "sending"]);
     }
 
     #[test]

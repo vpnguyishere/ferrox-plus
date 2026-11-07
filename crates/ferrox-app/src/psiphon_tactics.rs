@@ -54,6 +54,7 @@ impl Tactics {
         identity: &Identity<'_>,
         timeout: Duration,
         proxy: Option<&Proxy>,
+        dns: &crate::psiphon_dns::Config,
     ) -> Result<Self, String> {
         let keys = server
             .tactics
@@ -68,7 +69,7 @@ impl Tactics {
         let mut body = obfuscator.preamble.clone();
         body.extend_from_slice(&boxed);
         let mut reply =
-            psiphon_meek::post(&keys.meek, "/", Some("tactics"), &body, timeout, proxy)?;
+            psiphon_meek::post(&keys.meek, "/", Some("tactics"), &body, timeout, proxy, dns)?;
         let boxed = open_preamble(&keyword, &mut reply)?;
         let plain = open(
             &keys.public_key,
@@ -205,6 +206,18 @@ fn api_params(identity: &Identity<'_>) -> String {
         json_escape(identity.version),
         json_escape(identity.platform)
     );
+    if !identity.authorizations.is_empty() {
+        body.push_str(r#","authorizations":["#);
+        for (index, authorization) in identity.authorizations.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push('"');
+            body.push_str(&json_escape(authorization));
+            body.push('"');
+        }
+        body.push(']');
+    }
     if !identity.client_features.is_empty() {
         body.push_str(r#","client_features":["#);
         for (index, feature) in identity.client_features.iter().enumerate() {
@@ -370,6 +383,27 @@ fn json_escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// SSH authorizations reach the tactics API request.
+    fn authorizations_reach_the_api_request() {
+        let authorizations = vec!["a\"b".to_owned()];
+        let identity = Identity {
+            session_id: "00",
+            authorizations: &authorizations,
+            sponsor: "sponsor",
+            propagation: "propagation",
+            platform: "Android",
+            version: "453",
+            egress_region: None,
+            device_region: None,
+            device_location: None,
+            client_features: &[],
+            split_tunnel: false,
+            split_tunnel_regions: &[],
+        };
+        assert!(api_params(&identity).contains(r#""authorizations":["a\"b"]"#));
+    }
 
     #[test]
     fn a_preamble_encrypts_the_magic_and_padding() {

@@ -43,7 +43,7 @@ Syscalls: one TCP probe issues `peek` calls on the client until the HTTP head or
   sniff::tests::a_warm_probe_costs_the_documented_instructions 'ferrox_app::sniff::Sniffing::inspect'
 ```
 
-1228 retired instructions for one pre-warmed inspection, the row in `scripts/expected-ops.txt`; the test filter is that row's third column because the default filter never calls the sniffer. The buffer is resized and zeroed before the counted call, so the row prices the peek and the host parse rather than the 32 KiB growth the first call pays — `the_probe_buffer_is_the_worker_threads_not_the_flows` still holds that buffer's base and capacity across two flows, and holds the second inspection at zero zeroed allocations and one allocation.
+1228 retired instructions for one pre-warmed inspection, reported by `ops.yml` from `scripts/method-ops.txt` rather than gated: the loopback probe's frame has read 1228 and 1231 on the same source, so no exact row is a gate. The test filter is the row's symbol because the default filter never calls the sniffer. The buffer is resized and zeroed before the counted call, so the row prices the peek and the host parse rather than the 32 KiB growth the first call pays — `the_probe_buffer_is_the_worker_threads_not_the_flows` still holds that buffer's base and capacity across two flows, and holds the second inspection at zero zeroed allocations and one allocation.
 
 ## Time
 

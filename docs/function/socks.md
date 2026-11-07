@@ -6,6 +6,8 @@ The front reads its account list from `settings.accounts`, or from xray's `users
 
 The datagram half is the same protocol in the other direction: one `UDP ASSOCIATE` association to the upstream server, and every datagram rides it framed the way RFC 1928 frames them.
 
+The front is also an HTTP proxy: a greeting whose first byte is neither `5` nor `4` is handed to the same HTTP front the `http` inbound uses (`serve_http`), as the reference hands it to its own `http.Server` (`proxy/socks/server.go`'s `Process`). The accounts it checks are the socks accounts the front already holds, and the client in that scenario is the reference's `xray.proxy.http.ClientConfig` protobuf, which `xray_pb.rs` now decodes to the hop this tree dials.
+
 ## Byte-identity
 
 The bytes this client writes are the bytes the pinned references write, and the claim is checked by a differential, not by reading the code:
@@ -21,20 +23,26 @@ The one place the tree does **not** copy the reference is the method list. The p
 
 ```mermaid
 graph TD
-    A["device packet, or a front client"] --> B["serve_device_flow: the rules pick the lane,<br/>then serve_connect — the entry the socks and http fronts reach"]
-    B --> C["dial_socks_client: the destination keeps its shape<br/>— a name stays a name on the wire"]
-    C --> D["greeting: [5, 1, method] on the stack,<br/>one method, the one the client will use"]
-    D --> E{"a credential configured?"}
-    E -- "yes" --> F["RFC 1929 block: [1, ulen, user, plen, pass]"]
+    D["device packet"] --> DF["serve_device_flow"]
+    F["front client"] --> FB{"first byte: 5 or 4?"}
+    FB -- "yes" --> FS["socks_request, then serve_socks_connected"]
+    FB -- "no" --> FH["serve_http: a CONNECT or a plain head,<br/>the socks accounts check the credential"]
+    DF --> SC["serve_connect: the rules pick the lane;<br/>the socks client lane below is that lane when chosen"]
+    FS --> SC
+    FH --> SC
+    SC --> C["dial_socks_client: the destination keeps its shape<br/>— a name stays a name on the wire"]
+    C --> G0["greeting: [5, 1, method] on the stack,<br/>one method, the one the client will use"]
+    G0 --> E{"a credential configured?"}
+    E -- "yes" --> F1["RFC 1929 block: [1, ulen, user, plen, pass]"]
     E -- "no" --> G["request: [5, cmd, 0, atyp, addr, port]"]
-    F --> G
-    G --> H["the tunnel: the relay's own copy per byte"]
-    A --> I["UDP ASSOCIATE: the same request with cmd 3,<br/>the all-zero IPv4 address RFC 1928 names"]
+    F1 --> G
+    G --> T["the tunnel: the relay's own copy per byte"]
+    SC --> I["UDP ASSOCIATE: the same request with cmd 3,<br/>the all-zero IPv4 address RFC 1928 names"]
     I --> J["one association, every destination<br/>framed RSV|FRAG|address|payload"]
-    J --> H
-    A --> K["SOCKS4 request: [4, cmd, port, addr, user\0,<br/>name\0 for 4a] — no greeting, no method"]
+    J --> T
+    SC --> K["SOCKS4 request: [4, cmd, port, addr, user\0,<br/>name\0 for 4a] — no greeting, no method"]
     K --> L["reply: [0, 90, 0, 0, 0, 0, 0, 0] granted,<br/>[0, 91, ...] refused"]
-    L --> H
+    L --> T
 ```
 
 ## Measured
@@ -43,6 +51,7 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| seconds-per-socks-dial | UNBLESSED | CI bench.yml (no socks cell yet) |
 | oracle-lines-matching-the-pinned-go | 8 | ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes |
 | methods-offered-in-the-greeting | 1 | ferrox-core-socks::tests::the_greeting_is_the_bytes_the_pinned_writer_writes |
 | request-bytes-per-tcp-dial | 10 | ferrox-core-socks::tests::the_request_is_the_bytes_the_pinned_writer_writes |
@@ -80,6 +89,8 @@ graph TD
 | socks5-long-connect-read-calls | 4 | ferrox-app-socks::tests::a_long_destination_and_a_long_bound_name_take_no_heap_buffer |
 | socks4-requests-a-credential-front-refuses | 1 | ferrox-app-proxy::tests::a_front_that_asks_for_a_credential_refuses_a_socks4_request |
 | socks4-xray-scenario-tests-passing | 1 | scripts/run-upstream-suite.sh |
+| http-fallback-requests-served | 1 | ferrox-app-proxy::tests::a_socks_front_serves_an_http_outbound_that_offers_its_account |
+| http-fallback-scenario-tests-passing | 1 | scripts/run-upstream-suite.sh |
 <!-- counts:end -->
 
 The first row after the ops row is the identity claim itself: eight recorded runs — five handshakes and three datagram frames — compared octet for octet against the pinned Go's own writer. The greeting row is the one-method rule the pinned writers follow, pinned as bytes (`[5, 1, 0]` and `[5, 1, 2]`) rather than as a count of what the code happens to send. The request and credential rows are the byte counts a reader can check by hand: a `CONNECT` for an IPv4 literal is ten octets (`[5, 1, 0]` plus the type byte, four address bytes and two port bytes), and the RFC 1929 block for a one-byte name and a one-byte password is five (`[1, 1, u, 1, p]`). The datagram row is the frame's overhead — the two reserved bytes, the fragment byte, the address type byte, the address and the port — which is ten octets before the payload.
@@ -91,6 +102,12 @@ The device front's datagram is the head and the device's own payload, never one 
 The refusal row is the client's half of the method negotiation: a server that answers a method the client did not offer is refused, the way the pinned Go client refuses it (`"auth method not supported."`). A credentialed session therefore never tunnels through a server that answered `[5, 0]`, and a credential that is half written refuses the session outright rather than downgrading it to no authentication.
 
 The four end-to-end rows are the shape: the device's TCP flow leaves through the client lane and the SOCKS5 server receives a `CONNECT` for the destination the device's packet named; the same lane carries an echo through the tree's own front; the datagram lane carries a datagram through it; and the credentialed lane carries an echo through a front that asks for the credential. The refusal row is the front's half: a credential it does not know is refused with the status byte, not with a closed socket.
+
+## HTTP fallback
+
+A front that is configured for socks answers an HTTP request too. `serve_socks` peeks the first byte before it reads a greeting: a `5` or a `4` takes the SOCKS path, and anything else is handed — with the bytes still unread — to `serve_http`, which parses a `CONNECT` tunnel or a plain forwarded head and, when the inbound names accounts, checks `Proxy-Authorization: Basic` against the same socks account list. A missing or unknown credential gets xray's 407; an accepted one is dropped from the head before the origin sees it. `a_socks_front_serves_an_http_outbound_that_offers_its_account` drives the whole shape through a real socket — a local socks front whose outbound is the HTTP hop, the upstream front it dials, the account, and an echo — and `TestSocksWithHttpRequest` is the same shape in the pinned suite, now gated by `scripts/run-upstream-suite.sh`.
+
+On the client side the reference's `xray.proxy.http.ClientConfig` protobuf decodes to the JSON `http` outbound this tree dials: one `ServerEndpoint` (address, port, optional `Account`), and the repeated `Header` list as the hop's own fields. `a_socks_http_fallback_scenario_decodes_both_sides` holds the translation, and the account is what the hop writes as `Proxy-Authorization: Basic` in its CONNECT.
 
 ## SOCKS4
 
@@ -162,7 +179,7 @@ Named rather than claimed, with the worst input worked out first:
 - **The bound address is read and dropped.** The server's reply names the address it bound; the client reads its octets so the stream sits where the tunnel begins, and does not use it. All three RFC 1928 forms are accepted — a literal in a fixed block, a name as its length byte and then one read into a 257-byte stack block — because the reference's `addrParser.ReadAddressPort` accepts every type its request can carry.
 - **The datagram lane is one association for every destination,** not one per destination, and the association's control leg is held open for its life — dropping it ends the association, which is what the reference does too. The frame the lane writes carries an address, never a name: the tree's own front resolves a name in the datagram lane before it reaches here, and that resolution is the front's behaviour, not this lane's.
 - **The BIND command is refused.** SOCKS4's second command asks the proxy to open a *listening* port; nothing here listens for one, so the request is refused with the protocol's own rejection code, the way the pinned server refuses it.
-- **The front does not sniff an HTTP request.** The pinned socks server reads one byte and, when it is not 5 or 4, hands the connection to its HTTP server (`ProcessWithFirstbyte`). This tree's `socks` front does not; the `mixed` protocol is where both live. `TestSocksWithHttpRequest` fails against this tree for that reason and passes against the reference.
+- **The front looks one byte ahead before it reads it.** `serve_socks` issues one non-consuming peek to choose the SOCKS or HTTP lane and leaves the byte in the stream, so the greeting or the head reads it again; the pinned server consumes the byte once and seeds its parser with it. No test counts the front's reads, so that extra read stays `UNBLESSED`.
 - **The front has no datagram switch.** The pinned server config carries `udp_enabled` and refuses a `UDP ASSOCIATE` when it is false; the bridge reads that flag and drops it, and this front always carries datagrams. The `socks` inbound's own JSON surface has no `udp` setting to carry it either.
 - **The credential block's slow path is a stack block, not a heap one.** A name and a password that fit 64 bytes share the inline block; the RFC's longest pair takes a 513-byte stack block. No dial allocates either, and the block is zeroed only when it is the arm that runs.
 - **The front's method list is drained on the stack,** 255 bytes, never inspected beyond the one method the front wants — the tree's existing shape, now with a second method it can want.
@@ -172,7 +189,7 @@ Named rather than claimed, with the worst input worked out first:
 
 `conformance.yml`'s scenario-map job runs every test in the pinned `xray-core`'s `testing/scenarios` package against `ferrox-app`, and the pin's gate names the ones that must be green. `TestSocksBridgeTCP` is one of them now: it is xray's own scenario — a `socks.ServerConfig` inbound that asks for a password on one side, a `socks.ClientConfig` outbound that offers one on the other, and a `dokodemo.Config` front that rewrites every flow to an echo server — and it runs against this tree unmodified through the `scripts/xray-scenarios.sh` seam. The bridge carries `xray.proxy.socks.ServerConfig` (the auth type, the account map, the address and the datagram flag read and dropped) and `xray.proxy.socks.ClientConfig` (one endpoint, with the credential when the config names one); a user level is refused by name, because it feeds a policy app this tree has no lane for.
 
-`TestSocksBridageUDP` and `TestSocksBridageUDPWithRouting` pass now, because the `dokodemo-door` carries the datagram and the router's tag and port selectors decode; both are in the pin's gate. `TestSocksConformanceMod` — the scenario that dials this front with `socks4.Dial` — passes and is gated beside `TestSocksBridgeTCP`. The one remaining socks failure is `TestSocksWithHttpRequest`, which needs the front's HTTP sniff. The map at this pin is 43 of 73 green and the socks family 4 of its 5; the run is `scripts/run-xray-scenario-map.sh` against the pinned checkout, and it is informational — a failing test never fails the job.
+`TestSocksBridageUDP` and `TestSocksBridageUDPWithRouting` pass now, because the `dokodemo-door` carries the datagram and the router's tag and port selectors decode; both are in the pin's gate. `TestSocksConformanceMod` — the scenario that dials this front with `socks4.Dial` — passes and is gated beside `TestSocksBridgeTCP`. `TestSocksWithHttpRequest` passes too, and is now gated with them: the front hands the CONNECT to `serve_http`, and the bridge carries the `xray.proxy.http.ClientConfig` outbound the client leg dials. The map at this pin is 44 of 73 green and the socks family 5 of its 5; the run is `scripts/run-xray-scenario-map.sh` against the pinned checkout, and it is informational — a failing test never fails the job.
 
 ## Pins
 

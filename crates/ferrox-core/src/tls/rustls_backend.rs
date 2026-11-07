@@ -428,7 +428,7 @@ struct Material {
 }
 
 /// The config fields `build_material` reads. ALPN is not one of them because the anchors and the suite order do not depend on it, and the server name is not one either: it reaches the connection, not the config.
-#[derive(Eq)]
+#[derive(Clone, Eq)]
 pub(crate) struct MaterialKey {
     roots: crate::tls::Anchors,
     pins: crate::foxy::pin::Pins,
@@ -2476,40 +2476,49 @@ mod tests {
         );
     }
 
-    /// The oracle's TLS 1.2 case, plus the one id rustls adds (`0x00ff`, which `crypto/tls` never sends).
-    #[cfg_attr(miri, ignore = "assembles a real hello through ring")]
+    /// A named TLS 1.2-only list rides the legacy lane, which writes the reference's field and
+    /// appends no `0x00ff` SCSV.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and BoringSSL's assembly behind it"
+    )]
     #[test]
     fn a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let capture = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = [0u8; 5];
+            stream.read_exact(&mut head).expect("record header");
+            let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+            let mut record = head.to_vec();
+            record.resize(5 + len, 0);
+            stream.read_exact(&mut record[5..]).expect("record body");
+            record
+        });
         let preset =
             "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256";
         let crafted = crate::tls::cipher_suites::hello_ids(
             &crate::tls::cipher_suites::parse(preset),
             0x0301,
-            0x0304,
+            0x0303,
             true,
         );
         let mut cfg = client("tls.test", &[]);
         cfg.cipher_suites = crafted.into();
-        let config = client_config(&cfg).expect("builds");
-        let mut conn = rustls::ClientConnection::new(
-            config,
-            rustls::pki_types::ServerName::try_from("tls.test").expect("name"),
-        )
-        .expect("session");
-        let mut record = Vec::new();
-        conn.write_tls(&mut record).expect("hello goes out");
-        let got = hello_cipher_suites(&record);
-        let reference =
-            crate::tls::cipher_suites::field_bytes(&[0xc02b, 0xc02c, 0x1301, 0x1302, 0x1303]);
-        assert_eq!(
-            &got[2..got.len() - 2],
-            &reference[2..],
-            "the reachable ids are the reference's, in its order"
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+        assert!(
+            matches!(&session, crate::tls::ClientSession::Legacy(_)),
+            "a named TLS 1.2-only list rides the legacy lane"
         );
+        let _ = session.handshake();
+        let record = capture.join().expect("joins");
+        let want = crate::tls::cipher_suites::field_bytes(&cfg.cipher_suites);
         assert_eq!(
-            &got[got.len() - 2..],
-            [0x00, 0xff],
-            "rustls appends TLS_EMPTY_RENEGOTIATION_INFO_SCSV to a TLS 1.2 hello; crypto/tls never sends it"
+            hello_cipher_suites(&record),
+            want.as_slice(),
+            "the dialer field is the reference's, with no SCSV"
         );
     }
 
@@ -4101,11 +4110,12 @@ mod tests {
         );
     }
 
-    /// A list that also offers TLS 1.3 keeps `BoringSSL`'s own hello: its trio leads where
-    /// `crypto/tls` appends it, so this lane is exact only inside the TLS 1.2 ids.
+    /// A list naming both halves is neither stock lane's: `BoringSSL` leads with its trio and
+    /// rustls appends the TLS 1.2 list before it, so the stock shaped hello writes the derived
+    /// field verbatim.
     #[cfg_attr(miri, ignore = "needs a loopback socket")]
     #[test]
-    fn a_legacy_mixed_list_keeps_boringssls_trio_before_the_tls12_ids() {
+    fn a_mixed_list_keeps_the_reference_order_on_the_wire() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let capture = thread::spawn(move || {
@@ -4119,18 +4129,87 @@ mod tests {
             record
         });
         let mut cfg = client("tls.test", &[]);
-        cfg.cipher_suites = vec![0xc009, 0x002f, 0x1301, 0x1302, 0x1303].into();
+        cfg.cipher_suites = crate::tls::cipher_suites::hello_ids(
+            &crate::tls::cipher_suites::parse(
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+            ),
+            0x0303,
+            0x0304,
+            true,
+        )
+        .into();
+        assert_eq!(
+            &*cfg.cipher_suites,
+            &[0xc02f, 0xc013, 0x1301, 0x1302, 0x1303]
+        );
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+        assert!(
+            matches!(&session, crate::tls::ClientSession::Shaped(_)),
+            "a mixed list rides the stock shaped hello"
+        );
         let _ = session.handshake();
         let record = capture.join().expect("joins");
-        let want =
-            crate::tls::cipher_suites::field_bytes(&[0x1301, 0x1302, 0x1303, 0xc009, 0x002f]);
+        let want = crate::tls::cipher_suites::field_bytes(&cfg.cipher_suites);
         assert_eq!(
             hello_cipher_suites(&record),
             want.as_slice(),
-            "BoringSSL's trio leads even a list that names the 1.2 ids first"
+            "a mixed list is the reference field byte for byte"
         );
+    }
+
+    /// The mixed-list dial rides the shaped stock hello and still finishes a TLS 1.2 handshake
+    /// on the CBC id the list carries.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and BoringSSL's assembly behind it"
+    )]
+    #[test]
+    fn a_mixed_list_negotiates_a_tls12_suite() {
+        let mut identity = plain_identity();
+        identity.min_version = Some(0x0303);
+        identity.max_version = Some(0x0303);
+        identity.cipher_suites = vec![0xc009];
+        let ctx = crate::tls::legacy::server_context(&identity).expect("context");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accepts");
+                let ssl = boring::ssl::Ssl::new(&ctx).expect("ssl");
+                let mut server = ssl.accept(stream).expect("handshakes");
+                assert_eq!(
+                    server
+                        .ssl()
+                        .current_cipher()
+                        .map(boring::ssl::SslCipherRef::protocol_id),
+                    Some(0xc009),
+                    "the listener negotiated the mixed list's CBC id"
+                );
+                let mut buf = [0u8; 4];
+                server.read_exact(&mut buf).expect("reads");
+                server.write_all(&buf).expect("writes");
+                server.flush().expect("flushes");
+            });
+            let mut cfg = client("tls.test", &[]);
+            cfg.cipher_suites = crate::tls::cipher_suites::hello_ids(
+                &crate::tls::cipher_suites::parse(
+                    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+                ),
+                0x0303,
+                0x0304,
+                true,
+            )
+            .into();
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+            session.handshake().expect("handshakes");
+            session.write_all(b"ping").expect("writes");
+            session.flush().expect("flushes");
+            let mut buf = [0u8; 4];
+            session.read_exact(&mut buf).expect("reads");
+            assert_eq!(&buf, b"ping");
+        });
     }
 
     /// The dial's role: a list naming a CBC suite reaches a listener that admits only that suite.
@@ -4175,6 +4254,57 @@ mod tests {
             let mut buf = [0u8; 4];
             session.read_exact(&mut buf).expect("reads");
             assert_eq!(&buf, b"ping");
+        });
+    }
+
+    /// A named TLS 1.2-only list rides the legacy lane, and `enableSessionResumption` makes the
+    /// second dial reuse the session the first one stored.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and BoringSSL's assembly behind it"
+    )]
+    #[test]
+    fn a_legacy_dial_resumes_a_tls12_session() {
+        let mut identity = plain_identity();
+        identity.min_version = Some(0x0303);
+        identity.max_version = Some(0x0303);
+        identity.cipher_suites = vec![0xc02b];
+        let ctx = crate::tls::legacy::server_context(&identity).expect("context");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().expect("accepts");
+                    let ssl = boring::ssl::Ssl::new(&ctx).expect("ssl");
+                    let mut server = ssl.accept(stream).expect("handshakes");
+                    let mut buf = [0u8; 4];
+                    server.read_exact(&mut buf).expect("reads");
+                    server.write_all(&buf).expect("writes");
+                    server.flush().expect("flushes");
+                }
+            });
+            let mut cfg = client("tls.test", &[]);
+            cfg.cipher_suites = vec![0xc02b].into();
+            cfg.resumption = true;
+            let reused = |cfg: &TlsConfig| {
+                let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+                let mut session = crate::tls::connect(cfg, stream).expect("dials");
+                session.handshake().expect("handshakes");
+                session.write_all(b"ping").expect("writes");
+                session.flush().expect("flushes");
+                let mut buf = [0u8; 4];
+                session.read_exact(&mut buf).expect("reads");
+                match &session {
+                    crate::tls::ClientSession::Legacy(session) => session.session_reused(),
+                    _ => panic!("a named TLS 1.2-only list rides the legacy lane"),
+                }
+            };
+            assert!(!reused(&cfg), "the first dial had no session to offer");
+            assert!(
+                reused(&cfg),
+                "the second dial reused the first one's session"
+            );
         });
     }
 

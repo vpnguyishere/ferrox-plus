@@ -26,6 +26,7 @@ record-layer backends-a-differential-test-cannot-lie-to 6 ferrox-bench-gate-1
 
 # --- Shadowsocks AEAD -------------------------------------------------------
 shadowsocks ops-retired-instructions UNBLESSED scripts/count-ops.sh
+socks seconds-per-socks-dial UNBLESSED CI bench.yml (no socks cell yet)
 shadowsocks aead-calls-per-chunk 2 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks maximum-payload-per-chunk 16383 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks write-syscalls-per-64KiB-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
@@ -233,6 +234,7 @@ carrier-httpheader record-lane-segment-allocations-per-dial 0 ferrox-core-tls::r
 carrier-httpheader user-space-copies-per-byte-relayed 1 ferrox-app-proxy::tests::carried_streams_round_trip_behind_the_http_camouflage
 
 carrier-grpc ops-retired-instructions 73251 scripts/count-ops.sh
+carrier-grpc varint-write-probe-ops 102414 scripts/count-ops.sh
 carrier-grpc hunk-payload-bytes 16375 ferrox-app-grpc::tests::a_hunk_fits_the_frame_that_carries_it
 carrier-grpc user-space-copies-per-byte-written 0 ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer
 carrier-grpc writes-per-relay-read 1 ferrox-app-grpc::tests::a_relay_read_gathers_its_frames_into_one_write
@@ -280,6 +282,7 @@ carrier-xhttp write-slices-per-window 1 ferrox-app-xhttp::tests::one_window_is_o
 carrier-xhttp user-space-copies-per-byte-written 1 ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback
 carrier-xhttp read-window-copies 0 ferrox-app-xhttp::tests::a_body_window_is_the_readers_own_buffer
 carrier-xhttp h2-frame-window-copies 0 ferrox-app-xhttp_h2::tests::a_frame_window_is_the_readers_own_allocation
+carrier-xhttp session-upload-window-copies 0 ferrox-app-xhttp::tests::a_windowed_upload_reads_without_a_copy
 carrier-xhttp packet-window-copies 0 ferrox-app-xhttp::tests::a_packet_window_is_the_sessions_own_buffer
 carrier-xhttp chunk-bodies-per-window 8 ferrox-app-xhttp::tests::a_window_gathers_every_chunk_one_read_brought
 carrier-xhttp requests-served-per-connection 2 ferrox-app-xhttp::tests::one_connection_carries_the_packet_up_uplink
@@ -541,6 +544,7 @@ carrier-hysteria masquerade-static-answer-allocations 2 ferrox-app-hysteria::tes
 carrier-hysteria masquerade-proxied-round-trips 1 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_origin
 carrier-hysteria masquerade-escapes-served 0 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_path_that_escalates_the_directory
 carrier-hysteria hop-port-set-expanded 4 ferrox-core-hysteria::tests::the_plan_expands_overlapping_ranges_into_one_sorted_set
+carrier-hysteria hop-port-expansion-allocations 1 ferrox-core-hysteria::tests::every_plan_expands_to_the_bytes_the_contains_scan_wrote
 carrier-hysteria hop-config-forms-parsed 2 ferrox-app-config::tests::a_hysteria_carrier_reads_a_port_hopping_plan
 carrier-hysteria hop-plan-pool-keys 2 ferrox-app-hysteria::tests::a_hop_plan_is_its_own_pool_key
 carrier-hysteria hopped-datagrams-delivered 200 ferrox-app-quic::tests::a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port
@@ -563,12 +567,15 @@ tls-cipher-suites cipher-suite-ids-reachable-by-neither 5 ferrox-core-tls::rustl
 tls-cipher-suites dialer-hello-cipher-field-equals-reference 1 ferrox-core-tls::rustls_backend::tests::a_crafted_list_reorders_the_dialer_hello_to_the_reference
 tls-cipher-suites tls12-list-ids-equal-reference-in-order 1 ferrox-core-tls::rustls_backend::tests::a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire
 tls-cipher-suites tls12-suite-negotiated-by-the-dialer 1 ferrox-core-tls::rustls_backend::tests::a_tls12_dial_negotiates_the_configured_suite
+tls-cipher-suites mixed-list-dialer-field-equals-reference 1 ferrox-core-tls::rustls_backend::tests::a_mixed_list_keeps_the_reference_order_on_the_wire
+tls-cipher-suites mixed-list-negotiated-by-the-dialer 1 ferrox-core-tls::rustls_backend::tests::a_mixed_list_negotiates_a_tls12_suite
 tls-cipher-suites tls12-suite-negotiated-by-the-listener 1 ferrox-core-tls::rustls_backend::tests::a_tls_floor_and_suite_reach_the_negotiation
 tls-cipher-suites shaped-listener-negotiates-the-five-unreachable-ids 5 ferrox-core-tls::rustls_backend::tests::a_shaped_listener_serves_the_five_ids_neither_backend_has
 tls-cipher-suites mixed-max-hellos-routed-by-the-peek 2 ferrox-core-tls::rustls_backend::tests::a_mixed_max_listener_peeks_the_hello_before_choosing_an_engine
 tls-cipher-suites legacy-dial-tls12-ids-equal-reference-in-order 1 ferrox-core-tls::rustls_backend::tests::a_legacy_dial_offers_the_reference_cipher_ids_in_order
 tls-cipher-suites legacy-cbc-suite-negotiated-by-the-dialer 1 ferrox-core-tls::rustls_backend::tests::a_legacy_dial_negotiates_a_cbc_suite
 tls-cipher-suites legacy-static-rsa-suite-negotiated-by-the-listener 1 ferrox-core-tls::rustls_backend::tests::a_legacy_listener_negotiates_static_rsa
+tls-cipher-suites legacy-tls12-session-resumed 1 ferrox-core-tls::rustls_backend::tests::a_legacy_dial_resumes_a_tls12_session
 tls-cipher-suites config-key-heap-buffers-per-dial 0 ferrox-core-tls::rustls_backend::tests::a_repeat_dial_keys_the_config_without_copying_the_suite_order
 
 # --- uTLS-shaped ClientHello (matrix row 38) --------------------------------
@@ -682,6 +689,7 @@ http-proxy connect-grant-allocations 0 ferrox-app-proxy::tests::a_connect_grant_
 http-proxy connect-request-allocations 0 ferrox-app-proxy::tests::the_connect_request_builds_in_one_buffer
 http-proxy forwarded-head-allocations 0 ferrox-app-proxy::tests::an_origin_form_head_reaches_the_uplink_where_it_landed
 http-proxy forwarded-head-copies 0 ferrox-app-proxy::tests::a_forwarded_head_is_the_head_that_was_read
+http-proxy pb-client-endpoints-decoded 1 ferrox-app-xray_pb::tests::a_socks_http_fallback_scenario_decodes_both_sides
 
 # --- Routing rules and geosite/geoip -----------------------------------------
 engine-router ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -703,6 +711,7 @@ engine-router dns-lookups-ip-on-demand-source-failed 0 ferrox-app-router::tests:
 
 # --- SOCKS5, both roles ------------------------------------------------------
 socks ops-retired-instructions UNBLESSED scripts/count-ops.sh
+socks seconds-per-socks-dial UNBLESSED CI bench.yml (no socks cell yet)
 socks oracle-lines-matching-the-pinned-go 8 ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
 socks methods-offered-in-the-greeting 1 ferrox-core-socks::tests::the_greeting_is_the_bytes_the_pinned_writer_writes
 socks request-bytes-per-tcp-dial 10 ferrox-core-socks::tests::the_request_is_the_bytes_the_pinned_writer_writes
@@ -740,6 +749,8 @@ socks socks5-long-connect-allocations 0 ferrox-app-socks::tests::a_long_destinat
 socks socks5-long-connect-read-calls 4 ferrox-app-socks::tests::a_long_destination_and_a_long_bound_name_take_no_heap_buffer
 socks socks4-requests-a-credential-front-refuses 1 ferrox-app-proxy::tests::a_front_that_asks_for_a_credential_refuses_a_socks4_request
 socks socks4-xray-scenario-tests-passing 1 scripts/run-upstream-suite.sh
+socks http-fallback-requests-served 1 ferrox-app-proxy::tests::a_socks_front_serves_an_http_outbound_that_offers_its_account
+socks http-fallback-scenario-tests-passing 1 scripts/run-upstream-suite.sh
 
 # --- dokodemo-door transparent inbound -----------------------------------------
 front-dokodemo ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -822,12 +833,14 @@ tls-client ops-retired-instructions UNBLESSED scripts/count-ops.sh
 tls-client syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
 tls-client relay-staging-copies-per-byte UNBLESSED not measured
 tls-client seconds-per-relayed-megabyte UNBLESSED .github/workflows/bench.yml
-tls-client socks-tls-carriers-parsed 6 ferrox-app-proxy::tests::socks_tls_outbound_parses_diallable_carriers
-tls-client http-tls-carriers-parsed 6 ferrox-app-proxy::tests::http_tls_outbound_parses_diallable_carriers
+tls-client socks-tls-carriers-parsed 7 ferrox-app-proxy::tests::socks_tls_outbound_parses_diallable_carriers
+tls-client http-tls-carriers-parsed 7 ferrox-app-proxy::tests::http_tls_outbound_parses_diallable_carriers
 tls-client socks-tls-raw-echo-round-trips 1 ferrox-app-proxy::tests::socks_tls_over_raw_reaches_echo
 tls-client socks-tls-ws-echo-round-trips 1 ferrox-app-proxy::tests::socks_tls_over_ws_reaches_echo
+tls-client socks-tls-kcp-echo-round-trips 1 ferrox-app-proxy::tests::socks_tls_over_kcp_reaches_echo
 tls-client http-tls-raw-echo-round-trips 1 ferrox-app-proxy::tests::http_tls_over_raw_reaches_echo
 tls-client http-tls-ws-echo-round-trips 1 ferrox-app-proxy::tests::http_tls_over_ws_reaches_echo
+tls-client http-tls-kcp-echo-round-trips 1 ferrox-app-proxy::tests::http_tls_over_kcp_reaches_echo
 
 # --- Commander gRPC management API ----------------------------------------
 engine-api ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -908,6 +921,9 @@ carrier-psiphon ops-per-ssh-handshake UNBLESSED scripts/count-ops.sh
 carrier-psiphon syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
 carrier-psiphon relay-staging-copies-per-byte UNBLESSED not measured
 carrier-psiphon download-staging-copies-per-byte 0 ferrox-app-psiphon-ssh::tests::a_channel_chunk_is_the_packet_allocation
+carrier-psiphon ss-vectored-write-extra-buffers 0 ferrox-app-psiphon-shadowsocks::tests::a_vectored_write_allocates_only_the_wire_buffer
 carrier-psiphon flow-clone-allocations 0 ferrox-app-psiphon::tests::a_flow_clone_shares_the_credential_words
+carrier-psiphon ss-direct-write-probe-ops 47483770 scripts/count-ops.sh
+carrier-psiphon ss-flatten-write-probe-ops 47621538 scripts/count-ops.sh
 carrier-psiphon quic-varint-probe-ops 131079 scripts/count-ops.sh
 carrier-psiphon seconds-per-live-transfer UNBLESSED .github/workflows/psiphon-live.yml

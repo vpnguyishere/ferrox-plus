@@ -2050,11 +2050,13 @@ impl Hopper {
     /// before the schedule ever moves. The port and stay are drawn up front.
     fn open(
         server: SocketAddr,
-        ports: Vec<u16>,
+        mut ports: Vec<u16>,
         interval_ms: (u64, u64),
         bind: &'static str,
         first: &UdpSocket,
     ) -> std::io::Result<Self> {
+        ports.sort_unstable();
+        ports.dedup();
         let anchor = Arc::new(first.try_clone()?);
         let current = Arc::clone(&anchor);
         let port = ferrox_core::hysteria::pick_next(&ports, server.port(), entropy() as usize);

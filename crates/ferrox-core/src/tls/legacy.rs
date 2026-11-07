@@ -9,7 +9,7 @@
 use super::{MasterKeyLog, Stream, TlsConfig, TlsError, TlsProvider, TlsServerConfig};
 use boring::ssl::{
     HandshakeError, MidHandshakeSslStream, Ssl, SslContext, SslContextBuilder, SslMethod,
-    SslStream, SslVerifyMode, SslVersion,
+    SslSession, SslStream, SslVerifyMode, SslVersion,
 };
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -42,6 +42,15 @@ pub(crate) fn suite_name(id: u16) -> Option<&'static str> {
 pub(crate) fn needed(ids: &[u16]) -> bool {
     ids.iter()
         .any(|&id| suite_name(id).is_some() && !super::rustls_backend::carries(id))
+}
+
+/// Whether a dial must take this lane: a named TLS 1.2-only list writes the reference's field
+/// without rustls's SCSV, and this lane keeps the session cache `enableSessionResumption` asks for.
+pub(crate) fn dial_needed(ids: &[u16]) -> bool {
+    (!ids.is_empty()
+        && super::cipher_suites::offers_tls12(ids)
+        && !super::cipher_suites::offers_tls13(ids))
+        || needed(ids)
 }
 
 /// The cipher names for a config's list, in its order. Names `BoringSSL` cannot parse are skipped
@@ -118,12 +127,25 @@ fn error_stack(error: &boring::error::ErrorStack) -> TlsError {
 /// What selects a cached client context: the same material a rustls build keys on (anchors, pins,
 /// suite order, curves) plus the host the verify callback captures, the `ALPN` list, the client
 /// identity and the key-log handle.
+#[derive(Clone)]
 struct Key {
     material: super::rustls_backend::MaterialKey,
     server_name: String,
     alpn: Arc<[Vec<u8>]>,
     client_cert: Option<Arc<super::CertEntry>>,
     master_key_log: Option<Arc<MasterKeyLog>>,
+}
+
+/// The same inputs a context is cached under, so a stored session is only offered to the context
+/// that minted it.
+fn key(cfg: &TlsConfig) -> Key {
+    Key {
+        material: super::rustls_backend::MaterialKey::of(cfg),
+        server_name: cfg.server_name.clone(),
+        alpn: Arc::clone(&cfg.alpn),
+        client_cert: cfg.client_cert.clone(),
+        master_key_log: cfg.master_key_log.clone(),
+    }
 }
 
 impl PartialEq for Key {
@@ -152,16 +174,39 @@ static CONTEXTS: OnceLock<Mutex<Contexts>> = OnceLock::new();
 
 const CONTEXTS_MAX: usize = 32;
 
+type Sessions = Vec<(Key, SslSession)>;
+
+static SESSIONS: OnceLock<Mutex<Sessions>> = OnceLock::new();
+
+const SESSIONS_MAX: usize = 32;
+
+/// The session a prior dial to this key left, moved to the back so the cap drops the coldest.
+fn take_session(key: &Key) -> Option<SslSession> {
+    let all = SESSIONS.get_or_init(Default::default);
+    let mut kept = all.lock().expect("one session at a time");
+    let at = kept.iter().position(|(stored, _)| stored == key)?;
+    let entry = kept.remove(at);
+    let hit = entry.1.clone();
+    kept.push(entry);
+    Some(hit)
+}
+
+/// Keeps the session a completed handshake minted, replacing the key's older one.
+fn keep_session(key: &Key, session: SslSession) {
+    let all = SESSIONS.get_or_init(Default::default);
+    let mut kept = all.lock().expect("one session at a time");
+    if let Some(at) = kept.iter().position(|(stored, _)| stored == key) {
+        kept.remove(at);
+    } else if kept.len() == SESSIONS_MAX {
+        kept.remove(0);
+    }
+    kept.push((key.clone(), session));
+}
+
 /// The `BoringSSL` context a legacy dial builds its hello from, cached per input set because
 /// `BoringSSL` parses every trust anchor when a context is built.
 fn context(cfg: &TlsConfig) -> Result<Arc<SslContext>, TlsError> {
-    let key = Key {
-        material: super::rustls_backend::MaterialKey::of(cfg),
-        server_name: cfg.server_name.clone(),
-        alpn: Arc::clone(&cfg.alpn),
-        client_cert: cfg.client_cert.clone(),
-        master_key_log: cfg.master_key_log.clone(),
-    };
+    let key = key(cfg);
     let all = CONTEXTS.get_or_init(Default::default);
     let mut kept = all.lock().expect("one build at a time");
     if let Some(at) = kept.iter().position(|(stored, _)| *stored == key) {
@@ -296,6 +341,9 @@ pub(crate) fn server_context(cfg: &TlsServerConfig) -> Result<Arc<SslContext>, T
     builder
         .set_cipher_list(&cipher_list(&cfg.cipher_suites))
         .map_err(|e| error_stack(&e))?;
+    builder
+        .set_session_id_context(b"ferrox-legacy")
+        .map_err(|e| error_stack(&e))?;
     let built = Arc::new(builder.build());
     guard.legacy = Some((served, Arc::clone(&built)));
     Ok(built)
@@ -308,6 +356,7 @@ pub struct Session<S: Stream> {
     stream: Option<SslStream<S>>,
     leaf: Vec<u8>,
     suites: Vec<u16>,
+    resume: Option<Key>,
     eof: bool,
     failure: Option<String>,
 }
@@ -326,6 +375,11 @@ impl<S: Stream> Session<S> {
     pub fn connect(cfg: &TlsConfig, io: S) -> Result<Self, TlsError> {
         let ctx = context(cfg)?;
         let mut ssl = Ssl::new(&ctx).map_err(|e| error_stack(&e))?;
+        let resume = cfg.resumption.then(|| key(cfg));
+        if let Some(session) = resume.as_ref().and_then(take_session) {
+            // SAFETY: the session and the context are keyed by the same inputs, so the context minted it.
+            unsafe { ssl.set_session(&session) }.map_err(|e| error_stack(&e))?;
+        }
         // A literal address names no virtual host, so it reaches the transport without SNI.
         if rustls::pki_types::ServerName::try_from(cfg.server_name.clone())
             .is_ok_and(|name| matches!(name, rustls::pki_types::ServerName::DnsName(_)))
@@ -338,6 +392,7 @@ impl<S: Stream> Session<S> {
             stream: None,
             leaf: Vec::new(),
             suites: cfg.cipher_suites.to_vec(),
+            resume,
             eof: false,
             failure: None,
         })
@@ -349,6 +404,14 @@ impl<S: Stream> Session<S> {
             (None, Some(handshake)) => handshake.get_ref(),
             (None, None) => unreachable!("a session holds its transport until it is dropped"),
         }
+    }
+
+    /// Whether the last handshake rode the session the same key stored.
+    #[cfg(test)]
+    pub(crate) fn session_reused(&self) -> bool {
+        self.stream
+            .as_ref()
+            .is_some_and(|stream| stream.ssl().session_reused())
     }
 
     fn stream(&mut self) -> std::io::Result<&mut SslStream<S>> {
@@ -387,6 +450,11 @@ impl<S: Stream> TlsProvider for Session<S> {
                     .peer_certificate()
                     .and_then(|cert| cert.to_der().ok())
                     .unwrap_or_default();
+                if let Some(key) = &self.resume {
+                    if let Some(session) = done.ssl().session() {
+                        keep_session(key, session.to_owned());
+                    }
+                }
                 self.stream = Some(done);
                 Ok(())
             }

@@ -19,6 +19,20 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// Write a chunk's sealed length and tag, returning where its body starts.
+#[inline]
+fn seal_head(wire: &mut Vec<u8>, cipher: &mut Cipher, len: usize) -> io::Result<usize> {
+    let mut length = u16::try_from(len)
+        .map_err(|_| invalid("shadowsocks chunk"))?
+        .to_be_bytes();
+    let tag = cipher
+        .seal_piece_in_place(&mut length)
+        .ok_or_else(|| invalid("shadowsocks length seal"))?;
+    wire.extend_from_slice(&length);
+    wire.extend_from_slice(&tag);
+    Ok(wire.len())
+}
+
 struct Reader {
     master: MasterKey,
     cipher: Option<Cipher>,
@@ -166,7 +180,6 @@ struct Writer {
     cipher: Option<Cipher>,
     prefix: Vec<u8>,
     wire: Vec<u8>,
-    plain: Vec<u8>,
     failed: bool,
 }
 
@@ -177,7 +190,6 @@ impl Writer {
             cipher: None,
             prefix: prefix.to_vec(),
             wire: Vec::new(),
-            plain: Vec::new(),
             failed: false,
         }
     }
@@ -200,44 +212,82 @@ impl Writer {
     }
 
     fn write(&mut self, io: &mut impl Write, buf: &[u8]) -> io::Result<()> {
+        self.write_slices(io, &[IoSlice::new(buf)]).map(|_| ())
+    }
+
+    /// Seal the caller's slices in one wire write.
+    fn write_vectored(&mut self, io: &mut impl Write, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        self.write_slices(io, bufs)
+    }
+
+    /// Seal the slices and latch a failure so later writes fail.
+    fn write_slices(&mut self, io: &mut impl Write, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         if self.failed {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "shadowsocks write failed",
             ));
         }
-        let result = self.write_frames(io, buf);
+        let result = self.seal_slices(io, bufs);
         if result.is_err() {
             self.failed = true;
         }
         result
     }
 
-    fn write_frames(&mut self, io: &mut impl Write, buf: &[u8]) -> io::Result<()> {
+    /// Seal the concatenated slices as the same `MAX_CHUNK` frames the contiguous
+    /// writer makes, taking each chunk's bytes straight from the caller's buffers.
+    fn seal_slices(&mut self, io: &mut impl Write, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         self.start(io)?;
         let cipher = self
             .cipher
             .as_mut()
             .ok_or_else(|| invalid("shadowsocks cipher"))?;
+        let total: usize = bufs.iter().map(|buf| buf.len()).sum();
         self.wire.clear();
         self.wire
-            .reserve(buf.len() + (buf.len() / MAX_CHUNK + 1) * HEAD_LEN);
-        for chunk in buf.chunks(MAX_CHUNK) {
-            let mut length = u16::try_from(chunk.len())
-                .map_err(|_| invalid("shadowsocks chunk"))?
-                .to_be_bytes();
-            let tag = cipher
-                .seal_piece_in_place(&mut length)
-                .ok_or_else(|| invalid("shadowsocks length seal"))?;
-            self.wire.extend_from_slice(&length);
-            self.wire.extend_from_slice(&tag);
-            let at = self.wire.len();
-            self.wire.extend_from_slice(chunk);
-            cipher
-                .seal_tail_in_place(&mut self.wire, at)
-                .ok_or_else(|| invalid("shadowsocks body seal"))?;
+            .reserve(total + (total / MAX_CHUNK + 1) * HEAD_LEN);
+        if total == 0 {
+            io.write_all(&self.wire)?;
+            return Ok(0);
         }
-        io.write_all(&self.wire)
+        if total <= MAX_CHUNK {
+            let body = seal_head(&mut self.wire, cipher, total)?;
+            for buffer in bufs {
+                self.wire.extend_from_slice(buffer);
+            }
+            cipher
+                .seal_tail_in_place(&mut self.wire, body)
+                .ok_or_else(|| invalid("shadowsocks body seal"))?;
+            io.write_all(&self.wire)?;
+            return Ok(total);
+        }
+        let mut left = total;
+        let mut index = 0;
+        let mut at = 0;
+        while left > 0 {
+            let chunk = left.min(MAX_CHUNK);
+            let body = seal_head(&mut self.wire, cipher, chunk)?;
+            let mut need = chunk;
+            while need > 0 {
+                let buffer = &bufs[index];
+                if at == buffer.len() {
+                    index += 1;
+                    at = 0;
+                    continue;
+                }
+                let take = need.min(buffer.len() - at);
+                self.wire.extend_from_slice(&buffer[at..at + take]);
+                at += take;
+                need -= take;
+            }
+            cipher
+                .seal_tail_in_place(&mut self.wire, body)
+                .ok_or_else(|| invalid("shadowsocks body seal"))?;
+            left -= chunk;
+        }
+        io.write_all(&self.wire)?;
+        Ok(total)
     }
 }
 
@@ -264,6 +314,7 @@ impl Stream<TcpStream> {
         Self::new(io, key, prefix.unwrap_or_default())
     }
 
+    /// Clone the underlying stream.
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
             io: self.io.try_clone()?,
@@ -272,18 +323,58 @@ impl Stream<TcpStream> {
         })
     }
 
+    /// Forward the timeout to the underlying stream.
     pub(crate) fn set_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.io
             .set_read_timeout(timeout)
             .and_then(|()| self.io.set_write_timeout(timeout))
     }
 
+    /// Forward the read timeout to the underlying stream.
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.io.set_read_timeout(timeout)
     }
 
+    /// Shut down the underlying stream.
     pub(crate) fn shutdown(&self) -> io::Result<()> {
         self.io.shutdown(Shutdown::Both)
+    }
+}
+
+impl Stream<crate::psiphon_fragment::FragmentStream> {
+    /// Dial through the proxy and fragment the first writes beneath it.
+    pub(crate) fn connect_fragment(
+        io: crate::psiphon_fragment::FragmentStream,
+        key: &str,
+        prefix: Option<&[u8]>,
+    ) -> Self {
+        Self::new(io, key, prefix.unwrap_or_default())
+    }
+
+    /// Clone the underlying stream and its fragment plan.
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            io: self.io.try_clone()?,
+            reader: Arc::clone(&self.reader),
+            writer: Arc::clone(&self.writer),
+        })
+    }
+
+    /// Forward the timeout to the underlying stream.
+    pub(crate) fn set_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.io
+            .set_read_timeout(timeout)
+            .and_then(|()| self.io.set_write_timeout(timeout))
+    }
+
+    /// Forward the read timeout to the underlying stream.
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.io.set_read_timeout(timeout)
+    }
+
+    /// Shut down the underlying stream.
+    pub(crate) fn shutdown(&self) -> io::Result<()> {
+        self.io.shutdown(std::net::Shutdown::Both)
     }
 }
 
@@ -334,16 +425,7 @@ impl<T: Read + Write> Write for Stream<T> {
         if total == 0 {
             return Ok(0);
         }
-        let mut writer = lock(&self.writer);
-        let mut plain = std::mem::take(&mut writer.plain);
-        plain.clear();
-        for buf in bufs {
-            plain.extend_from_slice(buf);
-        }
-        let result = writer.write(&mut self.io, &plain);
-        writer.plain = plain;
-        result?;
-        Ok(total)
+        lock(&self.writer).write_vectored(&mut self.io, bufs)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -444,6 +526,155 @@ mod tests {
             reader.read(&mut got).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
+    }
+
+    /// A writer whose salt is fixed, so two writes can be compared byte for byte.
+    fn sealed_writer(key: &str) -> Writer {
+        let mut writer = Writer::new(key, &[]);
+        let cipher =
+            Cipher::from_master_key(METHOD, &writer.master, &[0x42; SALT_LEN]).expect("cipher");
+        writer.cipher = Some(cipher);
+        writer
+    }
+
+    #[test]
+    fn vectored_frames_are_the_contiguous_frames() {
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let payload: Vec<u8> = (0..=255u8).cycle().take(MAX_CHUNK * 2 + 17).collect();
+        let mut contiguous = sealed_writer(key);
+        let mut sink = Wire {
+            input: Vec::new(),
+            at: 0,
+            output: Vec::new(),
+        };
+        contiguous
+            .write_slices(&mut sink, &[IoSlice::new(&payload)])
+            .expect("writes");
+        let expected = sink.output;
+        for cut in [
+            0,
+            1,
+            HEAD_LEN,
+            MAX_CHUNK - 1,
+            MAX_CHUNK,
+            MAX_CHUNK + 1,
+            payload.len() - 1,
+        ] {
+            let parts = [IoSlice::new(&payload[..cut]), IoSlice::new(&payload[cut..])];
+            let mut writer = sealed_writer(key);
+            let mut sink = Wire {
+                input: Vec::new(),
+                at: 0,
+                output: Vec::new(),
+            };
+            writer.write_slices(&mut sink, &parts).expect("writes");
+            assert_eq!(sink.output, expected, "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn a_vectored_write_allocates_only_the_wire_buffer() {
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let payload = vec![0x5a; MAX_CHUNK * 2 + 17];
+        let ((), contiguous) = ferrox_core::alloc_count::measure(|| {
+            let mut writer = sealed_writer(key);
+            let mut sink = Wire {
+                input: Vec::new(),
+                at: 0,
+                output: Vec::new(),
+            };
+            writer
+                .write_slices(&mut sink, &[IoSlice::new(&payload)])
+                .expect("writes");
+        });
+        let ((), vectored) = ferrox_core::alloc_count::measure(|| {
+            let mut writer = sealed_writer(key);
+            let mut sink = Wire {
+                input: Vec::new(),
+                at: 0,
+                output: Vec::new(),
+            };
+            let parts = [
+                IoSlice::new(&payload[..3]),
+                IoSlice::new(&payload[3..MAX_CHUNK + 5]),
+                IoSlice::new(&payload[MAX_CHUNK + 5..]),
+            ];
+            writer.write_slices(&mut sink, &parts).expect("writes");
+        });
+        assert_eq!(
+            (vectored.allocs, vectored.bytes),
+            (contiguous.allocs, contiguous.bytes),
+            "a vectored write reserves only the wire buffer the contiguous one reserves"
+        );
+    }
+
+    struct Discard(usize);
+
+    impl Write for Discard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const PROBE_HEAD: [u8; 14] = [0x11; 14];
+    const PROBE_BODY: [u8; 1024] = [0x22; 1024];
+    const PROBE_PAD: [u8; 16] = [0x33; 16];
+    const PROBE_TAG: [u8; 32] = [0x44; 32];
+
+    #[inline(never)]
+    fn direct_write_probe() -> usize {
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut writer = sealed_writer(key);
+        let mut sink = Discard(0);
+        let slices = [
+            IoSlice::new(&PROBE_HEAD),
+            IoSlice::new(&PROBE_BODY),
+            IoSlice::new(&PROBE_PAD),
+            IoSlice::new(&PROBE_TAG),
+        ];
+        for _ in 0..4096 {
+            writer.write_slices(&mut sink, &slices).expect("writes");
+        }
+        sink.0
+    }
+
+    #[inline(never)]
+    fn flattened_write_probe() -> usize {
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut writer = sealed_writer(key);
+        let mut sink = Discard(0);
+        let slices = [
+            IoSlice::new(&PROBE_HEAD),
+            IoSlice::new(&PROBE_BODY),
+            IoSlice::new(&PROBE_PAD),
+            IoSlice::new(&PROBE_TAG),
+        ];
+        let mut plain = Vec::new();
+        for _ in 0..4096 {
+            plain.clear();
+            for slice in &slices {
+                plain.extend_from_slice(slice);
+            }
+            writer
+                .write_slices(&mut sink, &[IoSlice::new(&plain)])
+                .expect("writes");
+        }
+        sink.0
+    }
+
+    #[test]
+    fn the_direct_write_costs_the_seal_and_nothing_else() {
+        assert!(direct_write_probe() > 0);
+    }
+
+    #[test]
+    fn the_flattened_write_costs_the_copy() {
+        assert!(flattened_write_probe() > 0);
     }
 
     #[test]

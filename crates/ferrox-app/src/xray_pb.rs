@@ -277,6 +277,10 @@ pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
             ("protocol", Json::Str("socks".to_owned())),
             ("settings", socks_outbound_settings(value)?),
         ],
+        "xray.proxy.http.ClientConfig" => vec![
+            ("protocol", Json::Str("http".to_owned())),
+            ("settings", http_outbound_settings(value)?),
+        ],
         "xray.proxy.blackhole.Config" => {
             let settings = blackhole_settings(value)?;
             let mut pairs = vec![("protocol", Json::Str("blackhole".to_owned()))];
@@ -3660,11 +3664,48 @@ fn socks_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut server = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 2) => server = Some(socks_server_endpoint(reader.bytes()?)?),
+            (1, 2) => {
+                server = Some(credential_endpoint(
+                    reader.bytes()?,
+                    "xray.proxy.socks.Account",
+                )?);
+            }
             _ => return Err(reader.refuse(field, wire)),
         }
     }
     let (address, port, credential) = server.ok_or("xray.proxy.socks.ClientConfig: no server")?;
+    Ok(client_servers(address, port, credential, Vec::new()))
+}
+
+/// A http client dials the one endpoint its config names, with the credential and the
+/// headers it names.
+fn http_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.http.ClientConfig");
+    let mut server = None;
+    let mut headers = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                server = Some(credential_endpoint(
+                    reader.bytes()?,
+                    "xray.proxy.http.Account",
+                )?);
+            }
+            (2, 2) => headers.push(http_header(reader.bytes()?)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let (address, port, credential) = server.ok_or("xray.proxy.http.ClientConfig: no server")?;
+    Ok(client_servers(address, port, credential, headers))
+}
+
+/// One client endpoint as the JSON `servers` entry the tree's hops read.
+fn client_servers(
+    address: String,
+    port: u16,
+    credential: Option<(String, String)>,
+    headers: Vec<Json>,
+) -> Json {
     let mut users = Vec::new();
     if let Some((user, pass)) = credential {
         users.push(object(vec![
@@ -3672,24 +3713,50 @@ fn socks_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
             ("pass", Json::Str(pass)),
         ]));
     }
-    Ok(object(vec![(
-        "servers",
-        Json::Arr(vec![object(vec![
-            ("address", Json::Str(address)),
-            ("port", Json::Num(f64::from(port))),
-            ("users", Json::Arr(users)),
-        ])]),
-    )]))
+    let mut server = vec![
+        ("address", Json::Str(address)),
+        ("port", Json::Num(f64::from(port))),
+        ("users", Json::Arr(users)),
+    ];
+    if !headers.is_empty() {
+        server.push(("headers", Json::Arr(headers)));
+    }
+    object(vec![("servers", Json::Arr(vec![object(server)]))])
 }
 
-/// The endpoint a socks client dials: the address, the port, and the credential when
-/// the config names one.
-type SocksEndpoint = (String, u16, Option<(String, String)>);
+/// One `xray.proxy.http.Header` as the JSON field the hop writes.
+fn http_header(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.http.Header");
+    let mut key = None;
+    let mut value = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => key = Some(account_text(&mut reader)?),
+            (2, 2) => value = Some(account_text(&mut reader)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(object(vec![
+        (
+            "key",
+            Json::Str(key.ok_or("xray.proxy.http.Header: no key")?),
+        ),
+        (
+            "value",
+            Json::Str(value.ok_or("xray.proxy.http.Header: no value")?),
+        ),
+    ]))
+}
 
-/// `common.protocol.ServerEndpoint` for the socks client: the address, the port, and
-/// the credential when the config names one. A socks client may name no credential —
-/// the greeting then offers no authentication.
-fn socks_server_endpoint(bytes: &[u8]) -> Result<SocksEndpoint, String> {
+/// The endpoint a client dials: the address, the port, and the credential when the
+/// config names one.
+type ClientEndpoint = (String, u16, Option<(String, String)>);
+
+/// `common.protocol.ServerEndpoint` for a client whose account is `kind`: the address,
+/// the port, and the credential when the config names one. A client may name no
+/// credential — a socks greeting then offers no authentication and a CONNECT carries
+/// none.
+fn credential_endpoint(bytes: &[u8], kind: &'static str) -> Result<ClientEndpoint, String> {
     let mut reader = Reader::new(bytes, "xray.common.protocol.ServerEndpoint");
     let mut address = None;
     let mut port = None;
@@ -3703,7 +3770,7 @@ fn socks_server_endpoint(bytes: &[u8]) -> Result<SocksEndpoint, String> {
                     format!("xray.common.protocol.ServerEndpoint: port {value} is above 65535")
                 })?);
             }
-            (3, 2) => credential = Some(socks_user(reader.bytes()?)?),
+            (3, 2) => credential = Some(credential_user(reader.bytes()?, kind)?),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
@@ -3714,9 +3781,9 @@ fn socks_server_endpoint(bytes: &[u8]) -> Result<SocksEndpoint, String> {
     ))
 }
 
-/// A `common.protocol.User` whose account is a socks one; level and email feed the
-/// policy and the stats nothing here reads.
-fn socks_user(bytes: &[u8]) -> Result<(String, String), String> {
+/// A `common.protocol.User` whose account is `kind`; level and email feed the policy
+/// and the stats nothing here reads.
+fn credential_user(bytes: &[u8], kind: &'static str) -> Result<(String, String), String> {
     let mut reader = Reader::new(bytes, "xray.common.protocol.User");
     let mut account = None;
     while let Some((field, wire)) = reader.field()? {
@@ -3725,10 +3792,10 @@ fn socks_user(bytes: &[u8]) -> Result<(String, String), String> {
             (2, 2) => return Err(reader.uncarried("user email")),
             (3, 2) => {
                 let (name, value) = typed_message(reader.bytes()?)?;
-                if name != "xray.proxy.socks.Account" {
-                    return Err(format!("socks account `{name}` is not carried"));
+                if name != kind {
+                    return Err(format!("account `{name}` is not carried as `{kind}`"));
                 }
-                account = Some(socks_account(value)?);
+                account = Some(credential_account(value, kind)?);
             }
             _ => return Err(reader.refuse(field, wire)),
         }
@@ -3736,9 +3803,9 @@ fn socks_user(bytes: &[u8]) -> Result<(String, String), String> {
     account.ok_or("xray.common.protocol.User: no account".to_owned())
 }
 
-/// The socks account: the name and the password the RFC 1929 exchange carries.
-fn socks_account(bytes: &[u8]) -> Result<(String, String), String> {
-    let mut reader = Reader::new(bytes, "xray.proxy.socks.Account");
+/// The name and the password an HTTP or SOCKS account carries.
+fn credential_account(bytes: &[u8], kind: &'static str) -> Result<(String, String), String> {
+    let mut reader = Reader::new(bytes, kind);
     let mut user = None;
     let mut pass = None;
     while let Some((field, wire)) = reader.field()? {
@@ -3749,8 +3816,8 @@ fn socks_account(bytes: &[u8]) -> Result<(String, String), String> {
         }
     }
     Ok((
-        user.ok_or("xray.proxy.socks.Account: no username")?,
-        pass.ok_or("xray.proxy.socks.Account: no password")?,
+        user.ok_or_else(|| format!("{kind}: no username"))?,
+        pass.ok_or_else(|| format!("{kind}: no password"))?,
     ))
 }
 
@@ -6607,6 +6674,17 @@ mod tests {
         bytes_field(3, account)
     }
 
+    fn http_account(user: &[u8], pass: &[u8]) -> Vec<u8> {
+        typed(
+            "xray.proxy.http.Account",
+            &message(&[bytes_field(1, user), bytes_field(2, pass)]),
+        )
+    }
+
+    fn http_user(account: &[u8]) -> Vec<u8> {
+        bytes_field(3, account)
+    }
+
     fn socks_inbound(port: u64, auth_type: u64, accounts: &[(&[u8], &[u8])]) -> Vec<u8> {
         let mut settings = vec![varint_field(1, auth_type)];
         for (user, pass) in accounts {
@@ -6699,6 +6777,76 @@ mod tests {
             user.get("pass").and_then(Json::as_str),
             Some("Test Password")
         );
+    }
+
+    /// The shape `TestSocksWithHttpRequest` names: a socks server that asks for a
+    /// password, and a http client whose CONNECT offers it.
+    #[test]
+    fn a_socks_http_fallback_scenario_decodes_both_sides() {
+        let outbound = message(&[bytes_field(
+            3,
+            &typed(
+                "xray.proxy.http.ClientConfig",
+                &message(&[
+                    bytes_field(
+                        1,
+                        &message(&[
+                            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+                            varint_field(2, 5001),
+                            bytes_field(
+                                3,
+                                &http_user(&http_account(b"Test Account", b"Test Password")),
+                            ),
+                        ]),
+                    ),
+                    bytes_field(
+                        2,
+                        &message(&[bytes_field(1, b"X-Test"), bytes_field(2, b"one")]),
+                    ),
+                ]),
+            ),
+        )]);
+        let json = to_json(&config(
+            &socks_inbound(5000, 1, &[(b"Test Account", b"Test Password")]),
+            &outbound,
+        ))
+        .expect("the socks front and its http client decode");
+        let server = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0];
+        assert_eq!(server.get("protocol").and_then(Json::as_str), Some("socks"));
+        let client = &json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0];
+        assert_eq!(client.get("protocol").and_then(Json::as_str), Some("http"));
+        let endpoint = &client
+            .get("settings")
+            .expect("settings")
+            .get("servers")
+            .and_then(Json::as_arr)
+            .expect("servers")[0];
+        assert_eq!(
+            endpoint.get("address").and_then(Json::as_str),
+            Some("127.0.0.1")
+        );
+        assert_eq!(endpoint.get("port").and_then(Json::as_port), Some(5001));
+        let user = &endpoint.get("users").and_then(Json::as_arr).expect("users")[0];
+        assert_eq!(
+            user.get("user").and_then(Json::as_str),
+            Some("Test Account")
+        );
+        assert_eq!(
+            user.get("pass").and_then(Json::as_str),
+            Some("Test Password")
+        );
+        let header = &endpoint
+            .get("headers")
+            .and_then(Json::as_arr)
+            .expect("headers")[0];
+        assert_eq!(header.get("key").and_then(Json::as_str), Some("X-Test"));
+        assert_eq!(header.get("value").and_then(Json::as_str), Some("one"));
     }
 
     /// The blackhole outbound the pinned scenario suite names: a config with no

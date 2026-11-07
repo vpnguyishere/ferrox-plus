@@ -171,11 +171,27 @@ fn read_exact_within(stream: &mut impl Read, buf: &mut [u8], until: Instant) -> 
         }
         match stream.read(&mut buf[at..]) {
             Ok(0) => return None,
-            Ok(n) => at += n,
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Ok(n) => {
+                at += n;
+                if Instant::now() >= until {
+                    return None;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {
+                if Instant::now() >= until {
+                    return None;
+                }
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if Instant::now() >= until {
+                    return None;
+                }
+            }
             Err(_) => return None,
         }
+    }
+    if Instant::now() >= until {
+        return None;
     }
     Some(())
 }

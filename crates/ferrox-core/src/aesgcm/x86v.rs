@@ -364,6 +364,92 @@ impl Engine {
         )
     }
 
+    #[inline(always)]
+    /// CTR and GHASH writing `src.len()` bytes into uninitialized `dst`.
+    unsafe fn ctr_ghash8_from_uninit(
+        &self,
+        template: __m128i,
+        mut state: __m128i,
+        src: &[u8],
+        dst: *mut u8,
+        tailq: &mut super::Tail<__m128i>,
+    ) -> __m128i {
+        unsafe {
+            let template2 = _mm256_broadcastsi128_si256(template);
+            let (sblocks, _) = src.as_chunks::<16>();
+            let (sgroups, _) = sblocks.as_chunks::<8>();
+            let done = grouped(sblocks);
+            let mut ctr = 2u32;
+            for (group, sg) in sgroups.iter().enumerate() {
+                let mut ks = ctr8v(template2, ctr);
+                encrypt8(&self.rk2, &mut ks);
+                let pt = load_pairs(sg);
+                let pairs = [
+                    _mm256_xor_si256(ks[0], pt[0]),
+                    _mm256_xor_si256(ks[1], pt[1]),
+                    _mm256_xor_si256(ks[2], pt[2]),
+                    _mm256_xor_si256(ks[3], pt[3]),
+                ];
+                let at = group * 128;
+                _mm256_storeu_si256(dst.add(at).cast(), pairs[0]);
+                _mm256_storeu_si256(dst.add(at + 32).cast(), pairs[1]);
+                _mm256_storeu_si256(dst.add(at + 64).cast(), pairs[2]);
+                _mm256_storeu_si256(dst.add(at + 96).cast(), pairs[3]);
+                state = ghash_group8(
+                    &self.hp,
+                    state,
+                    [
+                        bswap2(pairs[0]),
+                        bswap2(pairs[1]),
+                        bswap2(pairs[2]),
+                        bswap2(pairs[3]),
+                    ],
+                );
+                ctr += 8;
+            }
+            super::ctr_ghash_from_uninit(
+                &self.rk,
+                &self.h,
+                template,
+                state,
+                &src[done..],
+                dst.add(done),
+                tailq,
+                ctr,
+            )
+        }
+    }
+
+    /// Seal `src` into uninitialized `dst` and return the tag.
+    #[target_feature(enable = "avx2,vaes,vpclmulqdq,aes,pclmulqdq,ssse3")]
+    pub(crate) unsafe fn seal_from_uninit(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        src: &[u8],
+        dst: *mut u8,
+    ) -> [u8; 16] {
+        let template = super::counter_template::<__m128i>(nonce);
+        let mask = <__m128i as Lanes>::encrypt1v(&self.rk, template.ctr_be(1));
+        let mut tailq = super::Tail::new();
+        let state = super::ghash(
+            &self.h,
+            <__m128i as Lanes>::load(&[0u8; 16]),
+            aad,
+            &mut tailq,
+        );
+        let state = super::flush(&self.h, state, &mut tailq);
+        let state = unsafe { self.ctr_ghash8_from_uninit(template, state, src, dst, &mut tailq) };
+        super::finish(
+            &self.h,
+            state,
+            &mut tailq,
+            aad.len() as u64,
+            src.len() as u64,
+            mask,
+        )
+    }
+
     #[target_feature(enable = "avx2,vaes,vpclmulqdq,aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn open(
         &self,
