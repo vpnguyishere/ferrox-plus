@@ -1,0 +1,171 @@
+name: tun-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      engines:
+        description: Space-separated engines
+        type: string
+        default: "ferrox zeptun-userspace zeptun-hybrid hev tun2socks singbox-system"
+      scenarios:
+        description: Space-separated scenarios
+        type: string
+        default: "tcp-up-1 tcp-up-10 tcp-down-1 tcp-down-10 rr rr-8x1k udp-100k"
+      duration:
+        description: Seconds per scenario
+        type: string
+        default: "5"
+      repeat:
+        description: Rounds per engine
+        type: string
+        default: "2"
+      queues:
+        description: TUN queues for engines that take them
+        type: string
+        default: "4"
+      mtu:
+        description: TUN MTU
+        type: string
+        default: "1500"
+      settle:
+        description: Idle seconds before the memory-after reading
+        type: string
+        default: "3"
+
+concurrency:
+  group: tun-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8
+  ZIG_VERSION: 0.17.0
+  ZEPTUN_REV: 85ef1daa0754444db9ed93b70d3dcee034892e84
+  HEV_TUNNEL_REV: 8e3b4cd7168fe64b64f8b58537b5623fb6a7074d
+  HEV_SERVER_REV: d23aaad702eb532ddb7c03be4598ed6f79cb79c1
+  SINGBOX_VERSION: 1.14.0
+  TUN2SOCKS_VERSION: 2.7.0
+
+jobs:
+  bench:
+    name: netns comparison
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: tun-bench
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git python3 iproute2 util-linux curl unzip
+
+      - name: allow unprivileged namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo modprobe tun || true
+
+      - name: the zeptun pin is the one the roadmap reads
+        run: |
+          pinned=$(python3 -c "import tomllib; print(tomllib.load(open('upstream/pins.toml','rb'))['sources']['zeptun']['rev'])")
+          test "$pinned" = "$ZEPTUN_REV"
+
+      - name: build ferrox
+        run: cargo build --locked --release -p ferrox-app
+
+      - name: build zeptun and its benchmark client
+        run: |
+          git init --quiet "$RUNNER_TEMP/zeptun"
+          git -C "$RUNNER_TEMP/zeptun" remote add origin https://github.com/Noisemux/zeptun
+          git -C "$RUNNER_TEMP/zeptun" fetch --quiet --no-tags --depth 1 origin "$ZEPTUN_REV"
+          git -C "$RUNNER_TEMP/zeptun" checkout --quiet FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/zeptun" rev-parse HEAD)" = "$ZEPTUN_REV"
+          ( cd "$RUNNER_TEMP/zeptun" && zig build -Doptimize=fast )
+
+      - name: build the hev peers
+        run: |
+          for spec in "hev-socks5-tunnel $HEV_TUNNEL_REV" "hev-socks5-server $HEV_SERVER_REV"; do
+            set -- $spec
+            git init --quiet "$RUNNER_TEMP/$1"
+            git -C "$RUNNER_TEMP/$1" remote add origin "https://github.com/heiher/$1"
+            git -C "$RUNNER_TEMP/$1" fetch --quiet --no-tags --depth 1 origin "$2"
+            git -C "$RUNNER_TEMP/$1" checkout --quiet FETCH_HEAD
+            git -C "$RUNNER_TEMP/$1" submodule update --init --recursive --quiet
+            make -C "$RUNNER_TEMP/$1" -j"$(nproc)"
+          done
+
+      - name: fetch sing-box and tun2socks
+        run: |
+          curl -sSL "https://github.com/SagerNet/sing-box/releases/download/v$SINGBOX_VERSION/sing-box-$SINGBOX_VERSION-linux-amd64.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP"
+          curl -sSL -o "$RUNNER_TEMP/t2s.zip" \
+            "https://github.com/xjasonlyu/tun2socks/releases/download/v$TUN2SOCKS_VERSION/tun2socks-linux-amd64.zip"
+          unzip -q -o "$RUNNER_TEMP/t2s.zip" -d "$RUNNER_TEMP/tun2socks"
+          chmod +x "$RUNNER_TEMP/tun2socks/tun2socks-linux-amd64"
+
+      - name: build identity
+        run: |
+          {
+            printf '| component | revision |\n|---|---|\n'
+            printf '| ferrox | `%s` |\n' "$(git rev-parse HEAD)"
+            printf '| zeptun | `%s` |\n' "$ZEPTUN_REV"
+            printf '| hev-socks5-tunnel | `%s` |\n' "$HEV_TUNNEL_REV"
+            printf '| hev-socks5-server | `%s` |\n' "$HEV_SERVER_REV"
+            printf '| sing-box | `v%s` |\n' "$SINGBOX_VERSION"
+            printf '| tun2socks | `v%s` |\n' "$TUN2SOCKS_VERSION"
+            printf '| zig | `%s` |\n' "$(zig version)"
+          } > "$RUNNER_TEMP/tun-bench-identity.md"
+          cat "$RUNNER_TEMP/tun-bench-identity.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: throughput, latency, udp, cpu and memory
+        env:
+          FERROX: ${{ github.workspace }}/target/release/ferrox-app
+          BENCH: ${{ runner.temp }}/zeptun/zig-out/bin/zeptun-bench
+          ZEPTUN: ${{ runner.temp }}/zeptun/zig-out/bin/zeptun
+          HEV: ${{ runner.temp }}/hev-socks5-tunnel/bin/hev-socks5-tunnel
+          HEV_SERVER: ${{ runner.temp }}/hev-socks5-server/bin/hev-socks5-server
+          SINGBOX: ${{ runner.temp }}/sing-box-${{ env.SINGBOX_VERSION }}-linux-amd64/sing-box
+          TUN2SOCKS: ${{ runner.temp }}/tun2socks/tun2socks-linux-amd64
+          OUT_DIR: tun-bench-results
+          ENGINES: ${{ inputs.engines }}
+          SCENARIOS: ${{ inputs.scenarios }}
+          DURATION: ${{ inputs.duration }}
+          REPEAT: ${{ inputs.repeat }}
+          QUEUES: ${{ inputs.queues }}
+          MTU: ${{ inputs.mtu }}
+          SETTLE: ${{ inputs.settle }}
+        run: sh scripts/tun-bench.sh
+
+      - name: summary
+        if: always()
+        run: |
+          cat "$RUNNER_TEMP/tun-bench-identity.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          cat tun-bench-results/runner.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          cat tun-bench-results/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          for log in tun-bench-results/ferrox.log tun-bench-results/zeptun-*.log tun-bench-results/hev-0.log tun-bench-results/singbox-*.log tun-bench-results/tun2socks.log; do
+            [ -s "$log" ] || continue
+            printf '\n### %s\n\n```\n' "$log" >> "$GITHUB_STEP_SUMMARY"
+            tail -n 40 "$log" >> "$GITHUB_STEP_SUMMARY"
+            printf '```\n' >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tun-bench-${{ github.run_id }}
+          path: tun-bench-results
+          retention-days: 30
+          if-no-files-found: warn
