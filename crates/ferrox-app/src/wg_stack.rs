@@ -45,6 +45,9 @@ const TCP_RECV_BUFFER: usize = 512 * 1024;
 /// The send side of one flow: a stream moves this queue per round trip, and a
 /// tunnel's round trip is milliseconds, so the queue bounds a fast link.
 const TCP_SEND_BUFFER: usize = 2 * 1024 * 1024;
+/// One turn drains at most this many local reads into a flow, so a download
+/// does not wait a whole tick for each buffer when the peer is far ahead.
+const UP_BURST: usize = 8;
 /// The most answers a client races for one target.
 const RACES: usize = 8;
 /// A pinned lane re-races its answers after this long without a reply.
@@ -77,6 +80,9 @@ const LISTENER_TTL: Duration = Duration::from_secs(60);
 /// ready with no tunnel packet to wake the stack, so the wait bounds a request's
 /// round trip and stays short.
 const TICK: Duration = Duration::from_millis(1);
+/// A TUN carries no tunnel reader to wake the stack, so an idle wait is also
+/// the bound on a target's answer; keep it below a request's round trip.
+const TUN_TICK: Duration = Duration::from_micros(100);
 /// Datagram lanes are idle most of their life; a ten millisecond wake is a
 /// poll of their own, not a bound on a request.
 const LANE_TICK: Duration = Duration::from_millis(10);
@@ -1210,7 +1216,7 @@ pub(crate) fn server(
     stack.device.recycle = recycle;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        if server_turn(&mut stack, &packets, &mut buf) {
+        if server_turn(&mut stack, &packets, &mut buf, TICK) {
             return;
         }
     }
@@ -1223,14 +1229,16 @@ pub(crate) fn serve_tun_device(
     packets: Receiver<Packet>,
     to_tunnel: SyncSender<Vec<u8>>,
     out: Outbound,
+    recycle: Option<Sender<Vec<u8>>>,
 ) {
     let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
+    stack.device.recycle = recycle;
     let mut buf = vec![0u8; 64 * 1024];
-    while !server_turn(&mut stack, &packets, &mut buf) {}
+    while !server_turn(&mut stack, &packets, &mut buf, TUN_TICK) {}
 }
 
 /// One server turn, or true once the inbound is closed.
-fn server_turn(stack: &mut ServerStack, packets: &Packets, buf: &mut [u8]) -> bool {
+fn server_turn(stack: &mut ServerStack, packets: &Packets, buf: &mut [u8], tick: Duration) -> bool {
     let mut closed = false;
     for _ in 0..RX_BURST {
         match packets.try_recv() {
@@ -1249,7 +1257,7 @@ fn server_turn(stack: &mut ServerStack, packets: &Packets, buf: &mut [u8]) -> bo
     if progressed {
         return false;
     }
-    match packets.recv_timeout(TICK) {
+    match packets.recv_timeout(tick) {
         Ok(packet) => stack.receive(packet),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return true,
@@ -1920,24 +1928,31 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
         }
     }
 
-    if up_ready && !flow.up_pending() && !flow.up_eof && socket.can_send() {
+    let mut bursts = 0;
+    while bursts < UP_BURST && up_ready && !flow.up_pending() && !flow.up_eof && socket.can_send() {
         match flow.local.read(buf) {
-            Ok(0) => flow.up_eof = true,
+            Ok(0) => {
+                flow.up_eof = true;
+                break;
+            }
             Ok(n) => {
                 moved = true;
+                bursts += 1;
                 match socket.send_slice(&buf[..n]) {
                     Ok(sent) if sent < n => flow.stage_up(&buf[sent..n]),
                     Ok(_) => {}
                     Err(SendError::InvalidState) => {
                         flow.done = true;
                         socket.abort();
+                        break;
                     }
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => {
                 flow.done = true;
                 socket.abort();
+                break;
             }
         }
     }

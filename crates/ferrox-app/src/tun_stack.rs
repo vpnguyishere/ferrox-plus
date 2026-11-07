@@ -92,13 +92,16 @@ fn build(spec: &Spec, multi: bool, offload: bool) -> io::Result<(SyncDevice, boo
 fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outbound) {
     let (packets, incoming) = mpsc::sync_channel(RX_QUEUE);
     let (outgoing, writes) = mpsc::sync_channel(TX_QUEUE);
+    let (recycle, reused) = mpsc::channel();
     let config = device_config(spec);
     let stack_out = out.clone();
-    thread::spawn(move || crate::wg_stack::serve_tun_device(config, incoming, outgoing, stack_out));
+    thread::spawn(move || {
+        crate::wg_stack::serve_tun_device(config, incoming, outgoing, stack_out, Some(recycle));
+    });
     let writer = Arc::clone(&device);
     thread::spawn(move || send_loop(writer, writes, offload));
     let mtu = spec.mtu();
-    thread::spawn(move || recv_loop(device, packets, mtu));
+    thread::spawn(move || recv_loop(device, packets, reused, mtu));
 }
 
 fn device_config(spec: &Spec) -> DeviceConfig {
@@ -116,7 +119,12 @@ fn device_config(spec: &Spec) -> DeviceConfig {
 }
 
 #[cfg(target_os = "linux")]
-fn recv_loop(device: Arc<SyncDevice>, packets: SyncSender<Packet>, mtu: usize) {
+fn recv_loop(
+    device: Arc<SyncDevice>,
+    packets: SyncSender<Packet>,
+    reuse: Receiver<Vec<u8>>,
+    mtu: usize,
+) {
     let mut original = vec![0u8; VIRTIO_NET_HDR_LEN + 65_535];
     let mut bufs: Vec<Vec<u8>> = (0..IDEAL_BATCH_SIZE)
         .map(|_| vec![0u8; VIRTIO_NET_HDR_LEN + mtu])
@@ -137,7 +145,7 @@ fn recv_loop(device: Arc<SyncDevice>, packets: SyncSender<Packet>, mtu: usize) {
             if sizes[index] == 0 || end > bufs[index].len() {
                 continue;
             }
-            let bytes = bufs[index][VIRTIO_NET_HDR_LEN..end].to_vec();
+            let bytes = packet_bytes(&reuse, &bufs[index][VIRTIO_NET_HDR_LEN..end]);
             let packet = Packet {
                 peer: [0; 32],
                 bytes,
@@ -151,7 +159,12 @@ fn recv_loop(device: Arc<SyncDevice>, packets: SyncSender<Packet>, mtu: usize) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn recv_loop(device: Arc<SyncDevice>, packets: SyncSender<Packet>, mtu: usize) {
+fn recv_loop(
+    device: Arc<SyncDevice>,
+    packets: SyncSender<Packet>,
+    reuse: Receiver<Vec<u8>>,
+    mtu: usize,
+) {
     let mut buffer = vec![0u8; mtu.max(1500) + 64];
     loop {
         let size = match device.recv(&mut buffer) {
@@ -163,7 +176,7 @@ fn recv_loop(device: Arc<SyncDevice>, packets: SyncSender<Packet>, mtu: usize) {
                 return;
             }
         };
-        let bytes = buffer[..size].to_vec();
+        let bytes = packet_bytes(&reuse, &buffer[..size]);
         let packet = Packet {
             peer: [0; 32],
             bytes,
@@ -205,6 +218,13 @@ fn send_loop(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, offload: bool)
 #[cfg(not(target_os = "linux"))]
 fn send_loop(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, _offload: bool) {
     send_plain(device, packets);
+}
+
+fn packet_bytes(reuse: &Receiver<Vec<u8>>, source: &[u8]) -> Vec<u8> {
+    let mut bytes = reuse.try_recv().unwrap_or_default();
+    bytes.clear();
+    bytes.extend_from_slice(source);
+    bytes
 }
 
 fn send_plain(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>) {
