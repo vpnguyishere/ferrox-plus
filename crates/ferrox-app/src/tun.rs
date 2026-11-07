@@ -54,6 +54,7 @@ pub(crate) struct Spec {
     mtu: usize,
     address: IpAddr,
     prefix: u8,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     queues: usize,
 }
 
@@ -97,6 +98,7 @@ impl Spec {
         self.prefix
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn queues(&self) -> usize {
         self.queues
     }
