@@ -31,6 +31,10 @@ on:
         description: Idle seconds before the memory-after reading
         type: string
         default: "3"
+      raw_variants:
+        description: Space-separated raw device variants
+        type: string
+        default: "ferrox-raw-plain ferrox-raw-gso ferrox-raw-mq ferrox-raw-gso-mq tun-rs-sync-normal tun-rs-sync-gso tun-rs-sync-gso-concurrent"
 
 concurrency:
   group: tun-bench-${{ github.ref }}
@@ -220,6 +224,7 @@ jobs:
           DURATION: ${{ inputs.duration }}
           REPEAT: ${{ inputs.repeat }}
           QUEUES: ${{ inputs.queues }}
+          VARIANTS: ${{ inputs.raw_variants }}
         run: sudo -E sh scripts/tun-raw-bench.sh
 
       - name: summary

@@ -30,6 +30,8 @@ REPEAT=${REPEAT:-2}
 QUEUES=${QUEUES:-4}
 MTU=${MTU:-1500}
 SETTLE=${SETTLE:-3}
+CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-$((DURATION + 20))}
+PROBE_SECONDS=${PROBE_SECONDS:-1}
 ENGINES=${ENGINES:-"ferrox zeptun-userspace zeptun-hybrid hev tun2socks singbox-system"}
 SCENARIOS=${SCENARIOS:-"tcp-up-1 tcp-up-10 tcp-down-1 tcp-down-10 rr rr-8x1k udp-100k"}
 
@@ -287,6 +289,20 @@ print(f"{cpu:.1f} {rss:.0f} {pss:.0f}")
 PY
 }
 
+probe_engine() {
+    engine=$1
+    timeout 5 "$BENCH" tcp-client --connect "$SERVER_ADDR:5201" --seconds "$PROBE_SECONDS" \
+        --json "$OUT_DIR/probe-$engine.json" > /dev/null 2>&1 || return 1
+    python3 - "$OUT_DIR/probe-$engine.json" << 'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if d.get("bytes", 0) > 0 else 1)
+PY
+}
+
 run_scenario() {
     engine=$1
     scenario=$2
@@ -301,7 +317,7 @@ run_scenario() {
             streams=${scenario##*-}
             reverse=""
             case "$scenario" in tcp-down-*) reverse="--reverse" ;; esac
-            "$BENCH" tcp-client --connect "$SERVER_ADDR:5201" --seconds "$DURATION" \
+            timeout "$CLIENT_TIMEOUT" "$BENCH" tcp-client --connect "$SERVER_ADDR:5201" --seconds "$DURATION" \
                 --streams "$streams" $reverse --json "$OUT_DIR/$tag.json" > /dev/null 2>&1 || true
             value=$(python3 -c "import json,sys; print('%.3f' % json.load(open(sys.argv[1]))['gbps'])" "$OUT_DIR/$tag.json" 2> /dev/null || echo 0)
             unit=Gbit/s
@@ -310,7 +326,7 @@ run_scenario() {
             conns=1
             size=64
             [ "$scenario" = rr-8x1k ] && { conns=8; size=1024; }
-            "$BENCH" rr-client --connect "$SERVER_ADDR:5203" --seconds "$DURATION" \
+            timeout "$CLIENT_TIMEOUT" "$BENCH" rr-client --connect "$SERVER_ADDR:5203" --seconds "$DURATION" \
                 --conns "$conns" --size "$size" --json "$OUT_DIR/$tag.json" > /dev/null 2>&1 || true
             value=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('%.0f tps p50=%.0fus p99=%.0fus' % (d['tps'], d['p50_us'], d['p99_us']))" "$OUT_DIR/$tag.json" 2> /dev/null || echo 0)
             unit=""
@@ -324,7 +340,7 @@ run_scenario() {
                 udp-*) pps=${scenario#udp-} ;;
             esac
             case "$pps" in *k) pps=$((${pps%k} * 1000)) ;; esac
-            "$BENCH" udp-client --connect "$SERVER_ADDR:5202" --seconds "$DURATION" \
+            timeout "$CLIENT_TIMEOUT" "$BENCH" udp-client --connect "$SERVER_ADDR:5202" --seconds "$DURATION" \
                 --size "$size" --pps "$pps" --echo $gso --json "$OUT_DIR/$tag.json" > /dev/null 2>&1 || true
             value=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('%.0f echo pps (%.1f%% of %.0f sent)' % (d['received']/d['seconds'], 100.0*d['received']/max(d['sent'],1), d['sent']/d['seconds']))" "$OUT_DIR/$tag.json" 2> /dev/null || echo 0)
             unit=""
@@ -380,6 +396,11 @@ while [ "$rep" -le "$REPEAT" ]; do
         printf 'round %s engine %s\n' "$rep" "$engine"
         if ! start_engine "$engine"; then
             printf '  failed to start %s\n' "$engine"
+            stop_engine
+            continue
+        fi
+        if ! probe_engine "$engine"; then
+            printf '  %s did not pass the TCP probe\n' "$engine"
             stop_engine
             continue
         fi

@@ -54,11 +54,15 @@ fn open_tun(name: &str, offload: bool, multi_queue: bool) -> io::Result<File> {
     let len = bytes.len().min(15);
     req.ifr_name[..len].copy_from_slice(&bytes[..len]);
 
+    let flags = req.ifr_flags;
     let rc = unsafe { libc::ioctl(fd, TUNSETIFF, &raw mut req) };
     if rc < 0 {
         let error = io::Error::last_os_error();
         unsafe { libc::close(fd) };
-        return Err(error);
+        return Err(io::Error::new(
+            error.kind(),
+            format!("TUNSETIFF {name} flags {flags:#x}: {error}"),
+        ));
     }
 
     if offload {
@@ -67,7 +71,10 @@ fn open_tun(name: &str, offload: bool, multi_queue: bool) -> io::Result<File> {
         if rc < 0 {
             let error = io::Error::last_os_error();
             unsafe { libc::close(fd) };
-            return Err(error);
+            return Err(io::Error::new(
+                error.kind(),
+                format!("TUNSETOFFLOAD {name}: {error}"),
+            ));
         }
     }
 
@@ -78,14 +85,21 @@ fn forward(mut source: File, mut sink: File) {
     let mut frame = vec![0u8; MAX_FRAME];
     loop {
         match source.read(&mut frame) {
-            Ok(0) => return,
+            Ok(0) => {
+                eprintln!("ferrox-tun-raw: read returned zero");
+                return;
+            }
             Ok(n) => {
-                if sink.write_all(&frame[..n]).is_err() {
+                if let Err(error) = sink.write_all(&frame[..n]) {
+                    eprintln!("ferrox-tun-raw: write failed: {error}");
                     return;
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return,
+            Err(error) => {
+                eprintln!("ferrox-tun-raw: read failed: {error}");
+                return;
+            }
         }
     }
 }
@@ -125,6 +139,9 @@ fn main() -> io::Result<()> {
         right.push(open_tun(&iface2, offload, queues > 1)?);
     }
 
+    eprintln!(
+        "ferrox-tun-raw: {iface1} <-> {iface2} queues={queues} offload={offload}"
+    );
     let mut handles = Vec::with_capacity(queues * 2);
     for (l, r) in left.into_iter().zip(right) {
         let l2 = l.try_clone()?;

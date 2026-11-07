@@ -15,6 +15,7 @@ RESULTS="$OUT_DIR/results.jsonl"
 FERROX_RAW=${FERROX_RAW:-"$ROOT/scripts/tun-raw/target/release/ferrox-tun-raw"}
 TUN_RS_DIR=${TUN_RS_DIR:-}
 DURATION=${DURATION:-5}
+CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-$((DURATION + 20))}
 REPEAT=${REPEAT:-2}
 QUEUES=${QUEUES:-4}
 VARIANTS=${VARIANTS:-"ferrox-raw-plain ferrox-raw-gso ferrox-raw-mq ferrox-raw-gso-mq tun-rs-sync-normal tun-rs-sync-gso tun-rs-sync-gso-concurrent"}
@@ -112,6 +113,17 @@ start_variant() {
     IPERF_PID=$!
     wait_port || { echo "  $variant: iperf3 never listened" >&2; return 1; }
     sleep 0.5
+
+    ip -s link show tun11 > "$OUT_DIR/$variant-links.log" 2>&1 || true
+    ip -s link show tun22 >> "$OUT_DIR/$variant-links.log" 2>&1 || true
+    ip route get 10.0.2.1 >> "$OUT_DIR/$variant-links.log" 2>&1 || true
+    if ! ping -c 3 -i 0.2 -W 1 -q 10.0.2.1 > "$OUT_DIR/$variant-ping-before.log" 2>&1; then
+        echo "  $variant: the path probe failed" >&2
+        cat "$OUT_DIR/$variant-links.log" >&2
+        cat "$OUT_DIR/$variant-ping-before.log" >&2
+        cat "$OUT_DIR/$variant.log" >&2
+        return 1
+    fi
 }
 
 stop_variant() {
@@ -182,7 +194,7 @@ run_variant() {
     fi
 
     sample_start "$OUT_DIR/$variant-$rep.samples"
-    iperf3 -c 10.0.2.1 -p 5201 -t "$DURATION" -J > "$OUT_DIR/$variant-$rep-tcp.json" 2> /dev/null || true
+    timeout "$CLIENT_TIMEOUT" iperf3 -c 10.0.2.1 -p 5201 -t "$DURATION" -J > "$OUT_DIR/$variant-$rep-tcp.json" 2> /dev/null || true
     set -- $(sample_stop "$OUT_DIR/$variant-$rep.samples")
     tcp=$(python3 - "$OUT_DIR/$variant-$rep-tcp.json" << 'PY'
 import json, sys
@@ -198,7 +210,7 @@ PY
     emit "$variant" "tcp-${rep}" "$tcp" "Gbit/s" "$1" "$2"
 
     sample_start "$OUT_DIR/$variant-$rep-udp.samples"
-    iperf3 -c 10.0.2.1 -p 5201 -u -b 1G -t "$DURATION" -J > "$OUT_DIR/$variant-$rep-udp.json" 2> /dev/null || true
+    timeout "$CLIENT_TIMEOUT" iperf3 -c 10.0.2.1 -p 5201 -u -b 1G -t "$DURATION" -J > "$OUT_DIR/$variant-$rep-udp.json" 2> /dev/null || true
     set -- $(sample_stop "$OUT_DIR/$variant-$rep-udp.samples")
     udp_cpu=$1
     udp_rss=$2
@@ -216,7 +228,7 @@ PY
     set -- $udp
     emit "$variant" "udp-${rep}" "$1" "Gbit/s" "$udp_cpu" "$udp_rss"
 
-    ping -c 100 -i 0.01 -W 1 -q 10.0.2.1 > "$OUT_DIR/$variant-$rep-ping.log" 2>&1 || true
+    timeout 10 ping -c 100 -i 0.01 -W 1 -q 10.0.2.1 > "$OUT_DIR/$variant-$rep-ping.log" 2>&1 || true
     rtt=$(python3 - "$OUT_DIR/$variant-$rep-ping.log" << 'PY'
 import re, sys
 text = open(sys.argv[1]).read()
