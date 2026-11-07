@@ -82,7 +82,7 @@ const LISTENER_TTL: Duration = Duration::from_secs(60);
 const TICK: Duration = Duration::from_millis(1);
 /// A TUN carries no tunnel reader to wake the stack, so an idle wait is also
 /// the bound on a target's answer; keep it below a request's round trip.
-const TUN_TICK: Duration = Duration::from_micros(100);
+const TUN_TICK: Duration = Duration::from_micros(25);
 /// Datagram lanes are idle most of their life; a ten millisecond wake is a
 /// poll of their own, not a bound on a request.
 const LANE_TICK: Duration = Duration::from_millis(10);
@@ -1929,49 +1929,54 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
     }
 
     let mut bursts = 0;
-    while bursts < UP_BURST && up_ready && !flow.up_pending() && !flow.up_eof && socket.can_send() {
-        match flow.local.read(buf) {
-            Ok(0) => {
-                flow.up_eof = true;
-                break;
-            }
-            Ok(n) => {
-                moved = true;
-                bursts += 1;
-                match socket.send_slice(&buf[..n]) {
-                    Ok(sent) if sent < n => flow.stage_up(&buf[sent..n]),
-                    Ok(_) => {}
-                    Err(SendError::InvalidState) => {
-                        flow.done = true;
-                        socket.abort();
-                        break;
+    while bursts < UP_BURST && !flow.up_eof && socket.can_send() {
+        if flow.up_pending() {
+            let at = flow.pending_up_at;
+            match socket.send_slice(&flow.pending_up[at..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    flow.pending_up_at += n;
+                    moved = true;
+                    bursts += 1;
+                    if !flow.up_pending() {
+                        flow.pending_up.clear();
+                        flow.pending_up_at = 0;
                     }
                 }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(_) => {
-                flow.done = true;
-                socket.abort();
-                break;
-            }
-        }
-    }
-    if flow.up_pending() && socket.can_send() {
-        let at = flow.pending_up_at;
-        match socket.send_slice(&flow.pending_up[at..]) {
-            Ok(0) => {}
-            Ok(n) => {
-                flow.pending_up_at += n;
-                moved = true;
-                if !flow.up_pending() {
-                    flow.pending_up.clear();
-                    flow.pending_up_at = 0;
+                Err(SendError::InvalidState) => {
+                    flow.done = true;
+                    socket.abort();
+                    break;
                 }
             }
-            Err(SendError::InvalidState) => {
-                flow.done = true;
-                socket.abort();
+        } else if up_ready {
+            match flow.local.read(buf) {
+                Ok(0) => {
+                    flow.up_eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    moved = true;
+                    bursts += 1;
+                    match socket.send_slice(&buf[..n]) {
+                        Ok(sent) if sent < n => flow.stage_up(&buf[sent..n]),
+                        Ok(_) => {}
+                        Err(SendError::InvalidState) => {
+                            flow.done = true;
+                            socket.abort();
+                            break;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    flow.done = true;
+                    socket.abort();
+                    break;
+                }
             }
+        } else {
+            break;
         }
     }
     if flow.up_eof && !flow.up_pending() && socket.is_open() && !flow.sent_fin {
