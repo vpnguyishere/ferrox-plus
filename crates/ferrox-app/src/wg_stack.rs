@@ -47,7 +47,7 @@ const TCP_RECV_BUFFER: usize = 512 * 1024;
 const TCP_SEND_BUFFER: usize = 2 * 1024 * 1024;
 /// One turn drains at most this many local reads into a flow, so a download
 /// does not wait a whole tick for each buffer when the peer is far ahead.
-const UP_BURST: usize = 8;
+const UP_BURST: usize = 64;
 /// The most answers a client races for one target.
 const RACES: usize = 8;
 /// A pinned lane re-races its answers after this long without a reply.
