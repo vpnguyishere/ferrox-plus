@@ -191,6 +191,12 @@ proxy::decode_trojan_request 1170 proxy::tests::the_trojan_header_costs_two_read
 # but this probe's messages do not walk it. The messages, offsets, prefixes and
 # bytes are unchanged.
 grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
+# Blessed 102414 by grpc-common-varint-write: 4096 two-byte Hunk lengths of
+# 16375 now take the direct write, against 118798 for the byte loop on the same
+# run, so the loop took 16384 (13.8%) out. The read keeps its loop: a direct
+# two/three-byte read moved the one-byte probe above to 84003, so that rewrite
+# did not land. The bytes, lengths and the 73251 row are unchanged.
+grpc::tests::direct_write_probe 102414 grpc::tests::the_direct_write_costs_the_second_byte_and_nothing_else
 # The sniff probe's frame in the app binary, re-measured by count-ops on
 # 2026-11-04: one pre-warmed inspection prices the peek and the host parse, 1228.
 # The vmess carrier's added code moved this frame's codegen on this tree; the

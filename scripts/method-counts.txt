@@ -233,6 +233,7 @@ carrier-httpheader record-lane-segment-allocations-per-dial 0 ferrox-core-tls::r
 carrier-httpheader user-space-copies-per-byte-relayed 1 ferrox-app-proxy::tests::carried_streams_round_trip_behind_the_http_camouflage
 
 carrier-grpc ops-retired-instructions 73251 scripts/count-ops.sh
+carrier-grpc varint-write-probe-ops 102414 scripts/count-ops.sh
 carrier-grpc hunk-payload-bytes 16375 ferrox-app-grpc::tests::a_hunk_fits_the_frame_that_carries_it
 carrier-grpc user-space-copies-per-byte-written 0 ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer
 carrier-grpc writes-per-relay-read 1 ferrox-app-grpc::tests::a_relay_read_gathers_its_frames_into_one_write
