@@ -29723,7 +29723,10 @@ impl LaneTrace {
             write_nanos: 0,
             gap_nanos: 0,
             last_end: None,
-            born: *LANE_ORIGIN.get_or_init(std::time::Instant::now),
+            born: {
+                let _ = LANE_ORIGIN.get_or_init(std::time::Instant::now);
+                std::time::Instant::now()
+            },
             first_nanos: None,
             idle: 0,
             reported: false,
