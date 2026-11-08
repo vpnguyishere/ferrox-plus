@@ -10000,6 +10000,7 @@ where
             } else {
                 note_wait_finish(ended);
                 buffer.release();
+                trace.idle += 1;
                 Next::Idle
             }
         }
@@ -29686,6 +29687,8 @@ impl RelayFinish {
 }
 
 #[derive(Default)]
+static LANE_ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 struct LaneTrace {
     steps: u64,
     bytes: u64,
@@ -29700,17 +29703,44 @@ struct LaneTrace {
     write_nanos: u128,
     gap_nanos: u128,
     last_end: Option<std::time::Instant>,
+    born: std::time::Instant,
+    first_nanos: Option<u128>,
+    idle: u64,
     reported: bool,
 }
 
 impl LaneTrace {
+    fn new() -> Self {
+        Self {
+            steps: 0,
+            bytes: 0,
+            read_ok: 0,
+            read_eof: 0,
+            read_timeout: 0,
+            read_yield: 0,
+            read_err: 0,
+            write_ok: 0,
+            write_err: 0,
+            read_nanos: 0,
+            write_nanos: 0,
+            gap_nanos: 0,
+            last_end: None,
+            born: *LANE_ORIGIN.get_or_init(std::time::Instant::now),
+            first_nanos: None,
+            idle: 0,
+            reported: false,
+        }
+    }
+
     fn report(&mut self, name: &str) {
         if self.reported {
             return;
         }
         self.reported = true;
+        let now = std::time::Instant::now();
+        let origin = *LANE_ORIGIN.get_or_init(std::time::Instant::now);
         eprintln!(
-            "ferrox-lane {name} steps={} bytes={} rok={} reof={} rtimeout={} ryield={} rerr={} wok={} werr={} rms={} wms={} gapms={}",
+            "ferrox-lane {name} steps={} bytes={} rok={} reof={} rtimeout={} ryield={} rerr={} wok={} werr={} rms={} wms={} gapms={} age={} first={} after={} idle={} at={}",
             self.steps,
             self.bytes,
             self.read_ok,
@@ -29723,6 +29753,11 @@ impl LaneTrace {
             self.read_nanos / 1_000_000,
             self.write_nanos / 1_000_000,
             self.gap_nanos / 1_000_000,
+            now.duration_since(self.born).as_millis(),
+            self.first_nanos.unwrap_or(0) / 1_000_000,
+            now.duration_since(self.last_end.unwrap_or(self.born)).as_millis(),
+            self.idle,
+            self.born.duration_since(origin).as_millis(),
         );
     }
 }
@@ -29745,6 +29780,9 @@ where
     if let Some(prev) = trace.last_end {
         trace.gap_nanos += start.duration_since(prev).as_nanos();
     }
+    trace
+        .first_nanos
+        .get_or_insert_with(|| start.duration_since(trace.born).as_nanos());
     trace.steps += 1;
     let read_start = std::time::Instant::now();
     let read = from.read_once(buffer.as_mut());
@@ -29780,6 +29818,7 @@ where
             } else {
                 note_wait_finish(ended);
                 buffer.release();
+                trace.idle += 1;
                 Next::Idle
             }
         }
@@ -29816,7 +29855,7 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     let flow = RelayFinish::new(close_first, Arc::clone(close), finish);
     let (up_a, up_b, up_flow) = (Arc::clone(&a), Arc::clone(&b), Arc::clone(&flow));
     let mut forward = RelayBuf::new();
-    let mut forward_trace = LaneTrace::default();
+    let mut forward_trace = LaneTrace::new();
     lane_pool::submit(
         Box::new(move || {
             stream_lane_step(
@@ -29831,7 +29870,7 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
         Box::new(stream_lane_done(&flow)),
     );
     let mut backward = RelayBuf::new();
-    let mut backward_trace = LaneTrace::default();
+    let mut backward_trace = LaneTrace::new();
     let parked = Arc::clone(&flow);
     lane_pool::submit(
         Box::new(move || {
@@ -37056,7 +37095,7 @@ mod tests {
         let from = Half::split(Yielding, Yielding);
         let to = Half::split(std::io::sink(), std::io::sink());
         let mut buffer = RelayBuf::new();
-        let mut trace = LaneTrace::default();
+        let mut trace = LaneTrace::new();
         assert_eq!(
             stream_lane_step(&from, &to, &mut buffer, &finish, &mut trace, "test"),
             lane_pool::Next::Retry,
