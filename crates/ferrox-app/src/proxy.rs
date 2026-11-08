@@ -10000,7 +10000,6 @@ where
             } else {
                 note_wait_finish(ended);
                 buffer.release();
-                trace.idle += 1;
                 Next::Idle
             }
         }
@@ -29686,7 +29685,6 @@ impl RelayFinish {
     }
 }
 
-#[derive(Default)]
 static LANE_ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 struct LaneTrace {
