@@ -1808,6 +1808,12 @@ impl Role {
         }
     }
 
+    /// Whether this role's setup waits on the peer's first request before the relay can start, so a
+    /// setup lane it holds is a worker the next connection cannot have.
+    fn setup_blocks_on_peer(&self) -> bool {
+        matches!(self, Role::VlessTls { .. } | Role::VlessReality { .. })
+    }
+
     /// Whether this role's TLS handshake can run on a lane instead of the accept thread.
     fn serves_polled_tls(&self) -> bool {
         matches!(self, Role::TrojanTls { .. })
@@ -3895,7 +3901,7 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
         }
         let tag = tag.map(str::to_owned);
         let accepted_at = Instant::now();
-        if role.tcp_stream() {
+        if role.tcp_stream() && !role.setup_blocks_on_peer() {
             let mut work = Some((stream, role, tag, sniffing));
             lane_pool::submit_setup(
                 Box::new(move || {
