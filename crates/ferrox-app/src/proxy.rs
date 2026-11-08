@@ -1352,6 +1352,14 @@ fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
     })
 }
 
+fn setup_ms() -> u128 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+}
+
 pub(crate) fn dial_or_report(target: &SocketAddr) -> Option<Connection> {
     match dial(target) {
         Ok(stream) => {
@@ -8522,6 +8530,7 @@ fn serve_vless_tls(
     }
     match carrier {
         Carrier::Raw(_) => {
+            let setup_at = std::time::Instant::now();
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(mut tls) = ferrox_core::tls::accept(server, stream) else {
                 return;
@@ -8529,6 +8538,11 @@ fn serve_vless_tls(
             if !shake_tls(&mut tls) {
                 return;
             }
+            eprintln!(
+                "ferrox-setup at={} hs={}",
+                setup_ms(),
+                setup_at.elapsed().as_millis()
+            );
             if let Some(decryption) = decryption {
                 if raw.set_read_timeout(Some(budgets::handshake())).is_err() {
                     return;
@@ -9245,7 +9259,13 @@ fn open_vless(
     if cmd != 1 || !freedom {
         return None;
     }
+    let dial_at = std::time::Instant::now();
     let uplink = dial_or_report(&target)?;
+    eprintln!(
+        "ferrox-setup at={} dial={}",
+        setup_ms(),
+        dial_at.elapsed().as_millis()
+    );
     if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
         eprintln!("tls: uplink timeout failed");
         return None;
@@ -9327,17 +9347,23 @@ fn relay_vless<S>(
                 front,
             );
         }
-        None => (
-            match decode_request_bounded_gated(
+        None => {
+            let req_at = std::time::Instant::now();
+            let decoded = match decode_request_bounded_gated(
                 &mut session,
                 |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
                 resolve_endpoint,
             ) {
                 Some(header) => Probe::Decoded(header),
                 None => Probe::Dropped,
-            },
-            Vec::new(),
-        ),
+            };
+            eprintln!(
+                "ferrox-setup at={} req={}",
+                setup_ms(),
+                req_at.elapsed().as_millis()
+            );
+            (decoded, Vec::new())
+        }
     };
     relay_vless_reply(
         session,
