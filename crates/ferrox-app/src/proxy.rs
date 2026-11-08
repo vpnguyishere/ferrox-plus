@@ -29685,6 +29685,45 @@ impl RelayFinish {
     }
 }
 
+#[derive(Default)]
+struct LaneTrace {
+    steps: u64,
+    bytes: u64,
+    read_ok: u64,
+    read_eof: u64,
+    read_timeout: u64,
+    read_yield: u64,
+    read_err: u64,
+    write_ok: u64,
+    write_err: u64,
+    read_nanos: u128,
+    write_nanos: u128,
+    reported: bool,
+}
+
+impl LaneTrace {
+    fn report(&mut self, name: &str) {
+        if self.reported {
+            return;
+        }
+        self.reported = true;
+        eprintln!(
+            "ferrox-lane {name} steps={} bytes={} rok={} reof={} rtimeout={} ryield={} rerr={} wok={} werr={} rms={} wms={}",
+            self.steps,
+            self.bytes,
+            self.read_ok,
+            self.read_eof,
+            self.read_timeout,
+            self.read_yield,
+            self.read_err,
+            self.write_ok,
+            self.write_err,
+            self.read_nanos / 1_000_000,
+            self.write_nanos / 1_000_000,
+        );
+    }
+}
+
 /// The one step of a plain half-to-half direction: read on the source's own clock, write the
 /// prefix the read reported, and end on EOF, a read the sibling ended, or a write error.
 fn stream_lane_step<R, W>(
@@ -29692,18 +29731,47 @@ fn stream_lane_step<R, W>(
     to: &Half<W>,
     buffer: &mut RelayBuf,
     ended: &Arc<RelayFinish>,
+    trace: &mut LaneTrace,
+    name: &str,
 ) -> Next
 where
     R: Read,
     W: Write,
 {
-    match from.read_once(buffer.as_mut()) {
-        Ok(0) => Next::Done,
-        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
+    trace.steps += 1;
+    let read_start = std::time::Instant::now();
+    let read = from.read_once(buffer.as_mut());
+    trace.read_nanos += read_start.elapsed().as_nanos();
+    match read {
+        Ok(0) => {
+            trace.read_eof += 1;
+            trace.report(name);
+            Next::Done
+        }
+        Ok(n) => {
+            trace.read_ok += 1;
+            trace.bytes += n as u64;
+            let write_start = std::time::Instant::now();
+            let written = to.write_once(buffer.filled(n));
+            trace.write_nanos += write_start.elapsed().as_nanos();
+            if written.is_ok() {
+                trace.write_ok += 1;
+                Next::More
+            } else {
+                trace.write_err += 1;
+                trace.report(name);
+                Next::Done
+            }
+        }
         // A record still arriving has progress behind it, so the step already spent its turn: the lane requeues rather than reading the yield as an idle peer.
-        Err(error) if is_driven_yield(&error) => Next::Retry,
+        Err(error) if is_driven_yield(&error) => {
+            trace.read_yield += 1;
+            Next::Retry
+        }
         Err(error) if is_timeout(&error) => {
+            trace.read_timeout += 1;
             if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                trace.report(name);
                 Next::Done
             } else {
                 note_wait_finish(ended);
@@ -29711,7 +29779,11 @@ where
                 Next::Idle
             }
         }
-        Ok(_) | Err(_) => Next::Done,
+        Err(_) => {
+            trace.read_err += 1;
+            trace.report(name);
+            Next::Done
+        }
     }
 }
 
@@ -29736,14 +29808,34 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     let flow = RelayFinish::new(close_first, Arc::clone(close), finish);
     let (up_a, up_b, up_flow) = (Arc::clone(&a), Arc::clone(&b), Arc::clone(&flow));
     let mut forward = RelayBuf::new();
+    let mut forward_trace = LaneTrace::default();
     lane_pool::submit(
-        Box::new(move || stream_lane_step(&up_a, &up_b, &mut forward, &up_flow)),
+        Box::new(move || {
+            stream_lane_step(
+                &up_a,
+                &up_b,
+                &mut forward,
+                &up_flow,
+                &mut forward_trace,
+                "fwd",
+            )
+        }),
         Box::new(stream_lane_done(&flow)),
     );
     let mut backward = RelayBuf::new();
+    let mut backward_trace = LaneTrace::default();
     let parked = Arc::clone(&flow);
     lane_pool::submit(
-        Box::new(move || stream_lane_step(&b, &a, &mut backward, &parked)),
+        Box::new(move || {
+            stream_lane_step(
+                &b,
+                &a,
+                &mut backward,
+                &parked,
+                &mut backward_trace,
+                "back",
+            )
+        }),
         Box::new(stream_lane_done(&flow)),
     );
     flow
@@ -36963,8 +37055,9 @@ mod tests {
         let from = Half::split(Yielding, Yielding);
         let to = Half::split(std::io::sink(), std::io::sink());
         let mut buffer = RelayBuf::new();
+        let mut trace = LaneTrace::default();
         assert_eq!(
-            stream_lane_step(&from, &to, &mut buffer, &finish),
+            stream_lane_step(&from, &to, &mut buffer, &finish, &mut trace, "test"),
             lane_pool::Next::Retry,
             "a yield is progress, not the end of the flow"
         );
