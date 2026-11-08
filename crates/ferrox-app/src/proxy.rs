@@ -29698,6 +29698,8 @@ struct LaneTrace {
     write_err: u64,
     read_nanos: u128,
     write_nanos: u128,
+    gap_nanos: u128,
+    last_end: Option<std::time::Instant>,
     reported: bool,
 }
 
@@ -29708,7 +29710,7 @@ impl LaneTrace {
         }
         self.reported = true;
         eprintln!(
-            "ferrox-lane {name} steps={} bytes={} rok={} reof={} rtimeout={} ryield={} rerr={} wok={} werr={} rms={} wms={}",
+            "ferrox-lane {name} steps={} bytes={} rok={} reof={} rtimeout={} ryield={} rerr={} wok={} werr={} rms={} wms={} gapms={}",
             self.steps,
             self.bytes,
             self.read_ok,
@@ -29720,6 +29722,7 @@ impl LaneTrace {
             self.write_err,
             self.read_nanos / 1_000_000,
             self.write_nanos / 1_000_000,
+            self.gap_nanos / 1_000_000,
         );
     }
 }
@@ -29738,14 +29741,17 @@ where
     R: Read,
     W: Write,
 {
+    let start = std::time::Instant::now();
+    if let Some(prev) = trace.last_end {
+        trace.gap_nanos += start.duration_since(prev).as_nanos();
+    }
     trace.steps += 1;
     let read_start = std::time::Instant::now();
     let read = from.read_once(buffer.as_mut());
     trace.read_nanos += read_start.elapsed().as_nanos();
-    match read {
+    let next = match read {
         Ok(0) => {
             trace.read_eof += 1;
-            trace.report(name);
             Next::Done
         }
         Ok(n) => {
@@ -29759,7 +29765,6 @@ where
                 Next::More
             } else {
                 trace.write_err += 1;
-                trace.report(name);
                 Next::Done
             }
         }
@@ -29771,7 +29776,6 @@ where
         Err(error) if is_timeout(&error) => {
             trace.read_timeout += 1;
             if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
-                trace.report(name);
                 Next::Done
             } else {
                 note_wait_finish(ended);
@@ -29781,10 +29785,14 @@ where
         }
         Err(_) => {
             trace.read_err += 1;
-            trace.report(name);
             Next::Done
         }
+    };
+    trace.last_end = Some(std::time::Instant::now());
+    if matches!(next, Next::Done) {
+        trace.report(name);
     }
+    next
 }
 
 /// A finished lane's bookkeeping: the sibling sees the end, and the pair closes when both have.
@@ -29827,14 +29835,7 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     let parked = Arc::clone(&flow);
     lane_pool::submit(
         Box::new(move || {
-            stream_lane_step(
-                &b,
-                &a,
-                &mut backward,
-                &parked,
-                &mut backward_trace,
-                "back",
-            )
+            stream_lane_step(&b, &a, &mut backward, &parked, &mut backward_trace, "back")
         }),
         Box::new(stream_lane_done(&flow)),
     );
