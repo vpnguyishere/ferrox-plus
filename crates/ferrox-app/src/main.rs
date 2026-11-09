@@ -98,10 +98,12 @@ mod xhttp_h3;
 mod xmux;
 mod xray_pb;
 
+use crate::proxy::exit;
 use ferrox_core::policy::UnsafeOptIn;
 use ferrox_core::transport::Support;
-use std::io::Read as _;
-use std::io::Write as _;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// Set by `-test`, so the startup exits answer xray's way: `Failed to start:` and status 23.
@@ -661,15 +663,7 @@ fn serve_from_flags(args: &[String]) -> ! {
     }
     let source = configs.pop().unwrap_or_else(discover_config);
     let format = source_format(format.as_deref(), &source);
-    if source == "stdin" || source == "stdin:" {
-        let mut bytes = Vec::new();
-        if let Err(error) = std::io::stdin().read_to_end(&mut bytes) {
-            proxy::exit(&format!("cannot read stdin: {error}"));
-        }
-        serve_source("stdin:", &bytes, format);
-    }
-    let bytes = std::fs::read(&source)
-        .unwrap_or_else(|error| proxy::exit(&format!("cannot read {source}: {error}")));
+    let bytes = read_source(&source);
     serve_source(&source, &bytes, format)
 }
 
@@ -724,8 +718,7 @@ fn serve_files(files: &[String], format: Option<&str>) -> ! {
         if matches!(source_format(format, file), SourceFormat::Protobuf) {
             proxy::exit("Only one protobuf config file is allowed");
         }
-        let bytes = std::fs::read(file)
-            .unwrap_or_else(|error| proxy::exit(&format!("cannot read {file}: {error}")));
+        let bytes = read_source(file);
         let body = std::str::from_utf8(&bytes)
             .unwrap_or_else(|error| proxy::exit(&format!("bad config {file}: {error}")));
         let root = crate::json::parse(body)
@@ -775,6 +768,8 @@ fn dump_config(configs: &[String]) -> ! {
                 dump_fail(&format!("cannot read stdin: {error}"));
             }
             bytes
+        } else if file.starts_with("http://") || file.starts_with("https://") {
+            fetch_http(file)
         } else {
             std::fs::read(file)
                 .unwrap_or_else(|error| dump_fail(&format!("cannot read {file}: {error}")))
@@ -877,8 +872,228 @@ fn serve_source(label: &str, bytes: &[u8], format: SourceFormat) -> ! {
     }
 }
 
+/// Read one `-config` source the way xray's `ConfigLoader` does: stdin, a file, or an HTTP(S) URL.
+/// Unix-socket sources refuse, named as such.
+fn read_source(source: &str) -> Vec<u8> {
+    if source == "stdin:" || source == "stdin" {
+        let mut bytes = Vec::new();
+        if let Err(error) = std::io::stdin().read_to_end(&mut bytes) {
+            proxy::exit(&format!("cannot read stdin: {error}"));
+        }
+        bytes
+    } else if source.starts_with("http+unix://") {
+        fetch_http_unix(source.strip_prefix("http+unix://").unwrap_or(source))
+    } else if source.starts_with("http://") || source.starts_with("https://") {
+        fetch_http(source)
+    } else {
+        std::fs::read(source)
+            .unwrap_or_else(|error| proxy::exit(&format!("cannot read {source}: {error}")))
+    }
+}
+
+fn fetch_http_unix(source: &str) -> Vec<u8> {
+    proxy::exit(&format!(
+        "cannot read {source}: http+unix config sources are not carried"
+    ));
+}
+
+fn tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    Arc::clone(CONFIG.get_or_init(|| {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        for der in crate::quic::system_roots().iter() {
+            let _ = roots.add(rustls::pki_types::CertificateDer::from(der.as_slice()));
+        }
+        let roots = Arc::new(roots);
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map(|builder| builder.with_root_certificates(roots))
+            .map(|builder| builder.with_no_client_auth())
+            .expect("fetch config is stock");
+        Arc::new(config)
+    }))
+}
+
+fn fetch_http(target: &str) -> Vec<u8> {
+    let parsed = parse_http_url(target);
+    let (host, port, path, tls) = match parsed {
+        Some(parsed) => parsed,
+        None => exit(&format!("invalid URL: {target}")),
+    };
+    let address = format!("{host}:{port}");
+    let socket = address
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .unwrap_or_else(|| exit(&format!("failed to dial to {target}")));
+    let stream = TcpStream::connect_timeout(&socket, Duration::from_secs(30))
+        .unwrap_or_else(|error| exit(&format!("failed to dial to {target}: {error}")));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    if tls {
+        let server_name = match rustls::pki_types::ServerName::try_from(host.clone()) {
+            Ok(name) => name,
+            Err(_) => exit(&format!("invalid URL: {target}")),
+        };
+        let conn = rustls::ClientConnection::new(tls_config(), server_name);
+        let mut tls = rustls::StreamOwned::new(conn, stream);
+        http_get(&mut tls, &host, port, &path, target)
+    } else {
+        let mut stream = stream;
+        http_get(&mut stream, &host, port, &path, target)
+    }
+}
+
+fn http_get(
+    stream: &mut (impl Read + Write),
+    host: &str,
+    port: u16,
+    path: &str,
+    target: &str,
+) -> Vec<u8> {
+    let host_header = if (host.contains(':') && !host.starts_with('[')) || host == "::1" {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+    if let Err(error) = stream.write_all(request.as_bytes()) {
+        exit(&format!("failed to dial to {target}: {error}"));
+    }
+    let mut head = Vec::with_capacity(4096);
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => exit(&format!("failed to read HTTP response")),
+            Ok(_) => {
+                head.extend_from_slice(&byte);
+                if head.len() > 65536 || head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(error) => exit(&format!("failed to read HTTP response: {error}")),
+        }
+    }
+    let status = http_status(&head);
+    if status != 200 {
+        exit(&format!("unexpected HTTP status code: {status}"));
+    }
+    let mut body = Vec::new();
+    let mut rest = [0u8; 8192];
+    loop {
+        match stream.read(&mut rest) {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&rest[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => exit(&format!("failed to read HTTP response: {error}")),
+        }
+    }
+    body
+}
+
+fn http_status(head: &[u8]) -> u16 {
+    let line = head.split(|b| *b == b'\n').next().unwrap_or(&[]);
+    let line = String::from_utf8_lossy(line);
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
+}
+
+fn parse_http_url(target: &str) -> Option<(String, u16, String, bool)> {
+    let (tls, rest) = if let Some(rest) = target.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = target.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return None;
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        let port = rest[end + 1..].strip_prefix(':')?.parse::<u16>().ok()?;
+        (host.to_owned(), port)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        (host.to_owned(), port.parse::<u16>().ok()?)
+    } else {
+        (authority.to_owned(), if tls { 443 } else { 80 })
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let path = path.split('#').next().unwrap_or("/").to_owned();
+    Some((host, port, path, tls))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_http_url_splits_authority_path_and_scheme() {
+        assert_eq!(
+            super::parse_http_url("http://example.com/a/b.json"),
+            Some(("example.com".to_owned(), 80, "/a/b.json".to_owned(), false))
+        );
+        assert_eq!(
+            super::parse_http_url("https://example.com:8443/x?y=1"),
+            Some(("example.com".to_owned(), 8443, "/x?y=1".to_owned(), true))
+        );
+        assert_eq!(
+            super::parse_http_url("http://[::1]:8080/"),
+            Some(("::1".to_owned(), 8080, "/".to_owned(), false))
+        );
+        assert_eq!(
+            super::parse_http_url("https://example.com"),
+            Some(("example.com".to_owned(), 443, "/".to_owned(), true))
+        );
+        assert_eq!(super::parse_http_url("mailto:example.com"), None);
+        assert_eq!(super::parse_http_url("http://"), None);
+    }
+
+    #[test]
+    fn http_status_reads_the_first_line() {
+        assert_eq!(super::http_status(b"HTTP/1.1 200 OK\r\n"), 200);
+        assert_eq!(super::http_status(b"HTTP/1.1 404 Not Found\r\n"), 404);
+        assert_eq!(super::http_status(b"garbage"), 0);
+    }
+
+    #[test]
+    fn a_config_http_get_fetches_the_body_from_a_loopback_server() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::thread;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                if stream.read(&mut byte).expect("reads") == 0 {
+                    break;
+                }
+                head.extend_from_slice(&byte);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"{"inbounds":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("writes");
+        });
+        let url = format!("http://127.0.0.1:{port}/config.json");
+        let body = super::fetch_http(&url);
+        assert_eq!(body, b"{\"inbounds\":[]}");
+    }
+
     #[test]
     fn shadowsocks_server_password_shape() {
         let root = crate::json::parse(
