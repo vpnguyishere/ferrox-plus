@@ -8538,8 +8538,16 @@ fn serve_vless_tls(
                 serve_sealed_session(tls, peer, users, freedom, &close, Some(raw), decryption);
                 return;
             }
-            let front = FrontNames::of(&tls);
-            relay_vless(tls, Some(raw), users, freedom, true, fallbacks, &front);
+            if fallbacks.is_none() {
+                let users: Arc<[VlessUser]> = Arc::from(users);
+                park_request(tls, move |tls, prefix| {
+                    let front = FrontNames::of(&tls);
+                    relay_vless(tls, Some(raw), &users, freedom, true, None, &front, &prefix);
+                });
+            } else {
+                let front = FrontNames::of(&tls);
+                relay_vless(tls, Some(raw), users, freedom, true, fallbacks, &front, &[]);
+            }
         }
         Carrier::Ws { path, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -8648,6 +8656,7 @@ fn serve_vless_kcp_tls(
         false,
         None,
         &FrontNames::default(),
+        &[],
     );
 }
 
@@ -8719,9 +8728,7 @@ where
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     let mut session = Some(session);
     let mut finish = Some(finish);
-    let mut transport = Some(transport);
     let mut handshaken = false;
-    let mut request_until = None;
     lane_pool::submit(
         Box::new(move || {
             let Some(mut current) = session.take() else {
@@ -8729,10 +8736,7 @@ where
             };
             if !handshaken {
                 match current.handshake() {
-                    Ok(()) => {
-                        handshaken = true;
-                        request_until = Some(Instant::now() + budgets::handshake());
-                    }
+                    Ok(()) => handshaken = true,
                     Err(ferrox_core::tls::TlsError::Timeout) if Instant::now() < deadline => {
                         session = Some(current);
                         return Next::Idle;
@@ -8740,7 +8744,39 @@ where
                     Err(_) => return Next::Done,
                 }
             }
-            if request_until.is_some_and(|until| Instant::now() >= until) {
+            if let Some(finish) = finish.take() {
+                park_request(current, finish);
+            }
+            Next::Done
+        }),
+        Box::new(|| {}),
+    );
+}
+
+/// Parks the peer's first request on a relay lane: an empty read hands the wait back instead of pinning a worker, and the bytes it drained ride ahead of the live stream.
+fn park_request<S, F>(session: S, finish: F)
+where
+    S: ferrox_core::tls::TlsProvider + Drivable + Send + 'static,
+    F: FnOnce(S, Vec<u8>) + Send + 'static,
+{
+    let Some(transport) = session.transport() else {
+        finish(session, Vec::new());
+        return;
+    };
+    if transport.set_nonblocking(true).is_err() {
+        finish(session, Vec::new());
+        return;
+    }
+    let deadline = Instant::now() + budgets::handshake();
+    let mut session = Some(session);
+    let mut finish = Some(finish);
+    let mut transport = Some(transport);
+    lane_pool::submit(
+        Box::new(move || {
+            let Some(mut current) = session.take() else {
+                return Next::Done;
+            };
+            if Instant::now() >= deadline {
                 return Next::Done;
             }
             match read_ready_prefix(&mut current) {
@@ -9151,8 +9187,16 @@ fn finish_reality<S>(
         serve_sealed_session(session, peer, users, freedom, &close, raw, decryption);
         return;
     }
-    let front = FrontNames::of(&session);
-    relay_vless(session, raw, users, freedom, true, fallbacks, &front);
+    if fallbacks.is_none() {
+        let users: Arc<[VlessUser]> = Arc::from(users);
+        park_request(session, move |session, prefix| {
+            let front = FrontNames::of(&session);
+            relay_vless(session, raw, &users, freedom, true, None, &front, &prefix);
+        });
+    } else {
+        let front = FrontNames::of(&session);
+        relay_vless(session, raw, users, freedom, true, fallbacks, &front, &[]);
+    }
 }
 
 /// A carrier write end that can be handed to the relay lanes: the writer behind one lock, so the
@@ -9301,6 +9345,7 @@ fn relay_vless<S>(
     vision: bool,
     fallbacks: Option<&[Fallback]>,
     front: &FrontNames,
+    prefix: &[u8],
 ) where
     S: std::io::Read
         + std::io::Write
@@ -9327,17 +9372,49 @@ fn relay_vless<S>(
                 front,
             );
         }
-        None => (
-            match decode_request_bounded_gated(
-                &mut session,
-                |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
-                resolve_endpoint,
-            ) {
-                Some(header) => Probe::Decoded(header),
-                None => Probe::Dropped,
-            },
-            Vec::new(),
-        ),
+        None => {
+            let mut carried = Vec::new();
+            let probe = if prefix.is_empty() {
+                match decode_request_bounded_gated(
+                    &mut session,
+                    |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
+                    resolve_endpoint,
+                ) {
+                    Some(header) => Probe::Decoded(header),
+                    None => Probe::Dropped,
+                }
+            } else {
+                let mut bounded = HandshakeDeadline {
+                    inner: &mut session,
+                    until: Instant::now() + budgets::handshake(),
+                };
+                let (decoded, consumed) = {
+                    let mut replay = Prefixed {
+                        head: prefix,
+                        at: 0,
+                        tail: &mut bounded,
+                        carried: &mut carried,
+                    };
+                    let decoded = decode_request_gated(
+                        &mut replay,
+                        |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
+                        resolve_endpoint,
+                    );
+                    (decoded, replay.at)
+                };
+                if consumed < prefix.len() {
+                    let mut rest = Vec::with_capacity(prefix.len() - consumed + carried.len());
+                    rest.extend_from_slice(&prefix[consumed..]);
+                    rest.extend_from_slice(&carried);
+                    carried = rest;
+                }
+                match decoded {
+                    Some(header) => Probe::Decoded(header),
+                    None => Probe::Dropped,
+                }
+            };
+            (probe, carried)
+        }
     };
     relay_vless_reply(
         session,
@@ -38844,6 +38921,7 @@ mod tests {
                 true,
                 None,
                 &FrontNames::default(),
+                &[],
             );
         });
 
