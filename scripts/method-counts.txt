@@ -683,7 +683,7 @@ unix unix-timeout-bound-read-back 50 ferrox-app-conn::tests::a_unix_read_timeout
 unix unix-path-past-the-field-refused 200 ferrox-app-conn::tests::a_unix_path_past_the_socket_field_is_refused
 
 # --- tun device inbound -----------------------------------------------------
-front-tun-smoltcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
+front-tun-smoltcp ops-retired-instructions 32598 scripts/count-ops.sh
 front-tun-smoltcp syscalls-per-tun-packet UNBLESSED no syscall checker yet
 front-tun-smoltcp user-space-copies-per-tun-packet UNBLESSED no copy checker yet
 front-tun-smoltcp time-tcp-down-1 ferrox=9.883Gbit/s,zeptun=17.937Gbit/s,ratio=0.55 tun-bench.yml
