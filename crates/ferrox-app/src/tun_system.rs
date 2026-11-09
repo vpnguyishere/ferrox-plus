@@ -87,7 +87,6 @@ struct TcpView {
     destination_port: u16,
     flags: u8,
     l4: usize,
-    total: usize,
 }
 
 impl Nat {
@@ -336,7 +335,6 @@ fn tcp_view(packet: &[u8]) -> Option<TcpView> {
         destination_port,
         flags: *packet.get(l4 + 13)?,
         l4,
-        total,
     })
 }
 
