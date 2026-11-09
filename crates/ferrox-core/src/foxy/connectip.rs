@@ -733,6 +733,17 @@ pub fn ipv4_checksum(header: &[u8]) -> u16 {
     !fold(word_sum(header))
 }
 
+/// The checksum a stored value becomes when the words it covered change from `old` to `new`: RFC 1624's incremental update, reading only the replaced words instead of the whole run.
+pub fn checksum_update(checksum: u16, old: &[u8], new: &[u8]) -> u16 {
+    debug_assert_eq!(old.len(), new.len());
+    let delta = i64::from(word_sum(new)) - i64::from(word_sum(old));
+    let mut sum = i64::from(!checksum) + delta;
+    while !(0..=0xffff).contains(&sum) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 /// The TCP checksum of a segment this lane builds (RFC 793), summed without materialising the twelve-byte pseudo-header: the addresses contribute their word runs, the protocol (6) and the segment length their own words, and the segment — header with its checksum field read as zero plus payload — is summed where it already lies. The same one's-complement sum the materialised pseudo-header and a copy of the whole segment reached, so the bytes on the device are unchanged and the throwaway vector and its copy are gone.
 pub fn tcp_checksum(source: &[u8], destination: &[u8], segment: &[u8]) -> u16 {
     const TCP_PROTOCOL: u32 = 6;
@@ -1605,6 +1616,44 @@ mod tests {
                 .collect();
             assert_eq!(checksum(&bytes), oracle(&bytes), "block boundary len {len}");
         }
+    }
+
+    /// RFC 1624's incremental update is the full checksum after the same prefix words move, at every prefix and payload length, including carries and an odd boundary.
+    #[test]
+    fn an_incremental_checksum_is_the_full_checksum_after_the_words_move() {
+        for old_len in 0..=17usize {
+            for payload_len in 0..=34usize {
+                let old: Vec<u8> = (0..old_len)
+                    .map(|i| (i as u8).wrapping_mul(29).wrapping_add(7))
+                    .collect();
+                let new: Vec<u8> = (0..old_len)
+                    .map(|i| (i as u8).wrapping_mul(101).wrapping_add(3))
+                    .collect();
+                let payload: Vec<u8> = (0..payload_len)
+                    .map(|i| (i as u8).wrapping_mul(53).wrapping_add(11))
+                    .collect();
+                let mut before = old.clone();
+                before.extend_from_slice(&payload);
+                let mut after = new.clone();
+                after.extend_from_slice(&payload);
+                assert_eq!(
+                    checksum_update(checksum(&before), &old, &new),
+                    checksum(&after),
+                    "old {old_len}, payload {payload_len}"
+                );
+            }
+        }
+        let old = [0xffu8; 8];
+        let new = [0x00u8; 8];
+        let payload = [0xffu8; 9];
+        let mut before = old.to_vec();
+        before.extend_from_slice(&payload);
+        let mut after = new.to_vec();
+        after.extend_from_slice(&payload);
+        assert_eq!(
+            checksum_update(checksum(&before), &old, &new),
+            checksum(&after)
+        );
     }
 
     /// The eight-byte lane is the two-byte word walk it replaces, folded to the same residue at every length through several lanes and every remainder modulo eight — the sweep that catches a lost tail byte, a misaligned pair or a carry the lane swallowed.
