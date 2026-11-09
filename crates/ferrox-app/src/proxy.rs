@@ -8538,7 +8538,7 @@ fn serve_vless_tls(
                 serve_sealed_session(tls, peer, users, freedom, &close, Some(raw), decryption);
                 return;
             }
-            if fallbacks.is_none() {
+            if fallbacks.is_none() && users.iter().all(|user| !matches!(user.flow, Flow::Vision)) {
                 let users: Arc<[VlessUser]> = Arc::from(users);
                 park_request(tls, move |tls, prefix| {
                     let front = FrontNames::of(&tls);
@@ -8728,7 +8728,9 @@ where
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     let mut session = Some(session);
     let mut finish = Some(finish);
+    let mut transport = Some(transport);
     let mut handshaken = false;
+    let mut request_until = None;
     lane_pool::submit(
         Box::new(move || {
             let Some(mut current) = session.take() else {
@@ -8736,7 +8738,10 @@ where
             };
             if !handshaken {
                 match current.handshake() {
-                    Ok(()) => handshaken = true,
+                    Ok(()) => {
+                        handshaken = true;
+                        request_until = Some(Instant::now() + budgets::handshake());
+                    }
                     Err(ferrox_core::tls::TlsError::Timeout) if Instant::now() < deadline => {
                         session = Some(current);
                         return Next::Idle;
@@ -8744,10 +8749,27 @@ where
                     Err(_) => return Next::Done,
                 }
             }
-            if let Some(finish) = finish.take() {
-                park_request(current, finish);
+            if request_until.is_some_and(|until| Instant::now() >= until) {
+                return Next::Done;
             }
-            Next::Done
+            match read_ready_prefix(&mut current) {
+                Some(prefix) if !prefix.is_empty() => {
+                    if let Some(transport) = transport.take() {
+                        let _ = transport.set_nonblocking(false);
+                        let _ = transport.set_read_timeout(Some(RELAY_POLL));
+                    }
+                    if let Some(finish) = finish.take() {
+                        let _lane = HandshakeLane::enter();
+                        finish(current, prefix);
+                    }
+                    Next::Done
+                }
+                Some(_) => {
+                    session = Some(current);
+                    Next::Idle
+                }
+                None => Next::Done,
+            }
         }),
         Box::new(|| {}),
     );
@@ -9187,7 +9209,7 @@ fn finish_reality<S>(
         serve_sealed_session(session, peer, users, freedom, &close, raw, decryption);
         return;
     }
-    if fallbacks.is_none() {
+    if fallbacks.is_none() && users.iter().all(|user| !matches!(user.flow, Flow::Vision)) {
         let users: Arc<[VlessUser]> = Arc::from(users);
         park_request(session, move |session, prefix| {
             let front = FrontNames::of(&session);
