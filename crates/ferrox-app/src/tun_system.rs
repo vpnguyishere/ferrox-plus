@@ -354,6 +354,9 @@ fn rewrite_tcp(
         return false;
     };
     let mut checksum = u16::from_be_bytes([tcp[16], tcp[17]]);
+    // One's-complement addition is linear: one delta over the changed words equals the sequential deltas.
+    let mut old = [0u8; 36];
+    let mut new = [0u8; 36];
     // The view and the NAT peer share a family; a mismatch stays with the userspace stack.
     match (view.source, view.destination, source, destination) {
         (
@@ -362,17 +365,29 @@ fn rewrite_tcp(
             IpAddr::V4(source),
             IpAddr::V4(destination),
         ) => {
+            old[..4].copy_from_slice(&old_source.octets());
+            old[4..8].copy_from_slice(&old_destination.octets());
+            old[8..10].copy_from_slice(&view.source_port.to_be_bytes());
+            old[10..12].copy_from_slice(&view.destination_port.to_be_bytes());
+            new[..4].copy_from_slice(&source.octets());
+            new[4..8].copy_from_slice(&destination.octets());
+            new[8..10].copy_from_slice(&source_port.to_be_bytes());
+            new[10..12].copy_from_slice(&destination_port.to_be_bytes());
+            let Some(header) = packet.get(10..12) else {
+                return false;
+            };
+            let header = checksum_update(
+                u16::from_be_bytes([header[0], header[1]]),
+                &old[..8],
+                &new[..8],
+            );
+            checksum = checksum_update(checksum, &old[..12], &new[..12]);
             let Some(ip) = packet.get_mut(10..20) else {
                 return false;
             };
             ip[2..6].copy_from_slice(&source.octets());
             ip[6..10].copy_from_slice(&destination.octets());
-            let mut header = u16::from_be_bytes([ip[0], ip[1]]);
-            header = checksum_update(header, &old_source.octets(), &source.octets());
-            header = checksum_update(header, &old_destination.octets(), &destination.octets());
             ip[0..2].copy_from_slice(&header.to_be_bytes());
-            checksum = checksum_update(checksum, &old_source.octets(), &source.octets());
-            checksum = checksum_update(checksum, &old_destination.octets(), &destination.octets());
         }
         (
             IpAddr::V6(old_source),
@@ -380,26 +395,23 @@ fn rewrite_tcp(
             IpAddr::V6(source),
             IpAddr::V6(destination),
         ) => {
+            old[..16].copy_from_slice(&old_source.octets());
+            old[16..32].copy_from_slice(&old_destination.octets());
+            old[32..34].copy_from_slice(&view.source_port.to_be_bytes());
+            old[34..36].copy_from_slice(&view.destination_port.to_be_bytes());
+            new[..16].copy_from_slice(&source.octets());
+            new[16..32].copy_from_slice(&destination.octets());
+            new[32..34].copy_from_slice(&source_port.to_be_bytes());
+            new[34..36].copy_from_slice(&destination_port.to_be_bytes());
+            checksum = checksum_update(checksum, &old[..36], &new[..36]);
             let Some(ip) = packet.get_mut(8..40) else {
                 return false;
             };
             ip[..16].copy_from_slice(&source.octets());
             ip[16..].copy_from_slice(&destination.octets());
-            checksum = checksum_update(checksum, &old_source.octets(), &source.octets());
-            checksum = checksum_update(checksum, &old_destination.octets(), &destination.octets());
         }
         _ => return false,
     }
-    checksum = checksum_update(
-        checksum,
-        &view.source_port.to_be_bytes(),
-        &source_port.to_be_bytes(),
-    );
-    checksum = checksum_update(
-        checksum,
-        &view.destination_port.to_be_bytes(),
-        &destination_port.to_be_bytes(),
-    );
     let Some(tcp) = packet.get_mut(view.l4..l4_end) else {
         return false;
     };
