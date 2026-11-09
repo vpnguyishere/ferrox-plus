@@ -2837,11 +2837,22 @@ mod tests {
         for psk in [key(2), key(3)] {
             echo_through(port, &format!("{}:{psk}", key(1)), method, target);
         }
-        let snapshot = crate::stats::snapshot();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let snapshot = loop {
+            let snapshot = crate::stats::snapshot();
+            if snapshot.user["alice@example"].downlink >= 4
+                && snapshot.user["ss-in#1#"].downlink >= 4
+            {
+                break snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the served downlink was not metered before the deadline"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
         assert_eq!(snapshot.user["alice@example"].uplink, 38);
         assert_eq!(snapshot.user["ss-in#1#"].uplink, 38);
-        assert!(snapshot.user["alice@example"].downlink >= 4);
-        assert!(snapshot.user["ss-in#1#"].downlink >= 4);
         assert!(
             !snapshot.user.contains_key("ss-in#1"),
             "the configured email of another inbound received no traffic"
