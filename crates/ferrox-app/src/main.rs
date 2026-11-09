@@ -103,7 +103,6 @@ use ferrox_core::policy::UnsafeOptIn;
 use ferrox_core::transport::Support;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// Set by `-test`, so the startup exits answer xray's way: `Failed to start:` and status 23.
@@ -897,29 +896,9 @@ fn fetch_http_unix(source: &str) -> Vec<u8> {
     ));
 }
 
-fn tls_config() -> Arc<rustls::ClientConfig> {
-    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    Arc::clone(CONFIG.get_or_init(|| {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut roots = rustls::RootCertStore::empty();
-        for der in crate::quic::system_roots().iter() {
-            let _ = roots.add(rustls::pki_types::CertificateDer::from(der.as_slice()));
-        }
-        let roots = Arc::new(roots);
-        let config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map(|builder| builder.with_root_certificates(roots))
-            .map(|builder| builder.with_no_client_auth())
-            .expect("fetch config is stock");
-        Arc::new(config)
-    }))
-}
-
 fn fetch_http(target: &str) -> Vec<u8> {
-    let parsed = parse_http_url(target);
-    let (host, port, path, tls) = match parsed {
-        Some(parsed) => parsed,
-        None => exit(&format!("invalid URL: {target}")),
+    let Some((host, port, path, tls)) = parse_http_url(target) else {
+        exit(&format!("invalid URL: {target}"));
     };
     let address = format!("{host}:{port}");
     let socket = address
@@ -932,13 +911,14 @@ fn fetch_http(target: &str) -> Vec<u8> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     if tls {
-        let server_name = match rustls::pki_types::ServerName::try_from(host.clone()) {
-            Ok(name) => name,
-            Err(_) => exit(&format!("invalid URL: {target}")),
+        let cfg = ferrox_core::tls::TlsConfig {
+            server_name: host.clone(),
+            roots: crate::quic::system_roots(),
+            ..Default::default()
         };
-        let conn = rustls::ClientConnection::new(tls_config(), server_name);
-        let mut tls = rustls::StreamOwned::new(conn, stream);
-        http_get(&mut tls, &host, port, &path, target)
+        let mut provider = ferrox_core::tls::RustlsProvider::connect(&cfg, stream)
+            .unwrap_or_else(|error| exit(&format!("failed to dial to {target}: {error}")));
+        http_get(&mut provider, &host, port, &path, target)
     } else {
         let mut stream = stream;
         http_get(&mut stream, &host, port, &path, target)
@@ -966,7 +946,7 @@ fn http_get(
     let mut byte = [0u8; 1];
     loop {
         match stream.read(&mut byte) {
-            Ok(0) => exit(&format!("failed to read HTTP response")),
+            Ok(0) => exit("failed to read HTTP response"),
             Ok(_) => {
                 head.extend_from_slice(&byte);
                 if head.len() > 65536 || head.ends_with(b"\r\n\r\n") {
@@ -986,7 +966,7 @@ fn http_get(
         match stream.read(&mut rest) {
             Ok(0) => break,
             Ok(n) => body.extend_from_slice(&rest[..n]),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => exit(&format!("failed to read HTTP response: {error}")),
         }
     }
@@ -1005,10 +985,9 @@ fn http_status(head: &[u8]) -> u16 {
 fn parse_http_url(target: &str) -> Option<(String, u16, String, bool)> {
     let (tls, rest) = if let Some(rest) = target.strip_prefix("https://") {
         (true, rest)
-    } else if let Some(rest) = target.strip_prefix("http://") {
-        (false, rest)
     } else {
-        return None;
+        let rest = target.strip_prefix("http://")?;
+        (false, rest)
     };
     let (authority, path) = match rest.find('/') {
         Some(at) => (&rest[..at], &rest[at..]),
