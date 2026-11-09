@@ -9359,6 +9359,7 @@ impl FrontNames {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn relay_vless<S>(
     mut session: S,
     raw: Option<Connection>,
@@ -9377,65 +9378,60 @@ fn relay_vless<S>(
         + CipherOpen
         + 'static,
 {
-    let (probe, carried) = match fallbacks {
-        // With a table on, the reference's first read and its verdict name the flow as a header or a probe.
-        Some(_) => {
-            let mut window = [0u8; PROBE_READ];
-            let (probe, consumed, carried) = probe_front(&mut session, users, &mut window);
-            return relay_vless_reply(
-                session,
-                raw,
-                users,
-                freedom,
-                vision,
-                fallbacks,
-                &window[..consumed],
-                (probe, carried),
-                front,
-            );
+    // With a table on, the reference's first read and its verdict name the flow as a header or a probe.
+    if fallbacks.is_some() {
+        let mut window = [0u8; PROBE_READ];
+        let (probe, consumed, carried) = probe_front(&mut session, users, &mut window);
+        return relay_vless_reply(
+            session,
+            raw,
+            users,
+            freedom,
+            vision,
+            fallbacks,
+            &window[..consumed],
+            (probe, carried),
+            front,
+        );
+    }
+    let mut carried = Vec::new();
+    let probe = if prefix.is_empty() {
+        match decode_request_bounded_gated(
+            &mut session,
+            |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
+            resolve_endpoint,
+        ) {
+            Some(header) => Probe::Decoded(header),
+            None => Probe::Dropped,
         }
-        None => {
-            let mut carried = Vec::new();
-            let probe = if prefix.is_empty() {
-                match decode_request_bounded_gated(
-                    &mut session,
-                    |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
-                    resolve_endpoint,
-                ) {
-                    Some(header) => Probe::Decoded(header),
-                    None => Probe::Dropped,
-                }
-            } else {
-                let mut bounded = HandshakeDeadline {
-                    inner: &mut session,
-                    until: Instant::now() + budgets::handshake(),
-                };
-                let (decoded, consumed) = {
-                    let mut replay = Prefixed {
-                        head: prefix,
-                        at: 0,
-                        tail: &mut bounded,
-                        carried: &mut carried,
-                    };
-                    let decoded = decode_request_gated(
-                        &mut replay,
-                        |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
-                        resolve_endpoint,
-                    );
-                    (decoded, replay.at)
-                };
-                if consumed < prefix.len() {
-                    let mut rest = Vec::with_capacity(prefix.len() - consumed + carried.len());
-                    rest.extend_from_slice(&prefix[consumed..]);
-                    rest.extend_from_slice(&carried);
-                    carried = rest;
-                }
-                match decoded {
-                    Some(header) => Probe::Decoded(header),
-                    None => Probe::Dropped,
-                }
+    } else {
+        let mut bounded = HandshakeDeadline {
+            inner: &mut session,
+            until: Instant::now() + budgets::handshake(),
+        };
+        let (decoded, consumed) = {
+            let mut replay = Prefixed {
+                head: prefix,
+                at: 0,
+                tail: &mut bounded,
+                carried: &mut carried,
             };
-            (probe, carried)
+            let decoded = decode_request_gated(
+                &mut replay,
+                |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
+                resolve_endpoint,
+            );
+            (decoded, replay.at)
+        };
+        if consumed < prefix.len() {
+            let mut rest = Vec::with_capacity(prefix.len() - consumed + carried.len());
+            rest.extend_from_slice(&prefix[consumed..]);
+            rest.extend_from_slice(&carried);
+            carried = rest;
+        }
+        match decoded {
+            Some(header) => Probe::Decoded(header),
+            None => Probe::Dropped,
         }
     };
     relay_vless_reply(
