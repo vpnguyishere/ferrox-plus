@@ -2016,6 +2016,12 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
     let _ = reader.join();
 }
 
+/// Take one queued datagram under the connection lock and release it before the caller relays, so the driver never waits behind a socket send.
+fn recv_one<T>(shared: &Mutex<T>, next: impl FnOnce(&mut T) -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+    let mut guard = shared.lock().ok()?;
+    next(&mut guard)
+}
+
 /// Drive the connection and hand every whole datagram of the flow being relayed back to the relay socket, re-wrapped in the socks5 UDP frame the client sent its first packet in. The drive stays `drive_once`'s, shared with the TCP pump, so writer and reader take the connection lock in the same one-turn shape and neither holds it across a socket wait; the `UDP_POLL` bound is how long a stop flag outlives the reader, since a UDP socket has no shutdown to wake a blocked read.
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
     let mut reply_head = Vec::with_capacity(22);
@@ -2023,10 +2029,8 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
         if stop.load(Ordering::Relaxed) || !drive_once(session, UDP_POLL) {
             break;
         }
-        let Ok(mut conn) = session.shared.lock() else {
-            break;
-        };
-        while let Ok(data) = conn.dgram_recv_buf() {
+        while let Some(data) = recv_one(session.shared.as_ref(), |conn| conn.dgram_recv_buf().ok())
+        {
             let Ok(message) = hysteria::decode_udp(&data) else {
                 continue;
             };
@@ -3446,5 +3450,16 @@ mod tests {
             left += 1;
         }
         assert_eq!(left, 0, "a turn left {left} queued datagrams unread");
+    }
+
+    #[test]
+    fn the_connection_lock_is_free_before_the_datagram_is_relayed() {
+        let shared = Mutex::new(vec![vec![1u8, 2, 3]]);
+        let data = recv_one(&shared, Vec::pop).expect("one datagram");
+        assert_eq!(data, vec![1, 2, 3]);
+        assert!(
+            shared.try_lock().is_ok(),
+            "the relay holds no connection lock"
+        );
     }
 }
