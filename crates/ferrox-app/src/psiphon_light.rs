@@ -709,8 +709,8 @@ pub(crate) struct LightStream<T> {
     header_sent: bool,
     padding_done: bool,
     wire: Vec<u8>,
-    payload: Vec<u8>,
-    payload_at: usize,
+    wire_at: usize,
+    payload: std::ops::Range<usize>,
     pending: Vec<u8>,
     pending_at: usize,
     shutdown: Option<TcpStream>,
@@ -725,8 +725,8 @@ impl<T> LightStream<T> {
             header_sent: false,
             padding_done: false,
             wire: Vec::with_capacity(BUFFER),
-            payload: Vec::new(),
-            payload_at: 0,
+            wire_at: 0,
+            payload: 0..0,
             pending: Vec::new(),
             pending_at: 0,
             shutdown: None,
@@ -746,47 +746,49 @@ impl<T> LightStream<T> {
 }
 
 impl<T: Read> Read for LightStream<T> {
-    /// Read framed payload, draining buffered bytes after the stop sentinel.
+    /// Read framed payload, keeping the wire buffer's consumed prefix as an offset.
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
         }
         loop {
-            if self.payload_at < self.payload.len() {
-                let count = (self.payload.len() - self.payload_at).min(out.len());
+            if !self.payload.is_empty() {
+                let count = (self.payload.end - self.payload.start).min(out.len());
                 out[..count]
-                    .copy_from_slice(&self.payload[self.payload_at..self.payload_at + count]);
-                self.payload_at += count;
+                    .copy_from_slice(&self.wire[self.payload.start..self.payload.start + count]);
+                self.payload.start += count;
                 return Ok(count);
             }
+            self.compact();
             if self.padding_done {
-                if self.wire.is_empty() {
+                if self.wire_at == self.wire.len() {
                     return self.inner.read(out);
                 }
-                let count = self.wire.len().min(out.len());
-                out[..count].copy_from_slice(&self.wire[..count]);
-                self.wire.drain(..count);
+                let count = (self.wire.len() - self.wire_at).min(out.len());
+                out[..count].copy_from_slice(&self.wire[self.wire_at..self.wire_at + count]);
+                self.wire_at += count;
                 return Ok(count);
             }
-            if self.wire.len() < 2 {
+            let at = self.wire_at;
+            if self.wire.len() - at < 2 {
                 if !fill(&mut self.inner, &mut self.wire)? {
                     return Ok(0);
                 }
                 continue;
             }
-            let padding = u16::from_be_bytes([self.wire[0], self.wire[1]]);
+            let padding = u16::from_be_bytes([self.wire[at], self.wire[at + 1]]);
             if padding == STOP_PADDING {
-                self.wire.drain(..2);
+                self.wire_at += 2;
                 self.padding_done = true;
                 continue;
             }
-            if self.wire.len() < 4 {
+            if self.wire.len() - at < 4 {
                 if !fill(&mut self.inner, &mut self.wire)? {
                     return Ok(0);
                 }
                 continue;
             }
-            let payload = u16::from_be_bytes([self.wire[2], self.wire[3]]);
+            let payload = u16::from_be_bytes([self.wire[at + 2], self.wire[at + 3]]);
             if payload == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -794,16 +796,38 @@ impl<T: Read> Read for LightStream<T> {
                 ));
             }
             let frame = 4 + usize::from(padding) + usize::from(payload);
-            if self.wire.len() < frame {
+            if self.wire.len() - at < frame {
                 if !fill(&mut self.inner, &mut self.wire)? {
                     return Ok(0);
                 }
                 continue;
             }
-            self.wire.drain(..4 + usize::from(padding));
-            self.payload = self.wire.drain(..usize::from(payload)).collect();
-            self.payload_at = 0;
+            let start = at + 4 + usize::from(padding);
+            self.payload = start..start + usize::from(payload);
+            self.wire_at = self.payload.end;
         }
+    }
+}
+
+impl<T> LightStream<T> {
+    /// Drop the consumed prefix once it is worth the move, so a long run of frames
+    /// does not carry every byte it has already returned.
+    fn compact(&mut self) {
+        if self.wire_at == 0 {
+            return;
+        }
+        if self.wire_at == self.wire.len() {
+            self.wire.clear();
+            self.wire_at = 0;
+            return;
+        }
+        if self.wire_at < BUFFER / 2 && self.wire.len() < self.wire.capacity() {
+            return;
+        }
+        let live = self.wire.len() - self.wire_at;
+        self.wire.copy_within(self.wire_at.., 0);
+        self.wire.truncate(live);
+        self.wire_at = 0;
     }
 }
 
@@ -1063,6 +1087,61 @@ mod tests {
         let mut rest = [0u8; 5];
         stream.read_exact(&mut rest).expect("second");
         assert_eq!(&rest, b"plain");
+    }
+
+    /// The read shape before the offset cursor: each frame's payload was collected
+    /// out of the wire, so every frame paid one buffer.
+    fn draining_frames(wire: &mut Vec<u8>, frames: usize) -> usize {
+        let mut bytes = 0;
+        for _ in 0..frames {
+            let padding = u16::from_be_bytes([wire[0], wire[1]]);
+            assert_ne!(padding, STOP_PADDING);
+            let payload = u16::from_be_bytes([wire[2], wire[3]]);
+            wire.drain(..4 + usize::from(padding));
+            let frame: Vec<u8> = wire.drain(..usize::from(payload)).collect();
+            bytes += frame.len();
+        }
+        bytes
+    }
+
+    /// The offset cursor keeps one wire buffer: the old shape collected a buffer per
+    /// frame, while the new read returns the frame's bytes where they already lie.
+    #[test]
+    fn a_frame_read_keeps_one_wire_buffer() {
+        let frames = 64;
+        let payload = b"data";
+        let mut wire = Vec::new();
+        for _ in 0..frames {
+            wire.extend_from_slice(&0u16.to_be_bytes());
+            wire.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            wire.extend_from_slice(payload);
+        }
+
+        let mut old = wire.clone();
+        let (old_bytes, old_counts) =
+            ferrox_core::alloc_count::measure(|| draining_frames(&mut old, frames));
+        assert_eq!(old_bytes, frames * payload.len());
+        assert_eq!(
+            old_counts.allocs, frames,
+            "the old read collected a buffer per frame"
+        );
+
+        let mut stream = LightStream::new(io::Cursor::new(wire), Vec::new());
+        let base = stream.wire.as_ptr();
+        let capacity = stream.wire.capacity();
+        let mut out = [0u8; 4];
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..frames {
+                stream.read_exact(&mut out).expect("frame");
+                assert_eq!(&out, payload);
+            }
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "the offset read allocates nothing: {counts:?}"
+        );
+        assert_eq!(stream.wire.as_ptr(), base, "the wire buffer did not move");
+        assert_eq!(stream.wire.capacity(), capacity, "the wire capacity held");
     }
 
     /// A writer that reports one timeout before accepting bytes.
