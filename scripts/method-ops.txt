@@ -194,6 +194,7 @@ http-proxy  proxy::tests::the_head_walk_costs_the_head_and_nothing_else  proxy::
 http-proxy  proxy::tests::the_head_walk_costs_the_head_and_nothing_else  proxy::tests::the_head_walk_costs_the_head_and_nothing_else
 http-proxy  proxy::tests::the_byte_walk_header_costs_the_same_answer  proxy::tests::the_byte_walk_header_costs_the_same_answer
 front-tun  tun::tests::an_emitted_packet_reuses_its_render_buffer  ferrox_app::tun::render_tcp_packet
+front-tun-smoltcp  tun_system::tests::a_forwarded_syn_becomes_a_packet_to_the_local_listener  ferrox_app::tun_system::Nat::rewrite
 socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::greeting
 socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::user_pass
 socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::request
