@@ -79,6 +79,7 @@ impl Wire {
 pub(crate) struct H3Reader {
     wire: Wire,
     buf: Vec<u8>,
+    room: Vec<u8>,
     payload: Vec<u8>,
     at: usize,
     head: Option<Vec<u8>>,
@@ -99,6 +100,7 @@ impl H3Reader {
         Self {
             wire,
             buf: Vec::new(),
+            room: vec![0; READ_ROOM],
             payload: Vec::new(),
             at: 0,
             head: None,
@@ -192,14 +194,13 @@ impl H3Reader {
             if self.ended || self.head.is_some() {
                 return Ok(());
             }
-            let mut room = [0u8; READ_ROOM];
-            match self.wire.read(&mut room) {
+            match self.wire.read(&mut self.room) {
                 Ok(0) => {
                     self.ended = true;
                     return Ok(());
                 }
                 Ok(n) => {
-                    self.buf.extend_from_slice(&room[..n]);
+                    self.buf.extend_from_slice(&self.room[..n]);
                     self.idle_since = None;
                 }
                 Err(error) if crate::proxy::is_timeout(&error) => {
@@ -309,8 +310,7 @@ impl H3Reader {
                 self.frame_left -= take;
                 return Ok(());
             }
-            let mut room = [0u8; READ_ROOM];
-            match self.wire.read(&mut room) {
+            match self.wire.read(&mut self.room) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
@@ -319,9 +319,9 @@ impl H3Reader {
                 }
                 Ok(n) => {
                     let take = n.min(self.frame_left);
-                    self.payload.extend_from_slice(&room[..take]);
+                    self.payload.extend_from_slice(&self.room[..take]);
                     if n > take {
-                        self.buf.extend_from_slice(&room[take..n]);
+                        self.buf.extend_from_slice(&self.room[take..n]);
                     }
                     self.frame_left -= take;
                     self.idle_since = None;
@@ -1284,6 +1284,26 @@ mod tests {
         let mut got = Vec::new();
         reader.read_to_end(&mut got).expect("the answer reads");
         assert_eq!(got, b"hello");
+    }
+
+    #[test]
+    fn a_read_reuses_one_scratch_buffer() {
+        let (identity, roots) = minted_identity("localhost");
+        let settings = dual_settings(XhttpMode::StreamUp);
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
+            .expect("the h3 listener binds");
+        let (mut reader, writer) = dial(port, &settings, roots);
+        reader.room.fill(0xAA);
+        assert!(writer.send(b"hello"));
+        writer.finish();
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).expect("the answer reads");
+        assert_eq!(got, b"hello");
+        assert_eq!(
+            reader.room[READ_ROOM - 1],
+            0xAA,
+            "the scratch buffer is reused, not zeroed"
+        );
     }
 
     #[test]
