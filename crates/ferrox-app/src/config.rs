@@ -1270,15 +1270,19 @@ pub(crate) fn outbound_tls(
         );
     }
     let ech_config_list = tls_ech_config(tls, &server_name)?;
-    // xray's empty name is Chrome and a name it does not know returns nil, which dials stock.
-    let fingerprint = tls
+    // xray's empty name is Chrome; a name no table knows is the config refusal it makes, not a stock hello.
+    let fingerprint = match tls
         .and_then(|s| s.get("fingerprint"))
         .and_then(Json::as_str)
-        .map(|name| {
-            ferrox_core::tls::Fingerprint::resolve(name)
-                .unwrap_or_else(ferrox_core::tls::Fingerprint::stock)
-        })
-        .unwrap_or_default();
+    {
+        Some(name) => ferrox_core::tls::Fingerprint::resolve(name).ok_or_else(|| {
+            format!(
+                "unknown \"fingerprint\": {}",
+                name.trim().to_ascii_lowercase()
+            )
+        })?,
+        None => ferrox_core::tls::Fingerprint::default(),
+    };
     let curves = tls_curves(tls, fingerprint.is_shaped())?;
     // xray leaves Go's session cache empty unless the config names one, so an unnamed store keeps no ticket.
     let resumption = matches!(
@@ -4108,6 +4112,12 @@ mod tests {
         let two = dial(&identity, "second.log", "");
         // A named fingerprint of `unsafe` dials through stock rustls, the other client build a key log reaches.
         let stock = dial(&identity, "stock.log", r#""fingerprint": "unsafe", "#);
+        // A server whose ceiling is TLS 1.2 makes the shaped hello run its own 1.2 flight.
+        let tls12 = dial(
+            &server_identity_with(&leaf, r#", "maxVersion": "1.2""#),
+            "tls12.log",
+            r#""fingerprint": "chrome", "#,
+        );
         let server_log = dir.join("server.log");
         let listener = server_identity_with(
             &leaf,
@@ -4132,6 +4142,11 @@ mod tests {
             &stock,
             "CLIENT_HANDSHAKE_TRAFFIC_SECRET ",
             "the stock rustls client writes its secrets too",
+        );
+        assert_nss_log(
+            &tls12,
+            "CLIENT_RANDOM ",
+            "the shaped hello's TLS 1.2 flight logs its master secret",
         );
         assert_nss_log(
             &served,
@@ -4173,6 +4188,64 @@ mod tests {
             !outbound_handshake(&identity, &client(None)),
             "without the field the hello's serverName is the name checked, and it does not match"
         );
+    }
+
+    /// xray's `pinnedPeerCertSha256`: the named digest is the whole trust contract, so a leaf it
+    /// matches dials with no root store, and one it does not is the pin's refusal.
+    #[test]
+    fn a_config_carries_the_leaf_pin_it_names() {
+        let (_ca, leaf) = ca_and_leaf("tls.test");
+        let identity = server_identity(&leaf);
+        let digest = ferrox_core::foxy::account::hex_encode(&{
+            use sha2::Digest as _;
+            sha2::Sha256::digest(leaf.cert.der())
+        });
+        let client = |pin: &str| {
+            crate::json::parse(&format!(
+                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "disableSystemRoot": true, "pinnedPeerCertSha256": "{pin}"}}}}}}"#
+            ))
+            .expect("parses")
+        };
+        assert!(
+            outbound_handshake(&identity, &client(&digest)),
+            "a leaf digest anchors the chain with no root store"
+        );
+        let colons = digest
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| std::str::from_utf8(pair).expect("hex"))
+            .collect::<Vec<_>>()
+            .join(":");
+        assert!(
+            outbound_handshake(&identity, &client(&colons)),
+            "the OpenSSL colon spelling is the same pin"
+        );
+        assert!(
+            !outbound_handshake(&identity, &client(&"00".repeat(32))),
+            "a digest the leaf does not match is refused"
+        );
+        let error = outbound_tls(&client("zz"), "127.0.0.1").expect_err("bad hex is refused");
+        assert!(error.contains("pinnedPeerCertSha256"), "{error}");
+    }
+
+    /// xray refuses a `fingerprint` no table knows while the config builds; the same name stops this
+    /// startup, and the spellings this tree widens to still build.
+    #[test]
+    fn an_unknown_fingerprint_is_refused_the_way_the_reference_refuses_it() {
+        let config = |name: &str| {
+            crate::json::parse(&format!(
+                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "allowInsecure": true, "fingerprint": "{name}"}}}}}}"#
+            ))
+            .expect("parses")
+        };
+        let error = outbound_tls(&config("Bogus"), "127.0.0.1").expect_err("a name no table knows");
+        assert_eq!(error, r#"unknown "fingerprint": bogus"#);
+        for known in ["", "chrome", "unsafe", "hello-firefox_120"] {
+            assert!(
+                outbound_tls(&config(known), "127.0.0.1").is_ok(),
+                "`{known}` builds"
+            );
+        }
     }
 
     /// The `supported_groups` ids of a dial's `ClientHello`, read off the socket before the peer
