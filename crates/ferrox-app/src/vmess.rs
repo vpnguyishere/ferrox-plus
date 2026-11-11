@@ -2383,6 +2383,11 @@ pub(crate) fn serve_xhttp_accepted(
     close: &Close,
 ) {
     // The h2 reader sleeps through poll timeouts, so the handshake claims the poll and a silent stream ends at its budget.
+    crate::xhttp::trace(format_args!(
+        "handshake={:?} relay_stall={:?}",
+        crate::budgets::handshake(),
+        crate::budgets::relay_stall()
+    ));
     let mut reader = crate::proxy::HandshakeRead::new(reader, crate::budgets::handshake());
     let decoded = accept_request(&mut reader, users);
     reader.disarm();

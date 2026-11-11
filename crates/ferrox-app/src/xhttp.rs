@@ -2429,9 +2429,11 @@ impl Read for SessionReader {
                 return Ok(n);
             }
             if self.take_upload() {
+                trace(format_args!("reader-has-upload"));
                 let got = self.upload.as_mut().expect("upload").read(buf);
                 return match got {
                     Ok(0) => {
+                        trace(format_args!("reader-upload-eof"));
                         self.finish_upload();
                         Ok(0)
                     }
