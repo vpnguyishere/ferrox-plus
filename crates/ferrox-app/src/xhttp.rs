@@ -2117,6 +2117,10 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
     if due {
         stalled.extend(sweep_stalled_sessions(&mut map, budget));
     }
+    let fresh = !map.contains_key(id);
+    if fresh {
+        eprintln!("t-trace: new {id}");
+    }
     let session = map
         .entry(id.to_owned())
         .or_insert_with(|| {
@@ -3111,6 +3115,10 @@ pub(crate) fn accept_core<
             Served::Closed
         }
         (Some(sid), Some(seq)) => {
+            eprintln!(
+                "t-trace: post {sid} seq={seq} mode={:?} src={:?}",
+                settings.mode, settings.mode_source
+            );
             if settings.mode != XhttpMode::PacketUp {
                 emit_400(&mut write);
                 return Served::Closed;
@@ -3193,7 +3201,9 @@ pub(crate) fn accept_core<
                 emit_413(&mut write);
                 return Served::Closed;
             }
+            eprintln!("t-trace: push {sid} {seq_num} len={}", payload.len());
             if !session.push_packet(seq_num, payload, settings.sc_max_buffered) {
+                eprintln!("t-trace: push-refused {sid}");
                 // A refused packet is a lost one — the reader waits on strict sequence — so the session is over; keeping it alive would park its reader on a sequence that can never arrive.
                 end_session(sid);
                 emit_500(&mut write);
