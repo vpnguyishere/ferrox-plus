@@ -794,13 +794,24 @@ impl<R: Read> Read for Reader<R> {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.open()?;
+        if let Err(error) = self.open() {
+            trace(format_args!("down-open-fail {error:?}"));
+            return Err(error);
+        }
         if self.ended {
+            trace(format_args!("down-ended want={}", buf.len()));
             return Ok(0);
         }
         let n = self.left.min(buf.len());
-        let got = self.body(&mut buf[..n])?;
+        let got = match self.body(&mut buf[..n]) {
+            Ok(got) => got,
+            Err(error) => {
+                trace(format_args!("down-body-fail {error:?}"));
+                return Err(error);
+            }
+        };
         if got == 0 {
+            trace(format_args!("down-eof want={}", buf.len()));
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
         }
         self.left -= got;
