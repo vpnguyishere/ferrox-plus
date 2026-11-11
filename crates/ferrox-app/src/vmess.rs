@@ -1706,17 +1706,17 @@ impl Users {
 pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Accepted> {
     let mut auth_id = [0u8; AUTH_LEN];
     if read_exact(stream, &mut auth_id).is_err() {
-        crate::xhttp::trace!("vmess-auth-read-fail");
+        crate::xhttp::trace(format_args!("vmess-auth-read-fail"));
         return None;
     }
-    crate::xhttp::trace!("vmess-auth {:02x?}", auth_id);
+    crate::xhttp::trace(format_args!("vmess-auth {:02x?}", auth_id));
     let Some((instruction, user)) = users.authenticate(&auth_id) else {
-        crate::xhttp::trace!("vmess-auth-mismatch");
+        crate::xhttp::trace(format_args!("vmess-auth-mismatch"));
         return None;
     };
-    crate::xhttp::trace!("vmess-auth-ok want={:02x?}", user.id);
+    crate::xhttp::trace(format_args!("vmess-auth-ok want={:02x?}", user.id));
     let Some(header) = read_open_header(stream, &instruction, &auth_id) else {
-        crate::xhttp::trace!("vmess-open-header-fail");
+        crate::xhttp::trace(format_args!("vmess-open-header-fail"));
         return None;
     };
     let Some((target, mut send, recv, prefix, cmd)) = decode_header(&header) else {
@@ -1730,7 +1730,7 @@ pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Acc
     let data_iv: [u8; 16] = header[1..17].try_into().unwrap();
     let data_key: [u8; 16] = header[17..33].try_into().unwrap();
     if session_seen(&user.id, &data_key, &data_iv) {
-        crate::xhttp::trace!("vmess-dup");
+        crate::xhttp::trace(format_args!("vmess-dup"));
         return None;
     }
     send.end_marker = !user.no_termination;
@@ -2125,7 +2125,7 @@ fn serve_decoded_impl<R, W>(
         return;
     };
     if !freedom || !matches!(cmd, 1 | 2) {
-        crate::xhttp::trace!("vmess-abandon freedom={freedom} cmd={cmd}");
+        crate::xhttp::trace(format_args!("vmess-abandon freedom={freedom} cmd={cmd}"));
         abandon(close, &mut abort);
         return;
     }
@@ -2133,7 +2133,7 @@ fn serve_decoded_impl<R, W>(
     match cmd {
         1 => {
             let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
-                crate::xhttp::trace!("vmess-dial-fail {target}");
+                crate::xhttp::trace(format_args!("vmess-dial-fail {target}"));
                 abandon(close, &mut abort);
                 return;
             };
@@ -2142,17 +2142,17 @@ fn serve_decoded_impl<R, W>(
                 Some(prefix)
             } else {
                 if !write_prefix(&mut writer, &prefix) {
-                    crate::xhttp::trace!("vmess-prefix-fail len={}", prefix.len());
+                    crate::xhttp::trace(format_args!("vmess-prefix-fail len={}", prefix.len()));
                     abandon(close, &mut abort);
                     return;
                 }
                 None
             };
-            crate::xhttp::trace!("vmess-relay start {target}");
+            crate::xhttp::trace(format_args!("vmess-relay start {target}"));
             pump_relay_carried_with_finish(
                 &uplink, reader, writer, close, send, recv, None, head, finish,
             );
-            crate::xhttp::trace!("vmess-relay end");
+            crate::xhttp::trace(format_args!("vmess-relay end"));
         }
         2 => serve_udp_carried(
             reader, writer, close, &mut abort, &target, &prefix, send, recv, &user,
@@ -2387,7 +2387,7 @@ pub(crate) fn serve_xhttp_accepted(
     let decoded = accept_request(&mut reader, users);
     reader.disarm();
     if decoded.is_none() {
-        crate::xhttp::trace!("vmess-decode-refused");
+        crate::xhttp::trace(format_args!("vmess-decode-refused"));
         writer.abort();
         close();
         return;
