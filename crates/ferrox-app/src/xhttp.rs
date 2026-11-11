@@ -2147,6 +2147,7 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
 }
 
 fn close_session(s: &Arc<Session>) {
+    eprintln!("trace close-session id={}", s.id);
     let response = {
         let mut st = s.state.lock().expect("session lock");
         st.ended = true;
@@ -3049,6 +3050,7 @@ pub(crate) fn accept_core<
                 return Served::Closed;
             }
             if method == "GET" {
+                eprintln!("trace get-nosid method={method} target={target}");
                 sse_ok(&mut write, settings, &padded);
                 let writer = writer_for(write, h2);
                 let session = get_or_create_session("__none__");
@@ -3075,6 +3077,10 @@ pub(crate) fn accept_core<
             Served::Closed
         }
         (Some(sid), None) => {
+            eprintln!(
+                "trace sid-no-seq method={method} sid={sid} mode={:?}",
+                settings.mode
+            );
             if method == "GET" {
                 if settings.mode == XhttpMode::StreamOne
                     && settings.mode_source == ModeSource::Stated
@@ -3201,6 +3207,7 @@ pub(crate) fn accept_core<
                 emit_413(&mut write);
                 return Served::Closed;
             }
+            eprintln!("trace post sid={sid} seq={seq_num} len={}", payload.len());
             if !session.push_packet(seq_num, payload, settings.sc_max_buffered) {
                 // A refused packet is a lost one — the reader waits on strict sequence — so the session is over; keeping it alive would park its reader on a sequence that can never arrive.
                 end_session(sid);
