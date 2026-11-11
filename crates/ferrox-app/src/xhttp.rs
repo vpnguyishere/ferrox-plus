@@ -714,7 +714,20 @@ impl PacketPost for H1Post {
             Some(body) => self.stream.write_slices(&[head.as_bytes(), body]),
             None => self.stream.write_all(head.as_bytes()).is_ok(),
         };
-        wrote && drain_answer(&mut *self.stream, &mut self.answer)
+        let answered = wrote && drain_answer(&mut *self.stream, &mut self.answer);
+        trace(format_args!(
+            "h1-post seq={seq} len={} wrote={wrote} answered={answered} answer={:?}",
+            piece.len(),
+            String::from_utf8_lossy(
+                &self.answer[..self
+                    .answer
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .unwrap_or(0)
+                    .min(60)]
+            )
+        ));
+        answered
     }
 }
 
