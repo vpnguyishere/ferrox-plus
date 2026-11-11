@@ -2247,6 +2247,12 @@ impl Session {
         }
         st.packets.insert(seq, payload);
         st.last_seen = std::time::Instant::now();
+        trace(format_args!(
+            "push ptr={:x} seq={seq} held={} next={}",
+            self as *const Session as usize,
+            st.packets.len(),
+            st.next_seq
+        ));
         self.cv.notify_all();
         true
     }
@@ -2328,6 +2334,10 @@ struct SessionReader {
 
 impl SessionReader {
     fn new(session: Arc<Session>, id: String) -> Self {
+        trace(format_args!(
+            "reader-new id={id} ptr={:x}",
+            Arc::as_ptr(&session) as usize
+        ));
         Self {
             session,
             id,
@@ -2482,6 +2492,14 @@ impl Read for SessionReader {
             if wait.timed_out() {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
+            trace(format_args!(
+                "reader-woken ptr={:x} ended={} up_done={} held={} next={}",
+                Arc::as_ptr(&self.session) as usize,
+                st.ended,
+                st.upload_done,
+                st.packets.len(),
+                st.next_seq
+            ));
         }
     }
 }

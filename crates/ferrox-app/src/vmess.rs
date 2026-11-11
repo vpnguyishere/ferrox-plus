@@ -1705,8 +1705,8 @@ impl Users {
 
 pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Accepted> {
     let mut auth_id = [0u8; AUTH_LEN];
-    if read_exact(stream, &mut auth_id).is_err() {
-        crate::xhttp::trace(format_args!("vmess-auth-read-fail"));
+    if let Err(error) = read_exact(stream, &mut auth_id) {
+        crate::xhttp::trace(format_args!("vmess-auth-read-fail {error:?}"));
         return None;
     }
     crate::xhttp::trace(format_args!("vmess-auth {:02x?}", auth_id));
