@@ -2448,9 +2448,14 @@ impl Read for SessionReader {
                 return Ok(buf.len());
             }
             if st.ended || st.upload_done {
+                eprintln!(
+                    "trace session-read-eof ended={} upload_done={}",
+                    st.ended, st.upload_done
+                );
                 return Ok(0);
             }
             if !st.upload_attached && st.last_seen.elapsed() >= crate::budgets::relay_stall() {
+                eprintln!("trace session-read-stall");
                 st.ended = true;
                 self.session.cv.notify_all();
                 return Ok(0);
@@ -2537,6 +2542,15 @@ impl crate::proxy::WindowRead for SessionReader {
 
 impl Drop for SessionReader {
     fn drop(&mut self) {
+        eprintln!(
+            "trace reader-drop id-empty={} ended={}",
+            self.id.is_empty(),
+            self.session
+                .state
+                .lock()
+                .map(|st| st.ended)
+                .unwrap_or(false)
+        );
         if !self.id.is_empty() {
             remove_session_if_owned(&self.id, self.session.as_ref());
         }
