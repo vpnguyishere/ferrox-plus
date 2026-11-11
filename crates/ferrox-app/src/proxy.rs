@@ -20806,7 +20806,10 @@ fn serve_trojan(stream: Connection, key: &[[u8; 56]], carrier: &Carrier, freedom
         }
         Carrier::Grpc(settings) => serve_trojan_grpc(stream, key, settings, freedom),
         Carrier::Xhttp { settings, .. } => {
-            serve_trojan_xhttp(stream, key, settings.path.as_str(), freedom);
+            let Ok(read) = stream.try_clone() else {
+                return;
+            };
+            serve_trojan_xhttp_carrier(read, stream, settings, key, freedom);
         }
         Carrier::HttpHeader { path } => {
             serve_trojan_httpheader(stream, key, path.as_str(), freedom);
@@ -21166,45 +21169,6 @@ pub(crate) fn serve_trojan_grpc_muxed(
     {
         reset();
     }
-}
-
-fn serve_trojan_xhttp(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
-    let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
-        return;
-    };
-    let Some((cmd, target)) = decode_trojan_request(&mut reader, key) else {
-        return;
-    };
-    if !freedom {
-        return;
-    }
-    crate::accesslog::record_current(&target);
-    if cmd == 3 {
-        let closer = writer.clone();
-        spawn_trojan_udp(reader, writer, move || closer.finish());
-        return;
-    }
-    if cmd != 1 {
-        return;
-    }
-    if target.is_mux() {
-        let closer = writer.clone();
-        spawn_trojan_mux(
-            reader,
-            writer,
-            Arc::new(move || closer.finish()),
-            Vec::new(),
-        );
-        return;
-    }
-    let Some(target) = target.socket() else {
-        return;
-    };
-    let Some(uplink) = dial_or_report(&target) else {
-        return;
-    };
-    reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink_drained(reader, &writer, &uplink);
 }
 
 fn serve_trojan_httpheader(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
@@ -58386,10 +58350,14 @@ mod tests {
         });
         let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
+        let served = xhttp_settings("/tunnel");
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                serve_trojan_xhttp(stream, &[trojan_key("secret")], "/tunnel", true);
+                let Ok(read) = stream.try_clone() else {
+                    continue;
+                };
+                serve_trojan_xhttp_carrier(read, stream, &served, &[trojan_key("secret")], true);
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
