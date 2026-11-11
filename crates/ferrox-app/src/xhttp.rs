@@ -2335,6 +2335,7 @@ struct SessionReader {
 
 impl SessionReader {
     fn new(session: Arc<Session>, id: String) -> Self {
+        eprintln!("t-trace: reader-new {id} {:p}", Arc::as_ptr(&session));
         Self {
             session,
             id,
@@ -2563,6 +2564,12 @@ impl crate::proxy::WindowRead for SessionReader {
 
 impl Drop for SessionReader {
     fn drop(&mut self) {
+        eprintln!(
+            "t-trace: reader-drop {} {:p} empty={}",
+            self.id,
+            Arc::as_ptr(&self.session),
+            self.id.is_empty()
+        );
         if !self.id.is_empty() {
             remove_session_if_owned(&self.id, self.session.as_ref());
         }
