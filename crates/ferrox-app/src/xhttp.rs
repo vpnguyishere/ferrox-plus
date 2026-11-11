@@ -2680,7 +2680,7 @@ fn content_length(text: &str) -> Option<usize> {
 
 // --- Server ------------------------------------------------------------------
 
-// The stream-one handshake the tree has always served: POST with chunked framing on one connection; mode handshakes live in `accept_with_settings`, and this stays so every existing rung keeps dialling.
+#[cfg(test)]
 pub(crate) fn accept(stream: Connection, path: &str) -> Option<(XhttpReader, XhttpWriter)> {
     let mut read = stream;
     let (head, at) = read_head(&mut read)?;
@@ -2689,6 +2689,7 @@ pub(crate) fn accept(stream: Connection, path: &str) -> Option<(XhttpReader, Xht
     split(read, head, at)
 }
 
+#[cfg(test)]
 fn check_request(head: &[u8], path: &str) -> Option<()> {
     let text = std::str::from_utf8(head).ok()?;
     let mut parts = text.split("\r\n").next()?.split_ascii_whitespace();
