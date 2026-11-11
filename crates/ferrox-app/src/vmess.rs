@@ -2125,6 +2125,7 @@ fn serve_decoded_impl<R, W>(
         return;
     };
     if !freedom || !matches!(cmd, 1 | 2) {
+        eprintln!("trace vmess-abandon freedom={freedom} cmd={cmd}");
         abandon(close, &mut abort);
         return;
     }
@@ -2132,6 +2133,7 @@ fn serve_decoded_impl<R, W>(
     match cmd {
         1 => {
             let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
+                eprintln!("trace vmess-dial-fail {target}");
                 abandon(close, &mut abort);
                 return;
             };
@@ -2140,14 +2142,17 @@ fn serve_decoded_impl<R, W>(
                 Some(prefix)
             } else {
                 if !write_prefix(&mut writer, &prefix) {
+                    eprintln!("trace vmess-prefix-fail len={}", prefix.len());
                     abandon(close, &mut abort);
                     return;
                 }
                 None
             };
+            eprintln!("trace vmess-relay start {target}");
             pump_relay_carried_with_finish(
                 &uplink, reader, writer, close, send, recv, None, head, finish,
             );
+            eprintln!("trace vmess-relay end");
         }
         2 => serve_udp_carried(
             reader, writer, close, &mut abort, &target, &prefix, send, recv, &user,
