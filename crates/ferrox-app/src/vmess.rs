@@ -1705,13 +1705,32 @@ impl Users {
 
 pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Accepted> {
     let mut auth_id = [0u8; AUTH_LEN];
-    read_exact(stream, &mut auth_id).ok()?;
-    let (instruction, user) = users.authenticate(&auth_id)?;
-    let header = read_open_header(stream, &instruction, &auth_id)?;
-    let (target, mut send, recv, prefix, cmd) = decode_header(&header)?;
+    if read_exact(stream, &mut auth_id).is_err() {
+        eprintln!("trace vmess-auth-read-fail");
+        return None;
+    }
+    eprintln!("trace vmess-auth {:02x?}", auth_id);
+    let Some((instruction, user)) = users.authenticate(&auth_id) else {
+        eprintln!("trace vmess-auth-mismatch");
+        return None;
+    };
+    eprintln!("trace vmess-auth-ok want={:02x?}", user.id);
+    let Some(header) = read_open_header(stream, &instruction, &auth_id) else {
+        eprintln!("trace vmess-open-header-fail");
+        return None;
+    };
+    let Some((target, mut send, recv, prefix, cmd)) = decode_header(&header) else {
+        eprintln!(
+            "trace vmess-decode-header-fail len={} first={:02x?}",
+            header.len(),
+            &header[..header.len().min(8)]
+        );
+        return None;
+    };
     let data_iv: [u8; 16] = header[1..17].try_into().unwrap();
     let data_key: [u8; 16] = header[17..33].try_into().unwrap();
     if session_seen(&user.id, &data_key, &data_iv) {
+        eprintln!("trace vmess-dup");
         return None;
     }
     send.end_marker = !user.no_termination;
