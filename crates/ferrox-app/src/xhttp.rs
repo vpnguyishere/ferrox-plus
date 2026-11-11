@@ -2114,6 +2114,7 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
             return session;
         }
         Some((_, true)) => {
+            eprintln!("t-trace: stalled-branch {id}");
             if let Some(session) = map.remove(id) {
                 stalled.push(session);
             }
@@ -2145,7 +2146,15 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
         })
         .clone();
     drop(map);
-    eprintln!("t-trace: lookup {id} {:p}", Arc::as_ptr(&session));
+    {
+        let st = session.state.lock().expect("session lock");
+        eprintln!(
+            "t-trace: lookup {id} {:p} dl={} age={}ms",
+            Arc::as_ptr(&session),
+            st.downlink,
+            st.last_seen.elapsed().as_millis()
+        );
+    }
     // The owed answers run after the map lock, so a peer that stops reading cannot block a session lookup.
     for session in stalled {
         close_session(&session);
@@ -2172,7 +2181,7 @@ fn remove_session_if_owned(id: &str, session: &Session) {
         .is_some_and(|carried| std::ptr::eq(Arc::as_ptr(carried), session))
     {
         map.remove(id);
-        eprintln!("t-trace: remove {id}");
+        eprintln!("t-trace: remove {id} {:p}", session as *const Session);
     }
 }
 
