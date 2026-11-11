@@ -2440,6 +2440,13 @@ impl Read for SessionReader {
                 let seq = st.next_seq;
                 st.packets.remove(&seq)
             } {
+                eprintln!(
+                    "t-trace: pkt {} seq={} len={} head={:02x?}",
+                    self.session.id,
+                    seq,
+                    pkt.len(),
+                    &pkt[..pkt.len().min(8)]
+                );
                 st.next_seq += 1;
                 st.last_seen = std::time::Instant::now();
                 if pkt.len() <= buf.len() {
@@ -3143,6 +3150,7 @@ pub(crate) fn accept_core<
                     n,
                     crate::budgets::head_arrival(),
                 ) else {
+                    eprintln!("t-trace: read-body-fail {sid} n={n}");
                     return Served::Closed;
                 };
                 carry = carry_tail(prefix, pre);
