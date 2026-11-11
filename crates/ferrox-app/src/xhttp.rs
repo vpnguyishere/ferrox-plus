@@ -2777,6 +2777,11 @@ pub(crate) fn accept_split_with_settings<
             trace(format_args!("no-head"));
             return None;
         };
+        {
+            let line = head.split(|byte| *byte == b'\n').next().unwrap_or_default();
+            let shown = String::from_utf8_lossy(&line[..line.len().min(96)]);
+            trace(format_args!("head {}", shown.trim_end()));
+        }
         // The loop hands `accept_core` a head it parses and a tail it keeps, so this is the one reader whose tail still needs its own owner.
         let prefix = head.split_off(at);
         // The session lands in a boxed window whose own arm is a no-op, so the socket gets its poll quantum here, once the head is in.
