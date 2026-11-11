@@ -219,6 +219,10 @@ impl<R: crate::proxy::RelayPoll> crate::proxy::RelayPoll for ChainReader<R> {
     fn arm_relay_poll(&mut self) {
         self.read.arm_relay_poll();
     }
+
+    fn arm_head_poll(&mut self) {
+        self.read.arm_head_poll();
+    }
 }
 
 impl<R: Read> Read for ChainReader<R> {
@@ -250,6 +254,10 @@ impl<R> Reader<R> {
 impl<R: Read + crate::proxy::RelayPoll> crate::proxy::RelayPoll for Reader<R> {
     fn arm_relay_poll(&mut self) {
         self.read.arm_relay_poll();
+    }
+
+    fn arm_head_poll(&mut self) {
+        self.read.arm_head_poll();
     }
 }
 
@@ -2710,6 +2718,8 @@ pub(crate) fn accept_split_with_settings<
     let mut read = ChainReader::new(Vec::new(), read);
     let mut write = write;
     loop {
+        // The head's own clock, because nothing arms the socket before the first read: a partial head that stops must end at its budget.
+        crate::proxy::RelayPoll::arm_head_poll(&mut read);
         let (mut head, at) =
             crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
         // The loop hands `accept_core` a head it parses and a tail it keeps, so this is the one reader whose tail still needs its own owner.
@@ -3039,7 +3049,9 @@ pub(crate) fn accept_core<
         }
         (Some(sid), None) => {
             if method == "GET" {
-                if settings.mode == XhttpMode::StreamOne {
+                if settings.mode == XhttpMode::StreamOne
+                    && settings.mode_source == ModeSource::Stated
+                {
                     emit_400(&mut write);
                     return Served::Closed;
                 }
@@ -3192,8 +3204,9 @@ thread_local! {
 fn send_dial_head<W: crate::proxy::FrameWrite>(
     write: &mut W,
     host: &str,
-    path: &str,
+    target: &str,
     headers: &[(String, String)],
+    pad: &str,
 ) -> Option<()> {
     const BEFORE_PATH: &str = "POST ";
     const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
@@ -3201,39 +3214,38 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
     const BEFORE_PADDING: &str = "?x_padding=";
     // The reference dialer disables keep-alives (dialer.go:272), and a chunked request whose first chunk waits on the 200 hangs a peer that drains the body before it flushes.
     const TAIL: &str = "Transfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
-    const PADDING_MAX: usize = 1000;
-    let mut raw = [0u8; 4];
-    getrandom::fill(&mut raw).unwrap_or_default();
-    let len = 100 + u32::from_le_bytes(raw) as usize % 901;
+    // The default padding's longest shape stays in the room, so a configured pad only grows it when it exceeds the default's ceiling.
+    const PADDING_ROOM: usize = 1000;
+    let referer = target.split_once('?').map_or(target, |(path, _)| path);
+    let room = pad.len().max(PADDING_ROOM);
     let headers_len = crate::headers::masked_len(headers, crate::headers::FETCH);
     DIAL_HEAD.with(|cell| {
         let mut head = cell.borrow_mut();
         head.clear();
-        // The room is the head's longest shape, so the allocator is entered once and the padding's length never grows it.
+        // The room is the head's longest shape, so the allocator is entered once and a default padding never grows it.
         head.reserve(
             BEFORE_PATH.len()
-                + path.len()
+                + target.len()
                 + BEFORE_HOST.len()
                 + host.len()
                 + BEFORE_REFERER.len()
                 + host.len()
-                + path.len()
+                + referer.len()
                 + BEFORE_PADDING.len()
-                + PADDING_MAX
+                + room
                 + 2
                 + headers_len
                 + TAIL.len(),
         );
         head.extend_from_slice(BEFORE_PATH.as_bytes());
-        head.extend_from_slice(path.as_bytes());
+        head.extend_from_slice(target.as_bytes());
         head.extend_from_slice(BEFORE_HOST.as_bytes());
         head.extend_from_slice(host.as_bytes());
         head.extend_from_slice(BEFORE_REFERER.as_bytes());
         head.extend_from_slice(host.as_bytes());
-        head.extend_from_slice(path.as_bytes());
+        head.extend_from_slice(referer.as_bytes());
         head.extend_from_slice(BEFORE_PADDING.as_bytes());
-        let at = head.len();
-        head.resize(at + len, b'X');
+        head.extend_from_slice(pad.as_bytes());
         head.extend_from_slice(b"\r\n");
         crate::headers::write_masked(&mut head, headers, crate::headers::FETCH);
         head.extend_from_slice(TAIL.as_bytes());
@@ -3386,7 +3398,7 @@ pub(crate) fn downlink_head(host: &str, settings: &XhttpSettings, session: &str)
 }
 
 /// The referer's pad the dial-side heads draw: a run in the configured range and method, the shape the hub's own check validates (`xpadding.go`'s `MakeXPadding`).
-fn referer_pad_value(settings: &XhttpSettings) -> String {
+pub(crate) fn referer_pad_value(settings: &XhttpSettings) -> String {
     pad_value(settings.x_padding_method, pad_target_len(settings))
 }
 
@@ -3566,9 +3578,10 @@ pub(crate) fn connect(
     host: &str,
     path: &str,
     headers: &[(String, String)],
+    pad: &str,
 ) -> Option<(XhttpReader, XhttpWriter)> {
     let mut read = stream;
-    send_dial_head(&mut read, host, path, headers)?;
+    send_dial_head(&mut read, host, path, headers, pad)?;
     let (head, at) = read_head(&mut read)?;
     check_response(&head[..at])?;
     split(read, head, at)
@@ -3581,8 +3594,9 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     host: &str,
     path: &str,
     headers: &[(String, String)],
+    pad: &str,
 ) -> Option<(Reader<R>, XhttpWriter)> {
-    send_dial_head(&mut write, host, path, headers)?;
+    send_dial_head(&mut write, host, path, headers, pad)?;
     let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head[..at])?;
@@ -3725,7 +3739,8 @@ mod tests {
             sock.shutdown(std::net::Shutdown::Write).ok();
         });
         let sock = Connection::connect(("127.0.0.1", port)).expect("connects");
-        let (mut reader, _w) = connect(sock, "h", "/share", &[]).expect("dials");
+        let pad = "X".repeat(500);
+        let (mut reader, _w) = connect(sock, "h", "/share", &[], &pad).expect("dials");
         let mut buf = vec![0u8; CHUNK];
         let mut got = 0usize;
         loop {
@@ -3920,7 +3935,9 @@ mod tests {
             writer.finish();
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
-        let (mut reader, writer) = connect(stream, "oracle.example", "/share", &[]).expect("dials");
+        let pad = "X".repeat(500);
+        let (mut reader, writer) =
+            connect(stream, "oracle.example", "/share", &[], &pad).expect("dials");
         assert!(writer.send(b"ping"));
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads");
@@ -4055,6 +4072,7 @@ mod tests {
             "h",
             "/share",
             &[],
+            &"X".repeat(500),
         )
         .expect("dials the head");
         assert_eq!(reader.at, HEAD.len(), "the cursor sits past the head");
@@ -4376,7 +4394,8 @@ mod tests {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .expect("timeout");
-        let (mut reader, writer) = connect(stream, "h", "/share", &[]).expect("dials");
+        let pad = "X".repeat(500);
+        let (mut reader, writer) = connect(stream, "h", "/share", &[], &pad).expect("dials");
         assert!(writer.send(&[1u8; 26]));
         let mut reply = [0u8; 2];
         reader.read_exact(&mut reply).expect("replies");
@@ -4648,7 +4667,8 @@ mod tests {
         assert_eq!(path, "/share/");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut sink = Sink(Arc::clone(&seen));
-        send_dial_head(&mut sink, "front.example", &path, &settings.headers).expect("head");
+        let pad = referer_pad_value(&settings);
+        send_dial_head(&mut sink, "front.example", &path, &settings.headers, &pad).expect("head");
         let head = String::from_utf8(seen.lock().expect("sink").clone()).expect("utf8");
         assert!(head.starts_with("POST /share/ HTTP/1.1\r\n"), "{head}");
         assert!(
@@ -4661,6 +4681,26 @@ mod tests {
             r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "stream-one", "sessionIDPlacement": "query", "seqPlacement": "query"}}}"#,
         );
         assert_eq!(dial_path(&query), "/share");
+    }
+
+    /// The pad hangs off the referer's path alone: the configured query rides on the request line, so the hub's extractor still finds `x_padding` when both are set.
+    #[test]
+    fn a_configured_query_keeps_the_pad_on_the_referer_path() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share?a=1", "mode": "stream-one"}}}"#,
+        );
+        let path = dial_path(&settings);
+        assert_eq!(path, "/share/?a=1");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = Sink(Arc::clone(&seen));
+        let pad = referer_pad_value(&settings);
+        send_dial_head(&mut sink, "front.example", &path, &settings.headers, &pad).expect("head");
+        let head = String::from_utf8(seen.lock().expect("sink").clone()).expect("utf8");
+        assert!(head.starts_with("POST /share/?a=1 HTTP/1.1\r\n"), "{head}");
+        assert!(
+            head.contains("Referer: http://front.example/share/?x_padding="),
+            "{head}"
+        );
     }
 
     #[test]
@@ -5038,7 +5078,8 @@ mod tests {
             bytes: [0u8; 4096],
             at: 0,
         };
-        send_dial_head(&mut warm, "example.com", "/share", &[]).expect("writes");
+        let pad = "X".repeat(500);
+        send_dial_head(&mut warm, "example.com", "/share", &[], &pad).expect("writes");
         let staged = DIAL_HEAD.with(|cell| {
             let head = cell.borrow();
             (head.as_ptr(), head.capacity())
@@ -5050,7 +5091,7 @@ mod tests {
             };
             for _ in 0..12 {
                 sink.at = 0;
-                send_dial_head(&mut sink, "example.com", "/share", &[]).expect("writes");
+                send_dial_head(&mut sink, "example.com", "/share", &[], &pad).expect("writes");
             }
             sink
         });
@@ -5602,13 +5643,38 @@ mod tests {
             writer.finish();
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
-        let (mut reader, writer) =
-            connect(stream, "127.0.0.1", "/share", &[]).expect("the dial was answered");
+        let (mut reader, writer) = connect(stream, "127.0.0.1", "/share", &[], &"X".repeat(500))
+            .expect("the dial was answered");
         assert!(writer.send(b"ping"));
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads the downlink");
         assert_eq!(&buf, b"pong");
         server.join().expect("joins");
+    }
+
+    /// The pad the dial writes is the one the hub validates: a configured range reaches the head, where a fixed 100–900 run would answer 400 against a hub told to take four bytes.
+    #[test]
+    fn the_dial_pad_is_the_configured_range_not_a_fixed_run() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "stream-one", "xPaddingBytes": "4-4"}}}"#,
+        );
+        assert_eq!(settings.x_padding_bytes, (4, 4));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = Sink(Arc::clone(&seen));
+        let pad = referer_pad_value(&settings);
+        send_dial_head(
+            &mut sink,
+            "front.example",
+            &dial_path(&settings),
+            &settings.headers,
+            &pad,
+        )
+        .expect("head");
+        let head = String::from_utf8(seen.lock().expect("sink").clone()).expect("utf8");
+        assert!(
+            head.contains("?x_padding=XXXX\r\n"),
+            "the dial wrote a run its own hub refuses: {head}"
+        );
     }
 
     /// A plaintext session's upload lane must park on a poll quantum: the boxed window cannot arm the socket itself, and an unarmed read holds its worker for as long as the peer keeps the body open, which is the whole download.
@@ -5669,20 +5735,79 @@ mod tests {
         );
     }
 
-    /// An auto hub keeps serving the shape it resolved to: the packet it was already answering is still answered, so gating on a stated mode narrowed nothing.
+    /// An auto hub keeps serving both shapes it resolved to: the downlink GET and the packet POST it was already answering are still answered, so gating on a stated mode narrowed nothing.
     #[test]
     fn an_unstated_mode_still_serves_the_shape_it_resolved_to() {
         let settings = settings_from(
             r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share"}}}"#,
         );
-        let head = format!(
-            "POST /share/autohub/0 HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nContent-Length: 1\r\n\r\n",
-            "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500)
+        assert_eq!(settings.mode_source, ModeSource::Auto);
+        let referer = "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500);
+        let post = format!(
+            "POST /share/autohub/0 HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nContent-Length: 1\r\n\r\n"
         );
         assert_eq!(
-            status_through_core(&head, &settings),
+            status_through_core(&post, &settings),
             200,
             "the packet shape an auto hub resolved to stopped being served"
+        );
+        let get = format!("GET /share/autohub HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\n\r\n");
+        assert_eq!(
+            status_through_core(&get, &settings),
+            200,
+            "the downlink shape an auto hub resolved to stopped being served"
+        );
+    }
+
+    /// A peer that sends part of a head and stops ends at the head's own budget: nothing has armed the socket when the first byte lands, so without one the slot waits forever.
+    #[test]
+    fn a_partial_head_ends_at_its_budget_instead_of_holding_the_slot() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share"}}}"#,
+        );
+        crate::budgets::apply(&crate::config::Budgets {
+            head_arrival: Some(std::time::Duration::from_millis(100)),
+            ..Default::default()
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let Ok(read) = stream.try_clone() else {
+                return;
+            };
+            let began = std::time::Instant::now();
+            let served = accept_split_with_settings(read, stream, &settings, None);
+            let _ = tx.send((served.is_none(), began.elapsed()));
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .write_all(b"GET /share HTTP/1.1\r\nHost: h")
+            .expect("writes a partial head");
+        let (refused, took) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the slot ended");
+        assert!(refused, "a partial head was served");
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "the head waited {took:?}"
+        );
+    }
+
+    /// A `stream-one` hub still refuses the separate downlink GET, so the relaxation reaches the mode nobody stated and not the check itself.
+    #[test]
+    fn a_stated_stream_one_still_refuses_the_session_get() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "stream-one"}}}"#,
+        );
+        assert_eq!(settings.mode_source, ModeSource::Stated);
+        let referer = "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500);
+        let get = format!("GET /share/autohub HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\n\r\n");
+        assert_eq!(
+            status_through_core(&get, &settings),
+            400,
+            "a hub told stream-one served the downlink GET"
         );
     }
 

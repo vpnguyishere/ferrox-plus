@@ -5160,6 +5160,9 @@ impl Carried for crate::ws::WsReader {
 pub(crate) trait RelayPoll {
     fn arm_relay_poll(&mut self);
 
+    /// Arms the clock the head's own read runs under: a peer that sends part of a head and stops must not hold the lane forever.
+    fn arm_head_poll(&mut self) {}
+
     /// Reads and dispatches carrier control frames after the data half ends, so a write side still waiting on the peer's window keeps being fed; `None` when the carrier has no such frames.
     fn pump_control(&mut self) -> Option<bool> {
         None
@@ -5169,6 +5172,10 @@ pub(crate) trait RelayPoll {
 impl RelayPoll for Connection {
     fn arm_relay_poll(&mut self) {
         let _ = self.set_read_timeout(Some(RELAY_POLL));
+    }
+
+    fn arm_head_poll(&mut self) {
+        let _ = self.set_read_timeout(Some(budgets::head_arrival()));
     }
 }
 
@@ -15848,8 +15855,15 @@ fn udp_carried_session<S: Dialed>(
                     (Box::new(reader), writer)
                 } else {
                     let head = crate::xhttp::dial_path(settings);
-                    let (reader, writer) =
-                        crate::xhttp::connect_split(first, up, host, &head, &settings.headers)?;
+                    let pad = crate::xhttp::referer_pad_value(settings);
+                    let (reader, writer) = crate::xhttp::connect_split(
+                        first,
+                        up,
+                        host,
+                        &head,
+                        &settings.headers,
+                        &pad,
+                    )?;
                     (Box::new(reader), writer)
                 };
                 if !writer.send(header) {
@@ -17701,7 +17715,8 @@ fn tls_xhttp<S: Dialed, D: Dialed>(
     }
     if settings.mode == crate::xhttp::XhttpMode::StreamOne {
         let head = crate::xhttp::dial_path(settings);
-        return crate::xhttp::connect_split(reader, writer, host, &head, &settings.headers)
+        let pad = crate::xhttp::referer_pad_value(settings);
+        return crate::xhttp::connect_split(reader, writer, host, &head, &settings.headers, &pad)
             .map(|(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer))
             .or_else(|| tls_unreachable(server));
     }
@@ -17854,11 +17869,13 @@ fn xhttp_pair(
         return pair.map(|(reader, writer)| (XhttpPairRead::H2(reader), writer));
     }
     if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+        let pad = crate::xhttp::referer_pad_value(settings);
         return crate::xhttp::connect(
             uplink,
             host,
             &crate::xhttp::dial_path(settings),
             &settings.headers,
+            &pad,
         )
         .map(|(reader, writer)| (XhttpPairRead::H1(reader), writer));
     }
@@ -44401,7 +44418,8 @@ mod tests {
         match &carrier {
             Carrier::Xhttp { .. } => {
                 let (mut reader, writer) =
-                    crate::xhttp::connect(uplink, host, path, &[]).expect("upgrades");
+                    crate::xhttp::connect(uplink, host, path, &[], &"X".repeat(500))
+                        .expect("upgrades");
                 writer.send(&header);
                 let mut reply = [0u8; 2];
                 reader.read_exact(&mut reply).expect("replies");
@@ -45339,7 +45357,8 @@ mod tests {
                 ))
             },
             |stream| {
-                let (reader, writer) = crate::xhttp::connect(stream, "127.0.0.1", "/share", &[])?;
+                let (reader, writer) =
+                    crate::xhttp::connect(stream, "127.0.0.1", "/share", &[], &"X".repeat(500))?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
@@ -46391,7 +46410,8 @@ mod tests {
                 ))
             },
             |stream| {
-                let (reader, writer) = crate::xhttp::connect(stream, "127.0.0.1", "/share", &[])?;
+                let (reader, writer) =
+                    crate::xhttp::connect(stream, "127.0.0.1", "/share", &[], &"X".repeat(500))?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,

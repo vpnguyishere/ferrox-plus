@@ -513,16 +513,20 @@ pub(crate) fn serve_xhttp(
     let Ok(read) = stream.try_clone() else {
         return;
     };
-    let Some((mut reader, writer)) =
+    let Some((reader, writer)) =
         crate::xhttp::accept_split_with_settings(read, stream, settings, None)
     else {
         return;
     };
+    // The handshake clock: a carrier that answers its head and then goes silent ends the slot at its budget instead of holding it.
+    let mut reader = crate::proxy::HandshakeRead::new(reader, crate::budgets::handshake());
     let Some((uplink, response, recv, meter)) =
         accept_on(&mut reader, password, method, identities, freedom)
     else {
+        writer.abort();
         return;
     };
+    reader.disarm();
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
@@ -3469,6 +3473,7 @@ mod tests {
             "h",
             "/share",
             &[],
+            &"X".repeat(500),
         )
         .expect("dials the head");
         let widths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));

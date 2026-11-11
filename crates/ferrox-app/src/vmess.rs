@@ -2967,8 +2967,13 @@ mod tests {
             "/vmess-xhttp",
             |stream, id| serve_xhttp(stream, "/vmess-xhttp", &Users::single(id), true),
             |stream| {
-                let (reader, writer) =
-                    crate::xhttp::connect(stream, "127.0.0.1", "/vmess-xhttp", &[])?;
+                let (reader, writer) = crate::xhttp::connect(
+                    stream,
+                    "127.0.0.1",
+                    "/vmess-xhttp",
+                    &[],
+                    &"X".repeat(500),
+                )?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
