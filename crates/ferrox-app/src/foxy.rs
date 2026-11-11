@@ -9803,4 +9803,117 @@ pub(crate) mod loopback {
         );
         edge.join().expect("joins");
     }
+    /// A DATA frame holding many DATAGRAM capsules advances a cursor instead of draining the buffer per capsule: the consumed prefix stays until the frame is done, and every payload still arrives in order.
+    #[test]
+    fn a_frame_of_capsules_advances_a_cursor_instead_of_draining() {
+        const COUNT: usize = 32;
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let mut capsules = Vec::new();
+        let mut sent = Vec::new();
+        for at in 0..COUNT {
+            let payload = [at as u8; 8];
+            sent.extend_from_slice(&payload);
+            masque::datagram_encode(&payload, &mut capsules);
+        }
+        let edge = h3_scripted_edge(
+            sock,
+            server,
+            vec![
+                (h3_answer(), Duration::ZERO),
+                (h3_data(&capsules), Duration::ZERO),
+            ],
+        );
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut lane = H3::open_udp(&dial, "example.com", 443, quic).expect("opens");
+        lane.set_read_quantum(Duration::from_secs(5));
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while got.len() < sent.len() {
+            assert!(std::time::Instant::now() < until, "the payloads arrive");
+            match lane.read_datagram(&mut buf) {
+                Ok(0) => panic!("an empty read with {} bytes owed", sent.len() - got.len()),
+                Ok(read) => {
+                    got.extend_from_slice(&buf[..read]);
+                    if got.len() < sent.len() {
+                        assert_eq!(
+                            lane.capsule_buf.len(),
+                            capsules.len(),
+                            "the consumed capsule is a cursor, not a drain"
+                        );
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("the capsule failed: {error}"),
+            }
+        }
+        assert_eq!(got, sent, "every payload once, in the order it was sent");
+        assert!(
+            lane.capsule_buf.is_empty(),
+            "nothing is left for the next frame"
+        );
+        edge.join().expect("joins");
+    }
+
+    /// A CONNECT-IP packet that arrives as one DATAGRAM capsule in one frame is read straight into the caller's buffer: the capsule buffer's allocation never grows, so the packet was not staged between the stream and its caller.
+    #[test]
+    fn a_connect_ip_packet_in_one_frame_is_read_into_the_caller() {
+        let (roots, server) = minted(b"h3");
+        // A packet wider than one QUIC datagram leaves in two, and a coalescing edge socket would hand its one-datagram read a burst it truncates.
+        let sock = crate::quic::Datagram::plain(
+            crate::quic::bind_datagram_plain("127.0.0.1:0").expect("binds"),
+        );
+        let port = sock.local_addr().expect("addr").port();
+        let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
+        let (udp_tx, udp_rx) = std::sync::mpsc::channel();
+        let edge = quic_ip_edge(sock, server, seen_tx, udp_tx, 1);
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let (mut lane, _) = Ip::open(&dial, Some(quic)).expect("opens");
+        let wide = vec![0x5a; 1_300];
+        assert!(lane
+            .write(&[198, 51, 100, 9], &[203, 0, 113, 9], 40_000, 443, &wide)
+            .expect("writes"));
+        lane.flush().expect("flushes");
+        udp_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the edge read it");
+        let mut packet = Vec::with_capacity(2_048);
+        let base = packet.as_ptr();
+        let staged = match &lane {
+            Ip::H3(inner) => inner.capsule_buf.capacity(),
+            Ip::H2(_) => unreachable!("an h3 tunnel"),
+        };
+        assert!(lane.read(&mut packet).expect("reads"), "a reply");
+        assert_eq!(
+            packet.as_ptr(),
+            base,
+            "the packet landed in the caller's own allocation"
+        );
+        assert_eq!(
+            packet.capacity(),
+            2_048,
+            "the caller's buffer did not regrow"
+        );
+        let Ip::H3(inner) = &lane else {
+            unreachable!("an h3 tunnel");
+        };
+        assert_eq!(
+            inner.capsule_buf.capacity(),
+            staged,
+            "the packet never entered the capsule buffer"
+        );
+        assert!(inner.capsule_buf.is_empty(), "nothing is left staged");
+        assert_eq!(
+            connectip::udp_from_packet(&packet).expect("parses").payload,
+            &wide[..]
+        );
+        edge.join().expect("joins");
+    }
 }
