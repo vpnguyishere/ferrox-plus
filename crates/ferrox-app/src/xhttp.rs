@@ -2440,14 +2440,14 @@ impl Read for SessionReader {
                 let seq = st.next_seq;
                 st.packets.remove(&seq)
             } {
+                st.next_seq += 1;
                 eprintln!(
                     "t-trace: pkt {} seq={} len={} head={:02x?}",
                     self.session.id,
-                    seq,
+                    st.next_seq - 1,
                     pkt.len(),
                     &pkt[..pkt.len().min(8)]
                 );
-                st.next_seq += 1;
                 st.last_seen = std::time::Instant::now();
                 if pkt.len() <= buf.len() {
                     buf[..pkt.len()].copy_from_slice(&pkt);
