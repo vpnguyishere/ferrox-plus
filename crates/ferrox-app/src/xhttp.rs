@@ -2084,7 +2084,13 @@ fn sweep_stalled_sessions(
         .filter(|(_, session)| is_stalled(session, budget))
         .map(|(id, _)| id.clone())
         .collect();
-    stale.into_iter().filter_map(|id| map.remove(&id)).collect()
+    stale
+        .into_iter()
+        .filter_map(|id| {
+            eprintln!("t-trace: sweep-stall {id}");
+            map.remove(&id)
+        })
+        .collect()
 }
 
 fn get_or_create_session(id: &str) -> Arc<Session> {
@@ -2117,10 +2123,6 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
     if due {
         stalled.extend(sweep_stalled_sessions(&mut map, budget));
     }
-    let fresh = !map.contains_key(id);
-    if fresh {
-        eprintln!("t-trace: new {id}");
-    }
     let session = map
         .entry(id.to_owned())
         .or_insert_with(|| {
@@ -2143,6 +2145,7 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
         })
         .clone();
     drop(map);
+    eprintln!("t-trace: lookup {id} {:p}", Arc::as_ptr(&session));
     // The owed answers run after the map lock, so a peer that stops reading cannot block a session lookup.
     for session in stalled {
         close_session(&session);
@@ -2169,11 +2172,13 @@ fn remove_session_if_owned(id: &str, session: &Session) {
         .is_some_and(|carried| std::ptr::eq(Arc::as_ptr(carried), session))
     {
         map.remove(id);
+        eprintln!("t-trace: remove {id}");
     }
 }
 
 // Drop is the only other way a session ends, and a waiter parked before a reader exists has no Drop to run.
 pub(crate) fn end_session(id: &str) {
+    eprintln!("t-trace: end {id}");
     let carried = sessions().lock().expect("sessions lock").remove(id);
     if let Some(carried) = carried {
         close_session(&carried);
