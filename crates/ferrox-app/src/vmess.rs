@@ -2315,7 +2315,7 @@ pub(crate) fn serve_xhttp(stream: Connection, path: &str, users: &Users, freedom
 pub(crate) fn serve_xhttp_settings(
     stream: Connection,
     settings: &crate::xhttp::XhttpSettings,
-    users: &Users,
+    users: &UsersRef,
     freedom: bool,
 ) {
     let Ok(read) = stream.try_clone() else {
@@ -2334,7 +2334,7 @@ pub(crate) fn serve_xhttp_split<R, W>(
     reader: R,
     writer: W,
     settings: &crate::xhttp::XhttpSettings,
-    users: &Users,
+    users: &UsersRef,
     freedom: bool,
     close: &Close,
 ) where
@@ -2346,7 +2346,12 @@ pub(crate) fn serve_xhttp_split<R, W>(
     else {
         return;
     };
-    serve_xhttp_accepted(reader, writer, users, freedom, close);
+    // A packet-up GET waits on the reader for a POST its own answer has not yet asked for; that wait belongs to the flow, not to the setup lane the POST's connection is queued behind.
+    let users = std::sync::Arc::clone(users);
+    let close = Close::clone(close);
+    crate::proxy::spawn_carried(move || {
+        serve_xhttp_accepted(reader, writer, &users, freedom, &close);
+    });
 }
 
 /// The session above an xHTTP carrier an accept already split: an h2 stream and an H1 request both
