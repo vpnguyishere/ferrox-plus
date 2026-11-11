@@ -21841,7 +21841,7 @@ fn serve_trojan_xhttp_accepted(
         return;
     };
     crate::accesslog::record_current(&target);
-    eprintln!("t-trace: trojan decode ok cmd={cmd}");
+    eprintln!("t-trace: trojan decode ok cmd={cmd} target={target:?}");
     if !freedom {
         echo_trace("session xhttp trojan cmd refused");
         cwriter.finish();
@@ -21868,16 +21868,19 @@ fn serve_trojan_xhttp_accepted(
         return;
     }
     let Some(target) = target.socket() else {
+        eprintln!("t-trace: trojan no-socket");
         cwriter.finish();
         return;
     };
     let Some(uplink) = dial_or_report(&target) else {
+        eprintln!("t-trace: trojan dial fail {target:?}");
         echo_trace("session xhttp uplink refused");
         cwriter.finish();
         return;
     };
     echo_trace("session xhttp relaying");
     relay_sink_xhttp_drained(creader, &cwriter, &uplink);
+    eprintln!("t-trace: trojan relay done {target:?}");
 }
 
 fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
