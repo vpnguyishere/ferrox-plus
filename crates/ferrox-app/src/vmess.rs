@@ -2363,6 +2363,7 @@ pub(crate) fn serve_xhttp_accepted(
     let decoded = accept_request(&mut reader, users);
     reader.disarm();
     if decoded.is_none() {
+        eprintln!("trace vmess-decode-refused");
         writer.abort();
         close();
         return;

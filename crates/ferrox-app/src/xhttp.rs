@@ -2646,29 +2646,35 @@ fn check_response(head: &[u8]) -> Option<()> {
 }
 
 fn emit_404(stream: &mut impl Write) {
+    eprintln!("trace emit404");
     let _ = stream
         .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 fn emit_400(stream: &mut impl Write) {
+    eprintln!("trace emit400");
     let _ = stream
         .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 fn emit_405(stream: &mut impl Write) {
+    eprintln!("trace emit405");
     let _ = stream.write_all(
         b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
 }
 fn emit_409(stream: &mut impl Write) {
+    eprintln!("trace emit409");
     let _ = stream
         .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 fn emit_413(stream: &mut impl Write) {
+    eprintln!("trace emit413");
     let _ = stream.write_all(
         b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
 }
 
 fn emit_500(stream: &mut impl Write) {
+    eprintln!("trace emit500");
     let _ = stream.write_all(
         b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
@@ -2720,8 +2726,12 @@ pub(crate) fn accept_split_with_settings<
     loop {
         // The head's own clock, because nothing arms the socket before the first read: a partial head that stops must end at its budget.
         crate::proxy::RelayPoll::arm_head_poll(&mut read);
-        let (mut head, at) =
-            crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
+        let Some((mut head, at)) =
+            crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())
+        else {
+            eprintln!("trace no-head");
+            return None;
+        };
         // The loop hands `accept_core` a head it parses and a tail it keeps, so this is the one reader whose tail still needs its own owner.
         let prefix = head.split_off(at);
         // The session lands in a boxed window whose own arm is a no-op, so the socket gets its poll quantum here, once the head is in.
@@ -2733,7 +2743,10 @@ pub(crate) fn accept_split_with_settings<
                 write = next_write;
                 read.set_carry(carry);
             }
-            Served::Closed => return None,
+            Served::Closed => {
+                eprintln!("trace closed");
+                return None;
+            }
         }
     }
 }
