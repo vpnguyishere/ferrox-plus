@@ -2448,6 +2448,7 @@ impl Read for SessionReader {
                 return Ok(buf.len());
             }
             if st.ended || st.upload_done {
+                eprintln!("t-trace: reader-end {} {}", self.session.id, st.ended);
                 return Ok(0);
             }
             if !st.upload_attached && st.last_seen.elapsed() >= crate::budgets::relay_stall() {
@@ -2721,8 +2722,17 @@ pub(crate) fn accept_split_with_settings<
     loop {
         // The head's own clock, because nothing arms the socket before the first read: a partial head that stops must end at its budget.
         crate::proxy::RelayPoll::arm_head_poll(&mut read);
-        let (mut head, at) =
-            crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
+        let (mut head, at) = match crate::proxy::read_exact_head(
+            &mut read,
+            HEAD_LIMIT,
+            crate::budgets::head_arrival(),
+        ) {
+            Some(v) => v,
+            None => {
+                eprintln!("t-trace: head-fail");
+                return None;
+            }
+        };
         // The loop hands `accept_core` a head it parses and a tail it keeps, so this is the one reader whose tail still needs its own owner.
         let prefix = head.split_off(at);
         // The session lands in a boxed window whose own arm is a no-op, so the socket gets its poll quantum here, once the head is in.
@@ -2734,7 +2744,10 @@ pub(crate) fn accept_split_with_settings<
                 write = next_write;
                 read.set_carry(carry);
             }
-            Served::Closed => return None,
+            Served::Closed => {
+                eprintln!("t-trace: closed");
+                return None;
+            }
         }
     }
 }
@@ -2976,6 +2989,7 @@ pub(crate) fn accept_core<
     };
 
     if !path_covers(settings.path.as_str(), bare_path(target)) {
+        eprintln!("t-trace: 404 {first}");
         emit_404(&mut write);
         return Served::Closed;
     }
@@ -3009,6 +3023,7 @@ pub(crate) fn accept_core<
         None => false,
     };
     if !pad_ok {
+        eprintln!("t-trace: 400 pad {first}");
         emit_400(&mut write);
         return Served::Closed;
     }
@@ -3023,6 +3038,7 @@ pub(crate) fn accept_core<
                 return Served::Closed;
             }
             if method == "GET" {
+                eprintln!("t-trace: none-none get");
                 sse_ok(&mut write, settings, &padded);
                 let writer = writer_for(write, h2);
                 let session = get_or_create_session("__none__");
@@ -3040,6 +3056,7 @@ pub(crate) fn accept_core<
                     emit_400(&mut write);
                     return Served::Closed;
                 }
+                eprintln!("t-trace: none-none post {first}");
                 sse_ok(&mut write, settings, &padded);
                 let reader = upload.into_window(prefix);
                 let writer = writer_for(write, h2);
@@ -3056,6 +3073,7 @@ pub(crate) fn accept_core<
                     emit_400(&mut write);
                     return Served::Closed;
                 }
+                eprintln!("t-trace: sid get {sid} {first}");
                 let session = bound_session(sid, h2.as_ref(), true);
                 sse_ok(&mut write, settings, &padded);
                 let writer = writer_for(write, h2);

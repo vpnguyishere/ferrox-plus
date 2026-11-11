@@ -21835,11 +21835,13 @@ fn serve_trojan_xhttp_accepted(
     bounded.disarm();
     let creader = bounded.into_inner();
     let Some((cmd, target)) = decoded else {
+        eprintln!("t-trace: trojan decode fail");
         echo_trace("session xhttp trojan decode refused");
         cwriter.abort();
         return;
     };
     crate::accesslog::record_current(&target);
+    eprintln!("t-trace: trojan decode ok cmd={cmd}");
     if !freedom {
         echo_trace("session xhttp trojan cmd refused");
         cwriter.finish();
