@@ -1888,6 +1888,23 @@ fn extract_padding<'a>(
     query_param(target, &settings.x_padding_key)
 }
 
+/// Temporary: the wall clock a trace line carries, so a refusal is placed against the accept that caused it.
+pub(crate) fn trace_ms() -> u128 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+}
+
+#[allow(unused_macros)]
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        trace!("t={} {}", crate::xhttp::trace_ms(), format!($($arg)*))
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use trace;
+
 /// Reads the session id and packet sequence from one request target.
 pub(crate) fn extract_meta<'a>(
     text: &'a str,
@@ -2147,7 +2164,7 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
 }
 
 fn close_session(s: &Arc<Session>) {
-    eprintln!("trace close-session id={}", s.id);
+    trace!("close-session id={}", s.id);
     let response = {
         let mut st = s.state.lock().expect("session lock");
         st.ended = true;
@@ -2456,7 +2473,7 @@ impl Read for SessionReader {
                 return Ok(0);
             }
             if !st.upload_attached && st.last_seen.elapsed() >= crate::budgets::relay_stall() {
-                eprintln!("trace session-read-stall");
+                trace!("session-read-stall");
                 st.ended = true;
                 self.session.cv.notify_all();
                 return Ok(0);
@@ -2661,35 +2678,35 @@ fn check_response(head: &[u8]) -> Option<()> {
 }
 
 fn emit_404(stream: &mut impl Write) {
-    eprintln!("trace emit404");
+    trace!("emit404");
     let _ = stream
         .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 fn emit_400(stream: &mut impl Write) {
-    eprintln!("trace emit400");
+    trace!("emit400");
     let _ = stream
         .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 fn emit_405(stream: &mut impl Write) {
-    eprintln!("trace emit405");
+    trace!("emit405");
     let _ = stream.write_all(
         b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
 }
 fn emit_409(stream: &mut impl Write) {
-    eprintln!("trace emit409");
+    trace!("emit409");
     let _ = stream
         .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 fn emit_413(stream: &mut impl Write) {
-    eprintln!("trace emit413");
+    trace!("emit413");
     let _ = stream.write_all(
         b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
 }
 
 fn emit_500(stream: &mut impl Write) {
-    eprintln!("trace emit500");
+    trace!("emit500");
     let _ = stream.write_all(
         b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
@@ -2744,7 +2761,7 @@ pub(crate) fn accept_split_with_settings<
         let Some((mut head, at)) =
             crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())
         else {
-            eprintln!("trace no-head");
+            trace!("no-head");
             return None;
         };
         // The loop hands `accept_core` a head it parses and a tail it keeps, so this is the one reader whose tail still needs its own owner.
@@ -2759,7 +2776,7 @@ pub(crate) fn accept_split_with_settings<
                 read.set_carry(carry);
             }
             Served::Closed => {
-                eprintln!("trace closed");
+                trace!("closed");
                 return None;
             }
         }
@@ -3050,7 +3067,7 @@ pub(crate) fn accept_core<
                 return Served::Closed;
             }
             if method == "GET" {
-                eprintln!("trace get-nosid method={method} target={target}");
+                trace!("get-nosid method={method} target={target}");
                 sse_ok(&mut write, settings, &padded);
                 let writer = writer_for(write, h2);
                 let session = get_or_create_session("__none__");
@@ -3207,7 +3224,7 @@ pub(crate) fn accept_core<
                 emit_413(&mut write);
                 return Served::Closed;
             }
-            eprintln!("trace post sid={sid} seq={seq_num} len={}", payload.len());
+            trace!("post sid={sid} seq={seq_num} len={}", payload.len());
             if !session.push_packet(seq_num, payload, settings.sc_max_buffered) {
                 // A refused packet is a lost one — the reader waits on strict sequence — so the session is over; keeping it alive would park its reader on a sequence that can never arrive.
                 end_session(sid);
