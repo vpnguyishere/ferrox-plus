@@ -518,6 +518,23 @@ pub(crate) fn serve_xhttp(
     else {
         return;
     };
+    // A packet-up GET waits on its reader for a POST queued behind this lane; the wait belongs to the flow.
+    let password = password.to_owned();
+    let method = method.to_owned();
+    let identities = identities.to_vec();
+    crate::proxy::spawn_carried(move || {
+        serve_xhttp_accepted(reader, writer, &password, &method, &identities, freedom);
+    });
+}
+
+fn serve_xhttp_accepted(
+    reader: Box<dyn crate::proxy::WindowRead + Send>,
+    writer: crate::xhttp::XhttpWriter,
+    password: &str,
+    method: &str,
+    identities: &[(String, u32)],
+    freedom: bool,
+) {
     // The handshake clock: a carrier that answers its head and then goes silent ends the slot at its budget instead of holding it.
     let mut reader = crate::proxy::HandshakeRead::new(reader, crate::budgets::handshake());
     let Some((uplink, response, recv, meter)) =

@@ -372,11 +372,24 @@ pub(crate) fn serve_xhttp(
     let Ok(read) = stream.try_clone() else {
         return;
     };
-    let Some((reader, mut writer)) =
+    let Some((reader, writer)) =
         crate::xhttp::accept_split_with_settings(read, stream, settings, None)
     else {
         return;
     };
+    // A packet-up GET waits on its reader for a POST queued behind this lane; the wait belongs to the flow.
+    let users = users.to_vec();
+    crate::proxy::spawn_carried(move || {
+        serve_xhttp_accepted(reader, writer, &users, freedom);
+    });
+}
+
+fn serve_xhttp_accepted(
+    reader: Box<dyn crate::proxy::WindowRead + Send>,
+    mut writer: crate::xhttp::XhttpWriter,
+    users: &[SsUser],
+    freedom: bool,
+) {
     // The handshake clock: a carrier that answers its head and then goes silent ends the slot at its budget instead of holding it.
     let mut reader = crate::proxy::HandshakeRead::new(reader, crate::budgets::handshake());
     let Some((accepted, meter)) = accept_on(&mut reader, &mut writer, users, freedom) else {

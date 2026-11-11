@@ -21779,7 +21779,9 @@ fn serve_session_trojan_xhttp<
         echo_trace("session xhttp trojan accept refused");
         return;
     };
-    serve_trojan_xhttp_accepted(creader, cwriter, key, freedom);
+    // A packet-up GET waits on its reader for a POST queued behind this lane; the wait belongs to the flow.
+    let key: Vec<[u8; 56]> = key.to_vec();
+    spawn_carried(move || serve_trojan_xhttp_accepted(creader, cwriter, &key, freedom));
 }
 
 /// A TLS xHTTP carrier for trojan: a peer that negotiated h2 gets the demux, an H1 peer the
