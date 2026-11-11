@@ -980,6 +980,7 @@ impl XhttpWriter {
     /// The session refused the request: the response ends and, on h2, the request is reset so its
     /// unread body is not credited for the connection's life.
     pub(crate) fn abort(&self) {
+        trace(format_args!("writer-abort"));
         if let Some(stream) = self.stream.get() {
             if self.shared.finished.swap(true, Ordering::SeqCst) {
                 return;
@@ -991,6 +992,7 @@ impl XhttpWriter {
     }
 
     pub(crate) fn finish(&self) {
+        trace(format_args!("writer-finish"));
         if self.shared.finished.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -2771,10 +2773,11 @@ pub(crate) fn accept_split_with_settings<
     loop {
         // The head's own clock, because nothing arms the socket before the first read: a partial head that stops must end at its budget.
         crate::proxy::RelayPoll::arm_head_poll(&mut read);
+        let started = std::time::Instant::now();
         let Some((mut head, at)) =
             crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())
         else {
-            trace(format_args!("no-head"));
+            trace(format_args!("no-head after={:?}", started.elapsed()));
             return None;
         };
         {
