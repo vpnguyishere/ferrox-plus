@@ -948,6 +948,28 @@ mod tests {
         );
     }
 
+    /// The bound name a UDP association reads is handed to the resolver from the read's
+    /// own stack room: the reply builds no `Vec` and no `String` for a relay it only dials.
+    #[test]
+    fn an_association_bound_name_is_read_without_a_heap_buffer() {
+        let (client, _written) = pair(|server, _seen| {
+            let mut greeting = [0u8; 3];
+            server.read_exact(&mut greeting).expect("the greeting");
+            server.write_all(&[5, 0]).expect("the method reply");
+            let mut request = [0u8; 10];
+            server.read_exact(&mut request).expect("the request");
+            let name = b"127.0.0.1";
+            let mut reply = vec![5, 0, 0, 3, name.len() as u8];
+            reply.extend_from_slice(name);
+            reply.extend_from_slice(&53u16.to_be_bytes());
+            server.write_all(&reply).expect("the reply");
+        });
+        let mut session = Session::open(client, &Credential::default()).expect("a session");
+        let (relay, counts) = ferrox_core::alloc_count::measure(|| session.associate());
+        assert_eq!(relay.expect("a relay").port(), 53);
+        assert_eq!(counts.allocs, 0, "the bound name is read on the stack");
+    }
+
     /// The relay a server binds with a name is dialled, not refused: the reference
     /// hands the bound address to its dialer, which resolves the name — `localhost`
     /// answers here without a wire, so the association carries the loopback relay.
