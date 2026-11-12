@@ -24998,7 +24998,7 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
     };
     let lane_address = lane.address;
     let mut lanes = HashMap::new();
-    lanes.insert(None, lane);
+    lanes.insert(DEFAULT_UDP_LANE.to_owned(), lane);
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
@@ -25286,7 +25286,7 @@ fn serve_socks_udp_split(
         match relay.recv_from(&mut buf) {
             Ok((n, src)) => {
                 quiet = Instant::now();
-                if replies.contains_key(&src) {
+                if replies.contains(&src) {
                     if let Some(client) = client_addr {
                         let _ = relay.send_to(&buf[..n], client);
                     }
