@@ -241,11 +241,14 @@ ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47483770 psiphon_shad
 # Re-blessed 47621538: the xhttp size-line probe adds one test to the same
 # ferrox-app bin, and the release layout puts the 12 Ir back that removing the
 # udp serve wrappers took out; psiphon_shadowsocks.rs is untouched.
-# Re-blessed 47621526 by p2-socks: the SOCKS front's borrowed account and the
-# client datagram's two-part send change the same ferrox-app bin's layout;
-# psiphon_shadowsocks.rs is untouched.
-ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+# Re-blessed 47621538 on the p2-socks address-encode run: main already reports
+# 47621538 on this runner (run 43253246183); psiphon_shadowsocks.rs is untouched.
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621538 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
 # The fused size-line walk: 256 turns over a twelve-byte line, the first digit
 # changed each turn so the call is not hoisted. The CRLF scan and the hex parse
 # share a pass and the line is never copied. Nothing on the wire moves.
 ferrox_app::xhttp::tests::xhttp_line_probe 68114 xhttp::tests::the_chunk_line_costs_one_walk
+# The client request built by `request`: one address type byte, the address and
+# the port, written in one match with the vector's room reserved exactly once.
+# The oracle test replays the pinned Go writer's bytes.
+ferrox_core::socks::request 867 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes

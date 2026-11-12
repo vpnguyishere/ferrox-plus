@@ -50,8 +50,9 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
-| seconds-per-socks-dial | UNBLESSED | CI bench.yml (no socks cell yet) |
+| ops-retired-instructions | 867 | scripts/count-ops.sh |
+| socks-raw-down-8-client-mib-per-second | 4303 | CI benchmark-matrix.yml run 43248778568 |
+| socks-raw-down-8-server-mib-per-second | 4374 | CI benchmark-matrix.yml run 43248778568 |
 | oracle-lines-matching-the-pinned-go | 8 | ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes |
 | methods-offered-in-the-greeting | 1 | ferrox-core-socks::tests::the_greeting_is_the_bytes_the_pinned_writer_writes |
 | request-bytes-per-tcp-dial | 10 | ferrox-core-socks::tests::the_request_is_the_bytes_the_pinned_writer_writes |
@@ -135,7 +136,7 @@ The client is leaner than this tree's own SOCKS5 client, which writes twice for 
 ### What is not proved here
 
 - The syscall count is arithmetic, not a count: a socket's read count cannot be gated by a loopback test, so the three-call figure is the shape of the code and the pinned reader's `n+1` is what its own loop does. No local check counts either.
-- The durations are CI-only: the matrix carries no socks cell, so no local run measures this path.
+- The durations are CI-only: `socks-raw-down-8` measures bulk throughput over 8 concurrent 256 MiB downloads, not a single dial, and a local run would measure a VPN tunnel.
 - No pinned tree in this matrix ships a SOCKS4 **client** whose bytes can be read here: `xray-core`'s client is SOCKS5 only, `zeronet` speaks SOCKS5 in both roles, and sing-box's SOCKS4 client lives in a library this tree does not vendor. The client's claim is therefore against this tree's own SOCKS5 client (one buffer against three), and the server's claim is against the pinned Go server above.
 - `TestSocksConformanceMod` is the xray-core scenario that exercises SOCKS4 (`socks4.Dial` against this front), and it is in the pin's gate; the other socks scenarios still name their own rows' gaps.
 
@@ -143,7 +144,7 @@ A datagram whose literal header is the one the tree would have written goes on a
 
 Syscalls: a no-auth TCP dial writes **twice** — the greeting, then the request after the method reply — and reads three (the method reply, the request reply's head, the bound address); a credentialed dial writes three (the greeting, the credential block, the request) and reads four (the method reply, the credential status, the reply head, the bound address). The exact shape is counted by an in-memory server (`a_no_auth_connect_writes_the_greeting_then_the_request`: two writes, three reads, zero allocations; `a_credentialed_connect_writes_the_greeting_credential_and_request`: three writes, four reads, zero allocations), not by a loopback duration.
 
-Copies: the handshake's bytes are built once — the greeting on the stack, the credential block and the request in one buffer each — and the payload is the relay's own copy, the same one every other lane pays; on the device front the payload is the device's own and goes to the socket by pointer. Time: not measured, see below.
+Copies: the handshake's bytes are built once — the greeting on the stack, the credential block and the request in one buffer each — and the payload is the relay's own copy, the same one every other lane pays; on the device front the payload is the device's own and goes to the socket by pointer. Time: the matrix's `socks-raw-down-8` cell, below.
 
 ## Ops
 
@@ -152,14 +153,17 @@ Copies: the handshake's bytes are built once — the greeting on the stack, the 
   socks::tests::the_client_writes_the_bytes_the_pinned_go_writes 'ferrox_core::socks::request'
 ```
 
-`UNBLESSED`, as above — macOS/aarch64 ships no `valgrind`, so this count is CI-only there and has not been read; it is not a number and is not quoted as one.
+`867` is the `ops.yml` report of run `43256551985` (commit `8a3aad2`); the same command on main's run `43253246183` reports `929`. The report also holds `Target::encode_into` at **301** against **401** on main and `datagram` at **890** against **1006**. macOS/aarch64 ships no `valgrind`, so the gate runs in CI there; the number in `scripts/expected-ops.txt` is what the check compares.
 
 ## Time
 
-**Not measured yet.** Durations come from CI runners (`bench.yml`, `parity.yml`); no CI artefact has been read. `scripts/lib-matrix.sh` carries no socks cell — there is no `socks-*` scenario id — so `bench.yml` and `compare.yml` gate nothing here, and a local dial would measure a VPN tunnel rather than this code.
+The matrix's `socks-raw-down-8` cell is 8 concurrent 256 MiB downloads through one SOCKS server with 64 KiB reads; it prices bulk throughput, not a single dial. On `benchmark-matrix.yml` run `43248778568` (tier `standard`, 3 repeats, commit `8a3aad2`) this tree moved **4303 MiB/s** through the pinned `xray-core` server and **4374 MiB/s** as the server under the pinned `xray-core` client; `xray-core` moved **3091** and **3233 MiB/s** in the same cells. That is **1.39x** on the client leg and **1.05x** on the server leg, both priced rows lead every engine in the cell, and this tree's CPU cost is **80 ms/GiB** against `xray-core`'s **560**. The handshake is amortised over the cell, so these medians bound a regression in the relay, not a per-dial latency.
 
 ## What we removed
 
+- **Two matches per address write.** `Target::encode_into` and `Bound::encode_into` walked the address three times: `wire_len` matched the variant, `atyp` matched it again for the type byte, and the write matched it a third time. One match now writes the type byte, the address and the port; the bytes are the oracle's (`the_client_writes_the_bytes_the_pinned_go_writes`). The `ops.yml` report of run `43256551985` holds `Target::encode_into` at **301** against **401** on main's run `43253246183`, and the request that calls it at **867** against **929**.
+- **The datagram writer's staging scratch.** `datagram` built the address into a zeroed 260-byte stack buffer and copied it into the caller's vector. It writes the address into the vector's own room now, so the scratch and the copy are gone; `datagram` reports **890** against **1006** on the same runs, and the frame is the oracle's (`the_datagram_frame_is_rfc_1928`).
+- **Three probes of the deadline per handshake read.** `read_exact_within` read the clock after `Ok`, after `Interrupted` and after `WouldBlock`/`TimedOut` as well as at the top of the loop and once after it; each inner probe answered what the next one answers, so the loop probes once per read now. The bytes and the call counts are unchanged (`socks5-connect-write-calls 2`, `socks5-connect-read-calls 3`, `socks5-credentialed-connect-read-calls 4`).
 - **A zero pass over the name and the credential a client sends.** The front opened each of them with `vec![0u8; len]` and the read that follows filled every byte, so a flow paid a zero pass over the name, the user and the password for nothing. Each buffer is the read's own room now, and the counting allocator's `zeroed` counter is the witness: `a_socks_front_reads_no_buffer_it_zeroed` fails if the front zeroes one again. The bytes on the wire do not move: the same bytes are read into the same buffer, and the name still becomes the same `String`.
 - **A second dialer in the device front.** The tun2socks shape this tree could have grown is a bespoke outbound call from the packet handler. It does not: `accept_flow` opens a loopback pair and calls `serve_device_flow`, which asks the rules for the lane and then calls the same `serve_connect` every other front reaches, and the lane that serves it is the tree's own protocol set. The device's destination keeps its shape down to the request bytes — a name the caller asked for is a name in the `CONNECT`, so the server resolves it and this tree's resolver never sees it. The idea `zeptun` sells (translate the device onto the SOCKS machinery, do not re-implement it) is taken without its translator thread; `is_device` refuses `utun`/`wintun`/`tun2socks` as *protocol* names while serving `tun` with all three device spellings, so the config surface keeps one way in.
 - **The greeting's heap buffer, and then the request's.** The pinned Go client allocates a `buf.Buffer` per stage — one for the greeting, one for the credential block, one for the request — and hands each to the socket. The greeting here is three bytes on the stack (`[u8; 3]`), and the credential block and the request are written where they are read: a literal or a short name fits the inline stack block, the RFC's longest name takes the block beside it, and the address is written by `encode_into` into that room. The pinned oracle's bytes are the witness that the walk is the same one, and the counting allocator holds both dials at zero heap buffers (`socks5-connect-allocations`, `socks5-credentialed-connect-allocations`).

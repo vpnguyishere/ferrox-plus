@@ -26,7 +26,6 @@ record-layer backends-a-differential-test-cannot-lie-to 6 ferrox-bench-gate-1
 
 # --- Shadowsocks AEAD -------------------------------------------------------
 shadowsocks ops-retired-instructions UNBLESSED scripts/count-ops.sh
-socks seconds-per-socks-dial UNBLESSED CI bench.yml (no socks cell yet)
 shadowsocks aead-calls-per-chunk 2 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks maximum-payload-per-chunk 16383 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks write-syscalls-per-64KiB-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
@@ -777,8 +776,9 @@ engine-router dns-lookups-ip-on-demand-source-failed 0 ferrox-app-router::tests:
 engine-router gunzip-write-chunk-bytes 65536 ferrox-app-geodata::tests::a_gzipped_asset_is_written_while_it_is_decompressed
 
 # --- SOCKS5, both roles ------------------------------------------------------
-socks ops-retired-instructions UNBLESSED scripts/count-ops.sh
-socks seconds-per-socks-dial UNBLESSED CI bench.yml (no socks cell yet)
+socks ops-retired-instructions 867 scripts/count-ops.sh
+socks socks-raw-down-8-client-mib-per-second 4303 CI benchmark-matrix.yml run 43248778568
+socks socks-raw-down-8-server-mib-per-second 4374 CI benchmark-matrix.yml run 43248778568
 socks oracle-lines-matching-the-pinned-go 8 ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
 socks methods-offered-in-the-greeting 1 ferrox-core-socks::tests::the_greeting_is_the_bytes_the_pinned_writer_writes
 socks request-bytes-per-tcp-dial 10 ferrox-core-socks::tests::the_request_is_the_bytes_the_pinned_writer_writes
