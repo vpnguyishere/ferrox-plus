@@ -817,6 +817,7 @@ socks socks5-credentialed-connect-read-calls 4 ferrox-app-socks::tests::a_creden
 socks socks5-credentialed-connect-allocations 0 ferrox-app-socks::tests::a_credentialed_connect_writes_the_greeting_credential_and_request
 socks socks5-long-connect-allocations 0 ferrox-app-socks::tests::a_long_destination_and_a_long_bound_name_take_no_heap_buffer
 socks socks5-long-connect-read-calls 4 ferrox-app-socks::tests::a_long_destination_and_a_long_bound_name_take_no_heap_buffer
+socks socks5-association-bound-name-allocations 0 ferrox-app-socks::tests::an_association_bound_name_is_read_without_a_heap_buffer
 socks socks4-requests-a-credential-front-refuses 1 ferrox-app-proxy::tests::a_front_that_asks_for_a_credential_refuses_a_socks4_request
 socks socks4-xray-scenario-tests-passing 1 scripts/run-upstream-suite.sh
 socks http-fallback-requests-served 1 ferrox-app-proxy::tests::a_socks_front_serves_an_http_outbound_that_offers_its_account
