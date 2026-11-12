@@ -777,8 +777,8 @@ engine-router gunzip-write-chunk-bytes 65536 ferrox-app-geodata::tests::a_gzippe
 
 # --- SOCKS5, both roles ------------------------------------------------------
 socks ops-retired-instructions 867 scripts/count-ops.sh
-socks socks-raw-down-8-client-mib-per-second 4303 CI benchmark-matrix.yml run 43248778568
-socks socks-raw-down-8-server-mib-per-second 4374 CI benchmark-matrix.yml run 43248778568
+socks socks-raw-down-8-client-mib-per-second 2658 CI benchmark-matrix.yml run 43292720499
+socks socks-raw-down-8-server-mib-per-second 2808 CI benchmark-matrix.yml run 43292720499
 socks oracle-lines-matching-the-pinned-go 8 ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
 socks methods-offered-in-the-greeting 1 ferrox-core-socks::tests::the_greeting_is_the_bytes_the_pinned_writer_writes
 socks request-bytes-per-tcp-dial 10 ferrox-core-socks::tests::the_request_is_the_bytes_the_pinned_writer_writes
