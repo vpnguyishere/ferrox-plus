@@ -365,14 +365,18 @@ pub fn datagram_header_len(target: &Target<'_>) -> usize {
 /// The fragment byte is zero: a fragmented datagram is dropped by every server that
 /// implements RFC 1928 strictly, and the pinned Go reader drops one too
 /// (`DecodeUDPPacket` refuses `packet.Byte(2) != 0`).
+#[allow(
+    clippy::uninit_vec,
+    reason = "the address is written into the room below before the vector is read"
+)]
 pub fn datagram(target: &Target<'_>, payload: &[u8], out: &mut Vec<u8>) {
     out.clear();
     out.reserve(datagram_header_len(target) + payload.len());
-    out.push(0);
-    out.push(0);
-    out.push(0);
+    out.extend_from_slice(&[0, 0, 0]);
     let at = out.len();
-    out.resize(at + target.wire_len(), 0);
+    let len = target.wire_len();
+    // SAFETY: the address is written into the room below before the vector is read, and `encode_into` fills every byte of it.
+    unsafe { out.set_len(at + len) };
     target.encode_into(&mut out[at..]);
     out.extend_from_slice(payload);
 }
