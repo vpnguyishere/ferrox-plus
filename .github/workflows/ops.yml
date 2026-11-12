@@ -92,7 +92,7 @@ jobs:
           RUSTFLAGS: -C debuginfo=line-tables-only
         run: ./scripts/count-ops.sh check quic::tests::pem_wraps_at_sixty_four_columns scripts/expected-ops.txt
       - name: report the per-method counts in scope, never red
-        if: steps.provision.outcome == 'success'
+        if: always() && steps.provision.outcome == 'success'
         env:
           RUSTFLAGS: -C debuginfo=line-tables-only
         run: |
