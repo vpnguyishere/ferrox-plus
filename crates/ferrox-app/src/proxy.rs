@@ -34075,12 +34075,13 @@ fn socks_request<'a>(
     )
     .ok()?;
     // The one method this front wants: the credential exchange when the front has accounts, no authentication when it has none — a front that asks for the credential exchange refuses a client that does not offer it, the way the pinned Go server does (`authNoMatchingMethod`), and the no-authentication front answers whatever the client offered, as it always has.
-    let wanted = if accounts.wants_credential() {
+    let wants = accounts.wants_credential();
+    let wanted = if wants {
         ferrox_core::socks::METHOD_USER
     } else {
         ferrox_core::socks::METHOD_NONE
     };
-    if accounts.wants_credential() && !methods[..usize::from(head[1])].contains(&wanted) {
+    if wants && !methods[..usize::from(head[1])].contains(&wanted) {
         client.write_all(&[5, 0xff]).ok()?;
         return None;
     }
