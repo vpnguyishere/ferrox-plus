@@ -96,22 +96,26 @@ impl Target<'_> {
 
     /// Write this target into `out`, which must hold `wire_len()` octets.
     pub fn encode_into(&self, out: &mut [u8]) {
-        let len = self.wire_len();
-        assert!(out.len() >= len, "socks5 address buffer too short");
-        out[0] = self.atyp();
         match self {
             Self::V4(octets, port) => {
+                assert!(out.len() >= 7, "socks5 address buffer too short");
+                out[0] = ATYP_IPV4;
                 out[1..5].copy_from_slice(octets);
                 out[5..7].copy_from_slice(&port.to_be_bytes());
             }
             Self::V6(octets, port) => {
+                assert!(out.len() >= 19, "socks5 address buffer too short");
+                out[0] = ATYP_IPV6;
                 out[1..17].copy_from_slice(octets);
                 out[17..19].copy_from_slice(&port.to_be_bytes());
             }
             Self::Name(name, port) => {
+                let len = 4 + name.len();
+                assert!(out.len() >= len, "socks5 address buffer too short");
+                out[0] = ATYP_DOMAIN;
                 out[1] = name.len() as u8;
                 out[2..2 + name.len()].copy_from_slice(name);
-                out[2 + name.len()..4 + name.len()].copy_from_slice(&port.to_be_bytes());
+                out[2 + name.len()..len].copy_from_slice(&port.to_be_bytes());
             }
         }
     }
@@ -201,22 +205,26 @@ impl Bound<'_> {
 
     /// Write this address into `out`, which must hold `wire_len()` octets.
     pub fn encode_into(&self, out: &mut [u8]) {
-        let len = self.wire_len();
-        assert!(out.len() >= len, "socks5 address buffer too short");
-        out[0] = self.atyp();
         match self {
             Self::V4(octets, port) => {
+                assert!(out.len() >= 7, "socks5 address buffer too short");
+                out[0] = ATYP_IPV4;
                 out[1..5].copy_from_slice(octets);
                 out[5..7].copy_from_slice(&port.to_be_bytes());
             }
             Self::V6(octets, port) => {
+                assert!(out.len() >= 19, "socks5 address buffer too short");
+                out[0] = ATYP_IPV6;
                 out[1..17].copy_from_slice(octets);
                 out[17..19].copy_from_slice(&port.to_be_bytes());
             }
             Self::Name(name, port) => {
+                let len = 4 + name.len();
+                assert!(out.len() >= len, "socks5 address buffer too short");
+                out[0] = ATYP_DOMAIN;
                 out[1] = name.len() as u8;
                 out[2..2 + name.len()].copy_from_slice(name);
-                out[2 + name.len()..4 + name.len()].copy_from_slice(&port.to_be_bytes());
+                out[2 + name.len()..len].copy_from_slice(&port.to_be_bytes());
             }
         }
     }
@@ -363,10 +371,9 @@ pub fn datagram(target: &Target<'_>, payload: &[u8], out: &mut Vec<u8>) {
     out.push(0);
     out.push(0);
     out.push(0);
-    let len = target.wire_len();
-    let mut addr = [0u8; 260];
-    target.encode_into(&mut addr[..len]);
-    out.extend_from_slice(&addr[..len]);
+    let at = out.len();
+    out.resize(at + target.wire_len(), 0);
+    target.encode_into(&mut out[at..]);
     out.extend_from_slice(payload);
 }
 
