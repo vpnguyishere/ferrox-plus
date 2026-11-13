@@ -159,7 +159,7 @@ jobs:
           cat "$RUNNER_TEMP/tun-bench-identity.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
           cat tun-bench-results/runner.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
           cat tun-bench-results/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-          for log in tun-bench-results/ferrox.log tun-bench-results/zeptun-*.log tun-bench-results/hev-0.log tun-bench-results/singbox-*.log tun-bench-results/tun2socks.log; do
+          for log in tun-bench-results/ferrox-*.log tun-bench-results/zeptun-*.log tun-bench-results/hev-0.log tun-bench-results/singbox-*.log tun-bench-results/tun2socks.log; do
             [ -s "$log" ] || continue
             printf '\n### %s\n\n```\n' "$log" >> "$GITHUB_STEP_SUMMARY"
             tail -n 40 "$log" >> "$GITHUB_STEP_SUMMARY"
