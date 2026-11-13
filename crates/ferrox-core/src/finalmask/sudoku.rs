@@ -1299,6 +1299,51 @@ mod tests {
         );
     }
 
+    const PROBE_PLAINTEXT: usize = 4096;
+    const PROBE_ROUNDS: usize = 16;
+
+    #[inline(never)]
+    fn encode_probe() -> usize {
+        let config = stage("probe", "", &[]);
+        let mut writer = config.open_write(MaskRole::Client);
+        let plain: Vec<u8> = (0..PROBE_PLAINTEXT).map(|at| at as u8).collect();
+        let mut sink = std::io::sink();
+        let mut total = 0;
+        for _ in 0..PROBE_ROUNDS {
+            total += writer.write(&mut sink, &plain).expect("encodes");
+        }
+        std::hint::black_box(total)
+    }
+
+    #[inline(never)]
+    fn decode_probe() -> usize {
+        let config = stage("probe", "", &[]);
+        let plain: Vec<u8> = (0..PROBE_PLAINTEXT).map(|at| at as u8).collect();
+        let mut wire = Vec::new();
+        let mut writer = config.open_write(MaskRole::Client);
+        for _ in 0..PROBE_ROUNDS {
+            writer.write(&mut wire, &plain).expect("encodes");
+        }
+        let mut reader = config.open_read(MaskRole::Server);
+        let mut input = wire.as_slice();
+        let mut decoded = vec![0u8; PROBE_PLAINTEXT];
+        let mut total = 0;
+        loop {
+            let got = reader.read_from(&mut input, &mut decoded).expect("decodes");
+            if got == 0 {
+                break;
+            }
+            total += got;
+        }
+        std::hint::black_box(total)
+    }
+
+    #[test]
+    fn the_sudoku_wire_costs_the_bytes_and_nothing_else() {
+        assert_eq!(encode_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
+        assert_eq!(decode_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
+    }
+
     #[test]
     fn the_encoder_buffer_holds_its_capacity() {
         let config = stage("hunter2", "", &[]);
