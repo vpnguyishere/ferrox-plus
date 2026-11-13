@@ -309,11 +309,12 @@ fn parse_file_spec(spec: &Json) -> Option<FileSpec> {
         .and_then(Json::as_str)
         .and_then(|value| ferrox_core::b64::decode(value.as_bytes()))?;
     let shares = parse_key_shares(spec.get("KeyShares")?)?;
-    let md5 = spec
-        .get("MD5Sum")
-        .and_then(Json::as_str)
-        .and_then(|value| ferrox_core::b64::decode(value.as_bytes()))
-        .and_then(|value| value.try_into().ok());
+    let md5 = match spec.get("MD5Sum") {
+        None | Some(Json::Null) => None,
+        Some(value) => {
+            Some(<[u8; 16]>::try_from(ferrox_core::b64::decode(value.as_str()?.as_bytes())?).ok()?)
+        }
+    };
     Some(FileSpec { id, md5, shares })
 }
 
@@ -520,6 +521,11 @@ mod tests {
         let text = r#"{"ID":"AQ==","KeyShares":{"Threshold":1,"BoxedShares":["Ag=="],"SLOKIDs":["Aw=="]}}"#;
         let spec = parse_file_spec(&json::parse(text).expect("spec")).expect("file spec");
         assert_eq!(spec.md5, None);
+        let text = r#"{"ID":"AQ==","MD5Sum":null,"KeyShares":{"Threshold":1,"BoxedShares":["Ag=="],"SLOKIDs":["Aw=="]}}"#;
+        let spec = parse_file_spec(&json::parse(text).expect("spec")).expect("file spec");
+        assert_eq!(spec.md5, None);
+        let text = r#"{"ID":"AQ==","MD5Sum":"AQ==","KeyShares":{"Threshold":1,"BoxedShares":["Ag=="],"SLOKIDs":["Aw=="]}}"#;
+        assert!(parse_file_spec(&json::parse(text).expect("spec")).is_none());
     }
 
     #[test]
