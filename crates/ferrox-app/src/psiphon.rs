@@ -5016,7 +5016,7 @@ fn osl_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
     roots
 }
 
-/// A TransferURL's URL is base64 encoded; plain HTTPS URLs are accepted for existing configs.
+/// A `TransferURL`'s URL is base64 encoded; plain HTTPS URLs are accepted for existing configs.
 fn transfer_url(value: &str) -> Option<String> {
     let value = value.trim();
     if value.starts_with("https://") || value.starts_with("http://") {
@@ -8274,7 +8274,7 @@ fn fetch_reply(
     crate::foxy_account::ask(&endpoint, "GET", &endpoint.url(""), &headers, &[])
 }
 
-/// A URL's cached body and ETag, keyed by its own identity under the lane's state directory.
+/// A URL's cached body and `ETag`, keyed by its own identity under the lane's state directory.
 #[derive(Clone, Copy)]
 struct CacheSlot<'a> {
     dir: &'a Path,
@@ -8313,7 +8313,7 @@ impl CacheSlot<'_> {
     }
 }
 
-/// Fetch a URL, honouring its ETag: a 304 reuses the cached body instead of downloading it again.
+/// Fetch a URL, honouring its `ETag`: a 304 reuses the cached body instead of downloading it again.
 fn fetch_cached(
     url: &str,
     headers: &[(String, String)],
@@ -8341,6 +8341,37 @@ fn fetch_cached(
         304 => cached.ok_or_else(|| format!("psiphon: {url}: HTTP 304 without a cached body")),
         status => Err(format!("psiphon: {url}: HTTP {status}")),
     }
+}
+
+/// Return a seeded OSL body from the cache when its registry MD5 still matches, else fetch it.
+fn osl_body(
+    key: &str,
+    spec: &crate::psiphon_osl::FileSpec,
+    root: &TransferRoot,
+    settings: &Settings,
+    cache: Option<CacheSlot<'_>>,
+) -> Result<Vec<u8>, String> {
+    let cached = cache.and_then(CacheSlot::body);
+    let fresh = cached
+        .as_ref()
+        .is_some_and(|body| spec.md5.is_some_and(|md5| md5::compute(body).0 == md5));
+    let body = if fresh {
+        cached.unwrap_or_default()
+    } else {
+        fetch_cached(
+            key,
+            &root.headers,
+            &settings.tls_shape.roots,
+            root.skip_verify,
+            cache,
+        )?
+    };
+    if let Some(md5) = spec.md5 {
+        if md5::compute(&body).0 != md5 {
+            return Err(format!("psiphon: {key}: MD5 sum does not match"));
+        }
+    }
+    Ok(body)
 }
 
 /// Download, authenticate and decrypt every seeded OSL under the configured roots.
@@ -8389,33 +8420,13 @@ fn fetch_osl_entries(
                 dir: &cache_dir,
                 key: &key,
             });
-            let cached = slot.and_then(CacheSlot::body);
-            let fresh = cached
-                .as_ref()
-                .is_some_and(|body| spec.md5.is_some_and(|md5| md5::compute(body).0 == md5));
-            let body = if fresh {
-                cached.unwrap_or_default()
-            } else {
-                match fetch_cached(
-                    &key,
-                    &root.headers,
-                    &settings.tls_shape.roots,
-                    root.skip_verify,
-                    slot,
-                ) {
-                    Ok(body) => body,
-                    Err(why) => {
-                        last = why;
-                        continue;
-                    }
-                }
-            };
-            if let Some(md5) = spec.md5 {
-                if md5::compute(&body).0 != md5 {
-                    last = format!("psiphon: {key}: MD5 sum does not match");
+            let body = match osl_body(&key, &spec, root, settings, slot) {
+                Ok(body) => body,
+                Err(why) => {
+                    last = why;
                     continue;
                 }
-            }
+            };
             match crate::psiphon_osl::decrypt_osl(&body, &spec, &lookup, &settings.remote_list_key)
             {
                 Ok(text) => absorb(

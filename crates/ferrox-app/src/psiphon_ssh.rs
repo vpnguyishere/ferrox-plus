@@ -5628,6 +5628,8 @@ mod tests {
             split_tunnel_regions: &["US".to_owned()],
             api_encoding: ApiEncoding::Cbor,
             compress_tactics: true,
+            disable_api: false,
+            ssh_algorithms: None,
         };
         let payload = packed_handshake_body("SSH", &identity, None).expect("packed handshake");
         assert_eq!(&payload[..2], &[0, 1]);
@@ -5712,6 +5714,8 @@ mod tests {
             split_tunnel_regions: &["US".to_owned(), "DE".to_owned()],
             api_encoding: ApiEncoding::Json,
             compress_tactics: false,
+            disable_api: false,
+            ssh_algorithms: None,
         };
         assert_eq!(
             handshake_body("UNFRONTED-MEEK-HTTPS-OSSH", &identity, None),
@@ -5736,6 +5740,8 @@ mod tests {
             split_tunnel_regions: &[],
             api_encoding: ApiEncoding::Json,
             compress_tactics: false,
+            disable_api: false,
+            ssh_algorithms: None,
         };
         assert_eq!(
             handshake_body("SSH", &identity, None),
