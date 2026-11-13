@@ -87,7 +87,7 @@ pub fn read_varint_with_length<R: Read>(reader: &mut R) -> io::Result<(Varint, u
         value |= i32::from(current & SEGMENT_BITS) << (7 * index);
         if current & CONTINUE_BIT == 0 {
             let length = index + 1;
-            if length != varint_size(value) {
+            if length > 1 && (value as u32) < (1u32 << (7 * (length - 1))) {
                 return Err(invalid_data("read varint: non-canonical encoding"));
             }
             return Ok((value, length));

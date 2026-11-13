@@ -495,7 +495,7 @@ impl Device {
         ))
     }
 
-    fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    pub(crate) fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let head = self.framing.header_len();
         if head == 0 {
             return self.handle.read(buf);
@@ -536,12 +536,55 @@ impl Device {
         write_framed(&mut self.handle, self.framing, None, packet).map(|_| ())
     }
 
-    fn clone_writer(&self) -> io::Result<PacketWriter> {
+    pub(crate) fn clone_writer(&self) -> io::Result<PacketWriter> {
         Ok(PacketWriter {
             handle: self.handle.try_clone()?,
             framing: self.framing,
             gso: self.gso,
         })
+    }
+
+    /// A packet tunnel's descriptor: the reference dups it, closes it on exec, and makes it nonblocking.
+    pub(crate) fn from_inherited(fd: i32, mtu: usize) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            let duplicated = unsafe { libc::dup(fd) };
+            if duplicated < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe { libc::fcntl(duplicated, libc::F_SETFD, libc::FD_CLOEXEC) };
+            let flags = unsafe { libc::fcntl(duplicated, libc::F_GETFL) };
+            if flags >= 0 {
+                unsafe { libc::fcntl(duplicated, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            }
+            let handle = unsafe { std::fs::File::from_raw_fd(duplicated) };
+            Ok(Self {
+                framing: inherited_framing(&handle),
+                handle,
+                mtu,
+                gso: false,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (fd, mtu);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "packet tunnel needs a Unix descriptor",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.handle.as_raw_fd()
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn raw_fd(&self) -> i32 {
+        -1
     }
 
     fn mss(&self, remote: IpAddr) -> u32 {
@@ -565,14 +608,14 @@ impl Device {
 }
 
 /// A flow's writer: the descriptor clone plus the framing an emit owes it.
-struct PacketWriter {
+pub(crate) struct PacketWriter {
     handle: std::fs::File,
     framing: Framing,
     gso: bool,
 }
 
 impl PacketWriter {
-    fn write_packet(&mut self, packet: &[u8]) -> io::Result<bool> {
+    pub(crate) fn write_packet(&mut self, packet: &[u8]) -> io::Result<bool> {
         write_framed(&mut self.handle, self.framing, None, packet)
     }
 

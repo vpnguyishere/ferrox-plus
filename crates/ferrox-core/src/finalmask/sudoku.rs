@@ -275,7 +275,7 @@ impl Layout {
 struct Table {
     encode: Vec<Vec<[u8; 4]>>,
     decode: Vec<(u32, u8)>,
-    layout: Arc<Layout>,
+    layout: Layout,
 }
 
 impl fmt::Debug for Table {
@@ -392,57 +392,20 @@ impl Encoder {
         Ok(&self.out)
     }
 
-    fn chance(&mut self) -> io::Result<u32> {
-        if let Some(chance) = self.chance {
-            return Ok(chance);
-        }
-        let chance = if self.padding_min == self.padding_max {
-            self.padding_min
-        } else {
-            let span = (self.padding_max - self.padding_min + 1) as usize;
-            self.padding_min + self.rng.int_n(span)? as u32
-        };
-        self.chance = Some(chance);
-        Ok(chance)
-    }
-
-    fn should_pad(&mut self) -> io::Result<bool> {
-        let chance = self.chance()?;
-        if chance == 0 {
-            return Ok(false);
-        }
-        if chance >= 100 {
-            return Ok(true);
-        }
-        Ok((self.rng.int_n(100)? as u32) < chance)
-    }
-
-    fn layout_at(&self, index: usize) -> Arc<Layout> {
-        Arc::clone(&self.tables[index % self.tables.len()].layout)
-    }
-
-    fn push_pure_pad(&mut self, out: &mut Vec<u8>, layout: &Layout) -> io::Result<()> {
-        let byte = layout.pure_padding(&mut self.rng)?;
-        out.push(byte);
-        Ok(())
-    }
-
-    fn push_packed_pad(&mut self, out: &mut Vec<u8>, layout: &Layout) -> io::Result<()> {
-        let byte = layout.packed_padding(&mut self.rng)?;
-        out.push(byte);
-        Ok(())
-    }
-
     fn encode_pure(&mut self, p: &[u8]) -> io::Result<()> {
         self.out
             .reserve(p.len().saturating_mul(10).saturating_add(8));
         let mut out = mem::take(&mut self.out);
+        let tables = &self.tables;
+        let len = tables.len();
+        let (padding_min, padding_max) = (self.padding_min, self.padding_max);
+        let rng = &mut self.rng;
+        let chance = &mut self.chance;
         for &byte in p {
-            let layout = self.layout_at(self.table_index);
-            if self.should_pad()? {
-                self.push_pure_pad(&mut out, &layout)?;
+            let table = &tables[self.table_index];
+            if should_pad(rng, chance, padding_min, padding_max)? {
+                push_pure_pad(rng, &mut out, &table.layout)?;
             }
-            let table = &self.tables[self.table_index % self.tables.len()];
             let choices = table
                 .encode
                 .get(byte as usize)
@@ -454,19 +417,19 @@ impl Encoder {
                     "sudoku table missing an entry",
                 ));
             };
-            let hints = choices[self.rng.int_n(choices.len())?];
-            let perm = PERM4[self.rng.int_n(PERM4.len())?];
+            let hints = choices[rng.int_n(choices.len())?];
+            let perm = PERM4[rng.int_n(PERM4.len())?];
             for index in perm {
-                if self.should_pad()? {
-                    self.push_pure_pad(&mut out, &layout)?;
+                if should_pad(rng, chance, padding_min, padding_max)? {
+                    push_pure_pad(rng, &mut out, &table.layout)?;
                 }
                 out.push(hints[index as usize]);
             }
-            self.table_index += 1;
+            self.table_index = next_slot(self.table_index, len);
         }
-        let layout = self.layout_at(self.table_index);
-        if self.should_pad()? {
-            self.push_pure_pad(&mut out, &layout)?;
+        let table = &tables[self.table_index];
+        if should_pad(rng, chance, padding_min, padding_max)? {
+            push_pure_pad(rng, &mut out, &table.layout)?;
         }
         self.out = out;
         Ok(())
@@ -476,6 +439,11 @@ impl Encoder {
         self.out
             .reserve(p.len().saturating_mul(3).saturating_add(8));
         let mut out = mem::take(&mut self.out);
+        let tables = &self.tables;
+        let len = tables.len();
+        let (padding_min, padding_max) = (self.padding_min, self.padding_max);
+        let rng = &mut self.rng;
+        let chance = &mut self.chance;
         let mut bit_buf = 0u64;
         let mut bit_count = 0u32;
         for &byte in p {
@@ -483,12 +451,12 @@ impl Encoder {
             bit_count += 8;
             while bit_count >= 6 {
                 bit_count -= 6;
-                let layout = self.layout_at(self.group_index);
-                if self.should_pad()? {
-                    self.push_packed_pad(&mut out, &layout)?;
+                let layout = &tables[self.group_index].layout;
+                if should_pad(rng, chance, padding_min, padding_max)? {
+                    push_packed_pad(rng, &mut out, layout)?;
                 }
                 out.push(layout.encode_group((bit_buf >> bit_count) as u8 & 0x3f));
-                self.group_index += 1;
+                self.group_index = next_slot(self.group_index, len);
                 bit_buf = if bit_count > 0 {
                     bit_buf & ((1u64 << bit_count) - 1)
                 } else {
@@ -497,19 +465,19 @@ impl Encoder {
             }
         }
         if bit_count > 0 {
-            let layout = self.layout_at(self.group_index);
-            if self.should_pad()? {
-                self.push_packed_pad(&mut out, &layout)?;
+            let layout = &tables[self.group_index].layout;
+            if should_pad(rng, chance, padding_min, padding_max)? {
+                push_packed_pad(rng, &mut out, layout)?;
             }
             let group = ((bit_buf << (6 - bit_count)) & 0x3f) as u8;
             out.push(layout.encode_group(group));
-            self.group_index += 1;
-            let next = self.layout_at(self.group_index);
+            self.group_index = next_slot(self.group_index, len);
+            let next = &tables[self.group_index].layout;
             out.push(next.pad_marker);
         }
-        let layout = self.layout_at(self.group_index);
-        if self.should_pad()? {
-            self.push_packed_pad(&mut out, &layout)?;
+        let layout = &tables[self.group_index].layout;
+        if should_pad(rng, chance, padding_min, padding_max)? {
+            push_packed_pad(rng, &mut out, layout)?;
         }
         self.out = out;
         Ok(())
@@ -524,7 +492,6 @@ enum ReaderKind {
 
 struct Reader {
     tables: Arc<[Table]>,
-    layouts: Vec<Arc<Layout>>,
     kind: ReaderKind,
     table_index: usize,
     hint: [u8; 4],
@@ -539,13 +506,8 @@ struct Reader {
 
 impl Reader {
     fn new(tables: Arc<[Table]>, kind: ReaderKind) -> Self {
-        let layouts = tables
-            .iter()
-            .map(|table| Arc::clone(&table.layout))
-            .collect();
         Self {
             tables,
-            layouts,
             kind,
             table_index: 0,
             hint: [0; 4],
@@ -631,7 +593,7 @@ impl Reader {
 
     fn decode_pure(&mut self, chunk: &[u8]) -> io::Result<()> {
         for &byte in chunk {
-            let table = &self.tables[self.table_index % self.tables.len()];
+            let table = &self.tables[self.table_index];
             if !table.layout.is_hint(byte) {
                 continue;
             }
@@ -649,14 +611,14 @@ impl Reader {
             };
             self.pending.push(plain);
             self.hint_len = 0;
-            self.table_index += 1;
+            self.table_index = next_slot(self.table_index, self.tables.len());
         }
         Ok(())
     }
 
     fn decode_packed(&mut self, chunk: &[u8]) -> io::Result<()> {
         for &byte in chunk {
-            let layout = &self.layouts[self.group_index % self.layouts.len()];
+            let layout = &self.tables[self.group_index].layout;
             if !layout.is_hint(byte) {
                 if byte == layout.pad_marker {
                     self.bit_buf = 0;
@@ -670,7 +632,7 @@ impl Reader {
                     "invalid packed sudoku byte",
                 ));
             };
-            self.group_index += 1;
+            self.group_index = next_slot(self.group_index, self.tables.len());
             self.bit_buf = (self.bit_buf << 6) | u64::from(group);
             self.bit_count += 6;
             while self.bit_count >= 8 {
@@ -736,7 +698,7 @@ impl Sudoku {
                 Mode::Entropy if pattern.is_empty() => Layout::entropy(),
                 Mode::Custom | Mode::Entropy => Layout::custom(pattern)?,
             };
-            tables.push(build_table(password, Arc::new(layout))?);
+            tables.push(build_table(password, layout)?);
         }
         if tables.is_empty() {
             return None;
@@ -828,6 +790,53 @@ impl Sudoku {
     }
 }
 
+#[inline]
+fn next_slot(slot: usize, len: usize) -> usize {
+    debug_assert!(slot < len);
+    if slot + 1 == len {
+        0
+    } else {
+        slot + 1
+    }
+}
+
+fn should_pad(
+    rng: &mut SudokuRng,
+    chance: &mut Option<u32>,
+    padding_min: u32,
+    padding_max: u32,
+) -> io::Result<bool> {
+    let drawn = if let Some(drawn) = *chance {
+        drawn
+    } else {
+        let drawn = if padding_min == padding_max {
+            padding_min
+        } else {
+            let span = (padding_max - padding_min + 1) as usize;
+            padding_min + rng.int_n(span)? as u32
+        };
+        *chance = Some(drawn);
+        drawn
+    };
+    if drawn == 0 {
+        return Ok(false);
+    }
+    if drawn >= 100 {
+        return Ok(true);
+    }
+    Ok((rng.int_n(100)? as u32) < drawn)
+}
+
+fn push_pure_pad(rng: &mut SudokuRng, out: &mut Vec<u8>, layout: &Layout) -> io::Result<()> {
+    out.push(layout.pure_padding(rng)?);
+    Ok(())
+}
+
+fn push_packed_pad(rng: &mut SudokuRng, out: &mut Vec<u8>, layout: &Layout) -> io::Result<()> {
+    out.push(layout.packed_padding(rng)?);
+    Ok(())
+}
+
 fn write_wire<W: Write>(raw: &mut W, mut p: &[u8]) -> io::Result<()> {
     while !p.is_empty() {
         match raw.write(p) {
@@ -897,7 +906,7 @@ fn patterns(mode: Mode, custom_table: &str, custom_tables: &[String]) -> Option<
     Some(patterns)
 }
 
-fn build_table(password: &str, layout: Arc<Layout>) -> Option<Table> {
+fn build_table(password: &str, layout: Layout) -> Option<Table> {
     let patterns = base_patterns();
     if patterns.len() < 256 {
         return None;
@@ -1297,6 +1306,51 @@ mod tests {
             plain.len() * 4 / 3,
             "a packed write is four octets per three plaintext octets"
         );
+    }
+
+    const PROBE_PLAINTEXT: usize = 4096;
+    const PROBE_ROUNDS: usize = 16;
+
+    #[inline(never)]
+    fn encode_probe() -> usize {
+        let config = stage("probe", "", &[]);
+        let mut writer = config.open_write(MaskRole::Client);
+        let plain: Vec<u8> = (0..PROBE_PLAINTEXT).map(|at| at as u8).collect();
+        let mut sink = std::io::sink();
+        let mut total = 0;
+        for _ in 0..PROBE_ROUNDS {
+            total += writer.write(&mut sink, &plain).expect("encodes");
+        }
+        std::hint::black_box(total)
+    }
+
+    #[inline(never)]
+    fn decode_probe() -> usize {
+        let config = stage("probe", "", &[]);
+        let plain: Vec<u8> = (0..PROBE_PLAINTEXT).map(|at| at as u8).collect();
+        let mut wire = Vec::new();
+        let mut writer = config.open_write(MaskRole::Client);
+        for _ in 0..PROBE_ROUNDS {
+            writer.write(&mut wire, &plain).expect("encodes");
+        }
+        let mut reader = config.open_read(MaskRole::Server);
+        let mut input = wire.as_slice();
+        let mut decoded = vec![0u8; PROBE_PLAINTEXT];
+        let mut total = 0;
+        loop {
+            let got = reader.read_from(&mut input, &mut decoded).expect("decodes");
+            if got == 0 {
+                break;
+            }
+            total += got;
+        }
+        std::hint::black_box(total)
+    }
+
+    #[test]
+    fn the_sudoku_wire_costs_the_bytes_and_nothing_else() {
+        assert_eq!(encode_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
+        assert_eq!(decode_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
     }
 
     #[test]

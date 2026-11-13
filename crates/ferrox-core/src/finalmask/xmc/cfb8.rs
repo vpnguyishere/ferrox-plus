@@ -31,13 +31,11 @@ impl Cfb8 {
     }
 
     pub fn apply(&mut self, data: &mut [u8]) {
-        let mut keystream = [0; BLOCK_SIZE];
         for byte in data {
             let mut block = self.iv.into();
             self.cipher.encrypt_block(&mut block);
-            keystream.copy_from_slice(&block);
             let ciphertext = *byte;
-            *byte ^= keystream[0];
+            *byte ^= block[0];
             self.iv.rotate_left(1);
             self.iv[BLOCK_SIZE - 1] = if self.decrypt { ciphertext } else { *byte };
         }

@@ -61,6 +61,7 @@ mod psiphon_h3;
 mod psiphon_light;
 mod psiphon_meek;
 mod psiphon_osl;
+mod psiphon_packet_tunnel;
 mod psiphon_quic;
 mod psiphon_rate;
 mod psiphon_replay;

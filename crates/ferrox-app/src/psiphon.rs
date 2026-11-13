@@ -1402,6 +1402,9 @@ struct Settings {
     disable_tactics: bool,
     meek_headers: Vec<(String, String)>,
     ssh_channel_window: u32,
+    packet_tunnel_fd: Option<i32>,
+    packet_tunnel_dns: crate::psiphon_packet_tunnel::Dns,
+    ssh_packet_tunnel_channel_window: u32,
     server_lists: Vec<String>,
     server_lists_explicit: bool,
     remote_fetch_disabled: bool,
@@ -1625,6 +1628,16 @@ impl PsiphonOut {
             light,
         });
         *lock(&inner.self_ref) = Arc::downgrade(&inner);
+        if let Some(fd) = inner.settings.packet_tunnel_fd {
+            let device = crate::tun::Device::from_inherited(fd, crate::psiphon_packet_tunnel::MTU)
+                .map_err(|error| format!("psiphon: PacketTunnelTunFileDescriptor {fd}: {error}"))?;
+            let weak = Arc::downgrade(&inner);
+            let dns = inner.settings.packet_tunnel_dns;
+            thread::Builder::new()
+                .name("psiphon-packet-tunnel".to_owned())
+                .spawn(move || packet_tunnel_loop(&weak, device, dns))
+                .map_err(|error| format!("psiphon: packet tunnel thread: {error}"))?;
+        }
         // The edge binds before a tunnel exists, so a refusal is retried, never a lane that exits.
         let weak = Arc::downgrade(&inner);
         thread::Builder::new()
@@ -2798,6 +2811,162 @@ fn warm_tunnel(lane: &Weak<Inner>) {
     }
 }
 
+/// One packet tunnel batch: the SSH channel writes in 32 KiB packets, so a
+/// batch that size is one channel write.
+const PACKET_TUNNEL_BATCH: usize = 32 * 1024;
+const PACKET_TUNNEL_POLL_MS: i32 = 100;
+
+/// Keep the tun descriptor across reconnects and swap the SSH channel under it,
+/// as the reference's `PacketTunnelTransport` does.
+fn packet_tunnel_loop(
+    lane: &Weak<Inner>,
+    mut device: crate::tun::Device,
+    dns: crate::psiphon_packet_tunnel::Dns,
+) {
+    let mut logged: Option<Instant> = None;
+    loop {
+        let Some(inner) = lane.upgrade() else {
+            return;
+        };
+        if inner.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let outcome = packet_tunnel_once(&inner, &mut device, dns);
+        drop(inner);
+        if let Err(why) = outcome {
+            let now = Instant::now();
+            if logged.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(10)) {
+                eprintln!("psiphon: packet tunnel: {why}; retrying");
+                logged = Some(now);
+            }
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn packet_tunnel_once(
+    inner: &Inner,
+    device: &mut crate::tun::Device,
+    dns: crate::psiphon_packet_tunnel::Dns,
+) -> Result<(), String> {
+    let session = inner.ensure()?;
+    let channel = session.open_packet_tunnel()?;
+    let writer = device
+        .clone_writer()
+        .map_err(|error| format!("tun descriptor clone: {error}"))?;
+    let failed = AtomicBool::new(false);
+    let stop = AtomicBool::new(false);
+    let mut upstream = channel.clone();
+    let mut downstream = channel.clone();
+    let close = channel;
+    thread::scope(|scope| {
+        let failed_reader = &failed;
+        let stop_reader = &stop;
+        let handle = scope.spawn(move || {
+            packet_tunnel_downstream(&mut downstream, writer, dns, failed_reader, stop_reader)
+        });
+        let outcome = packet_tunnel_upstream(device, &mut upstream, dns, &failed);
+        stop.store(true, Ordering::Release);
+        close.close();
+        let read = handle
+            .join()
+            .map_err(|_| "packet tunnel reader panicked".to_owned())?;
+        outcome?;
+        read?;
+        Ok(())
+    })
+}
+
+fn packet_tunnel_upstream(
+    device: &mut crate::tun::Device,
+    channel: &mut crate::psiphon_ssh::Channel,
+    dns: crate::psiphon_packet_tunnel::Dns,
+    failed: &AtomicBool,
+) -> Result<(), String> {
+    let fd = device.raw_fd();
+    let mut packet = vec![0u8; crate::psiphon_packet_tunnel::MTU + 4];
+    let mut batch = Vec::with_capacity(PACKET_TUNNEL_BATCH + crate::psiphon_packet_tunnel::MTU + 2);
+    loop {
+        if failed.load(Ordering::Acquire) {
+            return Err("packet tunnel reader stopped".to_owned());
+        }
+        let ready = crate::psiphon_packet_tunnel::wait_readable(fd, PACKET_TUNNEL_POLL_MS)
+            .map_err(|error| format!("tun poll: {error}"))?;
+        if !ready {
+            continue;
+        }
+        match device.read_packet(&mut packet) {
+            Ok(0) => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Ok(read) => {
+                let packet = &mut packet[..read];
+                if crate::psiphon_packet_tunnel::upstream(packet, &dns) {
+                    crate::psiphon_packet_tunnel::append_frame(&mut batch, packet)
+                        .map_err(|()| "packet does not fit a frame".to_owned())?;
+                }
+            }
+            Err(error) => return Err(format!("tun read: {error}")),
+        }
+        while batch.len() < PACKET_TUNNEL_BATCH {
+            let ready = crate::psiphon_packet_tunnel::wait_readable(fd, 0)
+                .map_err(|error| format!("tun poll: {error}"))?;
+            if !ready {
+                break;
+            }
+            let read = match device.read_packet(&mut packet) {
+                Ok(0) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Ok(read) => read,
+                Err(error) => return Err(format!("tun read: {error}")),
+            };
+            let packet = &mut packet[..read];
+            if crate::psiphon_packet_tunnel::upstream(packet, &dns) {
+                crate::psiphon_packet_tunnel::append_frame(&mut batch, packet)
+                    .map_err(|()| "packet does not fit a frame".to_owned())?;
+            }
+        }
+        if !batch.is_empty() {
+            channel
+                .write_all(&batch)
+                .map_err(|error| format!("packet tunnel channel write: {error}"))?;
+            batch.clear();
+        }
+    }
+}
+
+fn packet_tunnel_downstream(
+    channel: &mut crate::psiphon_ssh::Channel,
+    mut writer: crate::tun::PacketWriter,
+    dns: crate::psiphon_packet_tunnel::Dns,
+    failed: &AtomicBool,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let mut packet = Vec::with_capacity(crate::psiphon_packet_tunnel::MTU);
+    loop {
+        let read = match crate::psiphon_packet_tunnel::read_frame(channel, &mut packet) {
+            Ok(read) => read,
+            Err(error) => {
+                if failed.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                failed.store(true, Ordering::Release);
+                return Err(format!("packet tunnel channel read: {error}"));
+            }
+        };
+        if read == 0 {
+            continue;
+        }
+        let packet = &mut packet[..read];
+        if !crate::psiphon_packet_tunnel::downstream(packet, &dns) {
+            continue;
+        }
+        if let Err(error) = writer.write_packet(packet) {
+            failed.store(true, Ordering::Release);
+            return Err(format!("tun write: {error}"));
+        }
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn accept_loop(listener: TcpListener, inner: Weak<Inner>) {
     for stream in listener.incoming() {
@@ -3946,17 +4115,41 @@ impl Settings {
                         .and_then(|value| value.parse::<u16>().ok())
                 })
         };
+        let packet_tunnel_fd = number(settings, "PacketTunnelTunFileDescriptor")
+            .filter(|fd| *fd > 0)
+            .map(|fd| {
+                i32::try_from(fd).map_err(|_| {
+                    format!("psiphon: PacketTunnelTunFileDescriptor {fd} does not fit an int")
+                })
+            })
+            .transpose()?;
+        let packet_tunnel_dns = if packet_tunnel_fd.is_some() {
+            crate::psiphon_packet_tunnel::Dns::parse(
+                text(settings, "PacketTunnelTransparentDNSIPv4Address")
+                    .as_deref()
+                    .unwrap_or(""),
+                text(settings, "PacketTunnelTransparentDNSIPv6Address")
+                    .as_deref()
+                    .unwrap_or(""),
+            )
+            .map_err(|error| format!("psiphon: packet tunnel DNS: {error}"))?
+        } else {
+            crate::psiphon_packet_tunnel::Dns::default()
+        };
         let target =
             text(settings, "TargetServerEntry").or_else(|| env("AETHER_PSIPHON_TARGET_ENTRY"));
+        let configured_pool = number(settings, "TunnelPoolSize")
+            .or_else(|| number(settings, "tunnelPoolSize"))
+            .or_else(|| env("AETHER_PSIPHON_TUNNEL_POOL").and_then(|value| value.parse().ok()))
+            .unwrap_or(1);
+        if packet_tunnel_fd.is_some() && configured_pool != 1 {
+            return Err("psiphon: packet tunnel mode requires TunnelPoolSize to be 1".to_owned());
+        }
         // The reference pins a targeted entry to one tunnel, and so does this lane.
-        let pool = if target.is_some() {
+        let pool = if target.is_some() || packet_tunnel_fd.is_some() {
             1
         } else {
-            number(settings, "TunnelPoolSize")
-                .or_else(|| number(settings, "tunnelPoolSize"))
-                .or_else(|| env("AETHER_PSIPHON_TUNNEL_POOL").and_then(|value| value.parse().ok()))
-                .unwrap_or(1)
-                .clamp(1, 32) as usize
+            configured_pool.clamp(1, 32) as usize
         };
         let disable_timeouts = flag(
             settings,
@@ -4310,6 +4503,11 @@ impl Settings {
                 .map_or(crate::psiphon_ssh::DEFAULT_CHANNEL_WINDOW, |window| {
                     window.clamp(64 * 1024, u64::from(u32::MAX)) as u32
                 }),
+            packet_tunnel_fd,
+            packet_tunnel_dns,
+            ssh_packet_tunnel_channel_window: crate::psiphon_ssh::packet_tunnel_channel_window(
+                number(settings, "SSHPacketTunnelChannelWindowSize"),
+            ),
             server_lists,
             server_lists_explicit,
             remote_fetch_disabled: flag(
@@ -6110,6 +6308,10 @@ const KNOWN_SETTINGS: &[&str] = &[
     "ReplayTargetUpstreamBytes",
     "MeekAdditionalHeaders",
     "SSHChannelWindowSize",
+    "SSHPacketTunnelChannelWindowSize",
+    "PacketTunnelTunFileDescriptor",
+    "PacketTunnelTransparentDNSIPv4Address",
+    "PacketTunnelTransparentDNSIPv6Address",
     "ClientBuildRev",
     "NetworkType",
     "ClientBurstUpstreamTargetBytes",
@@ -6922,6 +7124,7 @@ fn load_tactics_entries(settings: &Settings) -> Result<Vec<Server>, String> {
 fn apply_session_settings(servers: &mut [Server], settings: &Settings) {
     for server in servers {
         server.channel_window = settings.ssh_channel_window;
+        server.packet_tunnel_channel_window = settings.ssh_packet_tunnel_channel_window;
         server.quic_noise.clone_from(&settings.quic_noise);
         for meek in [
             server.meek.as_mut(),
@@ -8773,6 +8976,7 @@ pub(crate) fn server_from_entry_json(
         tls_inproxy,
         inproxy_shadowsocks_key: shadowsocks_key,
         channel_window: crate::psiphon_ssh::DEFAULT_CHANNEL_WINDOW,
+        packet_tunnel_channel_window: crate::psiphon_ssh::packet_tunnel_channel_window(None),
     })
 }
 
@@ -13881,6 +14085,7 @@ mod tests {
             tls_inproxy: None,
             inproxy_shadowsocks_key: None,
             channel_window: crate::psiphon_ssh::DEFAULT_CHANNEL_WINDOW,
+            packet_tunnel_channel_window: crate::psiphon_ssh::packet_tunnel_channel_window(None),
         }
     }
 
@@ -14352,6 +14557,63 @@ mod tests {
             Settings::from_json(Some(&settings)).expect("settings").pool,
             1
         );
+    }
+
+    #[test]
+    fn a_packet_tunnel_reads_its_descriptor_dns_and_window() {
+        let settings = json::parse(
+            r#"{
+                "PacketTunnelTunFileDescriptor": 7,
+                "PacketTunnelTransparentDNSIPv4Address": "192.168.0.1",
+                "PacketTunnelTransparentDNSIPv6Address": "fd00::1",
+                "SSHPacketTunnelChannelWindowSize": 8
+            }"#,
+        )
+        .expect("settings");
+        let settings = Settings::from_json(Some(&settings)).expect("settings");
+        assert_eq!(settings.packet_tunnel_fd, Some(7));
+        assert_eq!(settings.pool, 1);
+        assert_eq!(
+            settings.packet_tunnel_dns.addresses(),
+            (
+                Some([192, 168, 0, 1]),
+                Some([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+            )
+        );
+        assert_eq!(
+            settings.ssh_packet_tunnel_channel_window,
+            8 * crate::psiphon_ssh::CHANNEL_PACKET
+        );
+    }
+
+    #[test]
+    fn a_packet_tunnel_defaults_an_out_of_range_window() {
+        for window in [0, 129] {
+            let settings = json::parse(&format!(
+                r#"{{"PacketTunnelTunFileDescriptor":7,"SSHPacketTunnelChannelWindowSize":{window}}}"#
+            ))
+            .expect("settings");
+            assert_eq!(
+                Settings::from_json(Some(&settings))
+                    .expect("settings")
+                    .ssh_packet_tunnel_channel_window,
+                16 * crate::psiphon_ssh::CHANNEL_PACKET
+            );
+        }
+    }
+
+    #[test]
+    fn a_packet_tunnel_refuses_a_non_single_pool() {
+        let settings = json::parse(r#"{"PacketTunnelTunFileDescriptor":7,"TunnelPoolSize":2}"#)
+            .expect("settings");
+        assert!(Settings::from_json(Some(&settings)).is_err());
+    }
+
+    #[test]
+    fn a_non_positive_packet_tunnel_descriptor_is_absent() {
+        let settings = json::parse(r#"{"PacketTunnelTunFileDescriptor":0}"#).expect("settings");
+        let settings = Settings::from_json(Some(&settings)).expect("settings");
+        assert_eq!(settings.packet_tunnel_fd, None);
     }
 
     #[test]
@@ -15320,6 +15582,9 @@ mod tests {
                 tls_inproxy: None,
                 inproxy_shadowsocks_key: None,
                 channel_window: crate::psiphon_ssh::DEFAULT_CHANNEL_WINDOW,
+                packet_tunnel_channel_window: crate::psiphon_ssh::packet_tunnel_channel_window(
+                    None,
+                ),
             })
             .collect();
         let began = Instant::now();
@@ -15381,6 +15646,9 @@ mod tests {
                 tls_inproxy: None,
                 inproxy_shadowsocks_key: None,
                 channel_window: crate::psiphon_ssh::DEFAULT_CHANNEL_WINDOW,
+                packet_tunnel_channel_window: crate::psiphon_ssh::packet_tunnel_channel_window(
+                    None,
+                ),
             })
             .collect();
         let began = Instant::now();

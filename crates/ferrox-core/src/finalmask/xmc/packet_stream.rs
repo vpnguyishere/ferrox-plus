@@ -1,8 +1,8 @@
 #[cfg(test)]
 use super::protocol::write_long;
 use super::protocol::{
-    decode_packet_body, read_long, read_string, read_varint_with_length, write_packet,
-    write_string, Packet, MAX_PACKET_BODY_LENGTH,
+    decode_packet_body, read_long, read_varint_with_length, write_packet, write_string, Packet,
+    MAX_PACKET_BODY_LENGTH, MAX_STRING_LENGTH,
 };
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -32,6 +32,7 @@ struct ReadState<R> {
     reader: R,
     buffer: Vec<u8>,
     pending: Vec<u8>,
+    chunk: [u8; 8192],
 }
 
 impl<R: Read> ReadState<R> {
@@ -41,15 +42,14 @@ impl<R: Read> ReadState<R> {
                 self.buffer.drain(..length);
                 return Ok(packet);
             }
-            let mut chunk = [0u8; 8192];
-            match self.reader.read(&mut chunk) {
+            match self.reader.read(&mut self.chunk) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "minecraft packet stream closed",
                     ))
                 }
-                Ok(read) => self.buffer.extend_from_slice(&chunk[..read]),
+                Ok(read) => self.buffer.extend_from_slice(&self.chunk[..read]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
@@ -95,6 +95,7 @@ where
                 reader,
                 buffer: Vec::new(),
                 pending: Vec::new(),
+                chunk: [0; 8192],
             }),
             writer,
             is_client,
@@ -272,15 +273,36 @@ impl<R, W> std::fmt::Debug for PacketStream<R, W> {
     }
 }
 
-fn parse_custom_payload(packet: &Packet) -> io::Result<Option<Vec<u8>>> {
+fn parse_custom_payload(packet: &Packet) -> io::Result<Option<&[u8]>> {
     let mut data = packet.data.as_slice();
-    let channel = read_string(&mut data).map_err(|error| {
+    let channel = read_channel(&mut data).map_err(|error| {
         io::Error::other(format!("read minecraft custom payload channel: {error}"))
     })?;
     if channel != CHANNEL {
         return Ok(None);
     }
-    Ok(Some(data.to_vec()))
+    Ok(Some(data))
+}
+
+fn read_channel<'a>(data: &mut &'a [u8]) -> io::Result<&'a str> {
+    let (length, _) = read_varint_with_length(data)?;
+    if !(0..=MAX_STRING_LENGTH).contains(&length) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("read string: bad length: {length}"),
+        ));
+    }
+    let length = length as usize;
+    if length > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        ));
+    }
+    let (channel, rest) = data.split_at(length);
+    *data = rest;
+    std::str::from_utf8(channel)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "read string: invalid utf-8"))
 }
 
 fn spawn_keepalive<W: Write + Send + 'static>(
@@ -402,17 +424,74 @@ mod tests {
             let mut body_reader = body;
             let _ = read_varint_with_length(&mut body_reader).expect("id");
             let _ = prefix;
-            let payload = parse_custom_payload(&Packet {
+            let packet = Packet {
                 id: body[0] as i32,
                 data: body[1..].to_vec(),
-            })
-            .expect("payload")
-            .expect("channel");
-            recovered.extend_from_slice(&payload);
+            };
+            let payload = parse_custom_payload(&packet)
+                .expect("payload")
+                .expect("channel");
+            recovered.extend_from_slice(payload);
             frames += 1;
         }
         assert_eq!(frames, 3);
         assert_eq!(recovered, payload);
+    }
+
+    #[test]
+    fn a_custom_payload_is_a_slice_of_its_frame() {
+        let mut data = Vec::new();
+        write_string(&mut data, CHANNEL).expect("channel");
+        data.extend_from_slice(b"hello");
+        let packet = Packet {
+            id: CLIENTBOUND_CUSTOM_PAYLOAD,
+            data,
+        };
+        let (payload, counts) = crate::alloc_count::measure(|| {
+            parse_custom_payload(&packet)
+                .expect("payload")
+                .expect("channel")
+        });
+        assert_eq!(payload, b"hello");
+        assert_eq!(
+            payload.as_ptr(),
+            packet.data[packet.data.len() - payload.len()..].as_ptr(),
+            "the payload is the frame's own bytes"
+        );
+        assert_eq!(counts.allocs, 0, "reading the channel takes no heap");
+    }
+
+    #[test]
+    fn a_custom_payload_channel_keeps_the_string_rules() {
+        let invalid_utf8 = Packet {
+            id: CLIENTBOUND_CUSTOM_PAYLOAD,
+            data: vec![1, 0xff],
+        };
+        let error = parse_custom_payload(&invalid_utf8).expect_err("invalid utf-8");
+        assert!(error.to_string().contains("read string: invalid utf-8"));
+
+        let too_long = Packet {
+            id: CLIENTBOUND_CUSTOM_PAYLOAD,
+            data: vec![0x81, 0x20],
+        };
+        let error = parse_custom_payload(&too_long).expect_err("length over the string cap");
+        assert!(error.to_string().contains("read string: bad length: 4097"));
+
+        let truncated = Packet {
+            id: CLIENTBOUND_CUSTOM_PAYLOAD,
+            data: vec![8, b'x'],
+        };
+        let error = parse_custom_payload(&truncated).expect_err("short channel");
+        assert!(error.to_string().contains("failed to fill whole buffer"));
+
+        let overlong = Packet {
+            id: CLIENTBOUND_CUSTOM_PAYLOAD,
+            data: vec![0x88, 0x00],
+        };
+        assert!(
+            parse_custom_payload(&overlong).is_err(),
+            "a non-canonical length is still refused"
+        );
     }
 
     #[test]

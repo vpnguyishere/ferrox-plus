@@ -189,6 +189,11 @@ finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configure
 finalmask  finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies  ferrox_core::finalmask::write_record
 finalmask  finalmask::tests::the_last_configured_width_governs_every_later_segment  ferrox_core::finalmask::Fragment::write_pieces
 finalmask  finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather  ferrox_core::finalmask::tests::merged_hello_probe
+# The pure sudoku slot walk over the same 64 KiB in each direction: one ops job
+# reports both frames, and a slot walk that divides or counts references shows up
+# in the encoder/decoder probes rather than in the test that drives them.
+finalmask  finalmask::sudoku::tests::the_sudoku_wire_costs_the_bytes_and_nothing_else  ferrox_core::finalmask::sudoku::tests::encode_probe
+finalmask  finalmask::sudoku::tests::the_sudoku_wire_costs_the_bytes_and_nothing_else  ferrox_core::finalmask::sudoku::tests::decode_probe
 reverse  proxy::reverse_tests::a_sixteen_kib_downlink_is_echoed_whole  reverse::Session::read_loop
 http-proxy  proxy::tests::the_connect_request_builds_in_one_buffer  proxy::http_connect_request
 http-proxy  proxy::tests::http_request_parses_connect_and_both_get_forms  proxy::http_proxy_request

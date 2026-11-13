@@ -25,7 +25,15 @@ pub(crate) const MIN_PADDING: usize = 32;
 pub(crate) const MAX_PADDING: usize = 8192;
 const MAX_PACKET: usize = 256 * 1024;
 pub(crate) const DEFAULT_CHANNEL_WINDOW: u32 = 2 * 1024 * 1024;
-const CHANNEL_PACKET: u32 = 32 * 1024;
+pub(crate) const CHANNEL_PACKET: u32 = 32 * 1024;
+/// The reference's packet tunnel window is counted in 32 KiB packets; 0, or a
+/// value outside 1..=128, uses its default of 16.
+pub(crate) fn packet_tunnel_channel_window(count: Option<u64>) -> u32 {
+    let count = count
+        .filter(|count| (1..=128).contains(count))
+        .unwrap_or(16);
+    count as u32 * CHANNEL_PACKET
+}
 /// Channel ids are 0-based, so 0 is a server's first channel; this is the only value
 /// that never names one.
 const NO_CHANNEL: u32 = u32::MAX;
@@ -321,6 +329,7 @@ pub(crate) struct Server {
     pub(crate) tls_inproxy: Option<crate::psiphon_broker::Destination>,
     pub(crate) inproxy_shadowsocks_key: Option<String>,
     pub(crate) channel_window: u32,
+    pub(crate) packet_tunnel_channel_window: u32,
 }
 
 impl Server {
@@ -1513,6 +1522,7 @@ static NEXT_SESSION_ID: AtomicUsize = AtomicUsize::new(1);
 pub(crate) struct Session {
     inner: Arc<Inner>,
     id: usize,
+    packet_tunnel_channel_window: u32,
 }
 
 type ApiReply = mpsc::Sender<Result<Vec<u8>, String>>;
@@ -1830,6 +1840,7 @@ impl Session {
         Ok(Self {
             inner,
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            packet_tunnel_channel_window: server.packet_tunnel_channel_window,
         })
     }
 
@@ -1852,6 +1863,17 @@ impl Session {
     /// Open one `direct-tcpip` channel, or report that split tunnel sends it direct.
     pub(crate) fn open_split(&self, host: &str, port: u16) -> Result<Option<Channel>, String> {
         self.open_named(host, port, b"direct-tcpip")
+    }
+
+    /// Open the single packet tunnel channel, with its own wider window.
+    pub(crate) fn open_packet_tunnel(&self) -> Result<Channel, String> {
+        self.open_payload_with_window(
+            crate::psiphon_packet_tunnel::CHANNEL,
+            &[],
+            "packet tunnel",
+            self.packet_tunnel_channel_window,
+        )?
+        .ok_or_else(|| "psiphon ssh refused the packet tunnel channel".to_owned())
     }
 
     fn open_named(
@@ -1984,6 +2006,16 @@ impl Session {
         extra: &[u8],
         target: &str,
     ) -> Result<Option<Channel>, String> {
+        self.open_payload_with_window(channel_type, extra, target, self.inner.channel_window)
+    }
+
+    fn open_payload_with_window(
+        &self,
+        channel_type: &[u8],
+        extra: &[u8],
+        target: &str,
+        channel_window: u32,
+    ) -> Result<Option<Channel>, String> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err("psiphon ssh is closed".to_owned());
         }
@@ -1998,7 +2030,7 @@ impl Session {
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
-                local_window: u64::from(self.inner.channel_window),
+                local_window: u64::from(channel_window),
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -2012,7 +2044,7 @@ impl Session {
         let mut payload = vec![MSG_CHANNEL_OPEN];
         put_str(&mut payload, channel_type);
         put_u32(&mut payload, local);
-        put_u32(&mut payload, self.inner.channel_window);
+        put_u32(&mut payload, channel_window);
         put_u32(&mut payload, CHANNEL_PACKET);
         payload.extend_from_slice(extra);
         if let Err(why) = self.inner.send(&payload) {
@@ -5131,6 +5163,19 @@ mod tests {
     #[test]
     fn a_channel_write_respects_the_remote_packet() {
         assert_eq!(u64::from(CHANNEL_PACKET), 32 * 1024);
+    }
+
+    #[test]
+    fn a_packet_tunnel_window_uses_its_own_default_and_range() {
+        for count in [None, Some(0), Some(129)] {
+            assert_eq!(packet_tunnel_channel_window(count), 16 * CHANNEL_PACKET);
+        }
+        for count in [1, 128] {
+            assert_eq!(
+                packet_tunnel_channel_window(Some(count)),
+                count as u32 * CHANNEL_PACKET
+            );
+        }
     }
 
     #[test]

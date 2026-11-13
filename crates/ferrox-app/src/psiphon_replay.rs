@@ -433,6 +433,7 @@ mod tests {
             tls_inproxy: None,
             inproxy_shadowsocks_key: None,
             channel_window: 2 * 1024 * 1024,
+            packet_tunnel_channel_window: crate::psiphon_ssh::packet_tunnel_channel_window(None),
         }
     }
 

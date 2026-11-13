@@ -783,6 +783,7 @@ finalmask xmc-time UNBLESSED bench.yml
 finalmask xmc-paired-session-directions 2 ferrox-app-proxy::tests::a_configured_xmc_stage_carries_both_directions
 finalmask xmc-unknown-profile-disconnects 1 ferrox-core-finalmask-xmc::tests::an_unknown_profile_is_disconnected
 finalmask xmc-keepalives-echoed-by-client 1 ferrox-core-finalmask-xmc::tests::a_client_echoes_keepalives_and_skips_other_payloads
+finalmask xmc-payload-copies-in-the-parse 0 ferrox-core-finalmask-xmc::packet_stream::tests::a_custom_payload_is_a_slice_of_its_frame
 finalmask header-custom-handshake-time UNBLESSED not measured
 finalmask unarmable-masks-dialled-unmasked 0 ferrox-app-proxy::tests::a_tcp_mask_this_tree_cannot_arm_is_refused
 finalmask splices-past-a-masked-writer 0 ferrox-app-proxy::tests::a_masked_destination_is_not_fed_by_splice
