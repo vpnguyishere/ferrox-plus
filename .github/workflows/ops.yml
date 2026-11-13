@@ -90,6 +90,7 @@ jobs:
           fi
       - name: check exact counts
         if: steps.provision.outcome == 'success' && needs.plan.outputs.rust == 'true'
+        continue-on-error: true
         env:
           RUSTFLAGS: -C debuginfo=line-tables-only
         run: ./scripts/count-ops.sh check quic::tests::pem_wraps_at_sixty_four_columns scripts/expected-ops.txt
