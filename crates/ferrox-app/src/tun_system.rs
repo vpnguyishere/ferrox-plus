@@ -532,6 +532,7 @@ pub(crate) fn serve(
             stack_outgoing,
             stack_out,
             Some(stack_recycle),
+            0,
             wake_read,
             stack_failed,
         );
@@ -565,7 +566,7 @@ pub(crate) fn serve(
     });
 
     let mtu = spec.mtu();
-    thread::spawn(move || tun_stack::recv_loop(device, packets, reused, mtu, wake_write));
+    thread::spawn(move || tun_stack::recv_loop(device, packets, reused, mtu, 0, wake_write));
     Ok(())
 }
 

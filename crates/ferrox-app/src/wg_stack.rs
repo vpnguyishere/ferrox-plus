@@ -1316,17 +1316,18 @@ pub(crate) fn server(
 
 /// Run the server stack over a TUN until its reader is dropped.
 #[cfg(unix)]
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub(crate) fn serve_tun_device(
     config: DeviceConfig,
     packets: Receiver<Packet>,
     to_tunnel: SyncSender<Vec<u8>>,
     out: Outbound,
     recycle: Option<SyncSender<Vec<u8>>>,
+    headroom: usize,
     wake: std::os::unix::net::UnixStream,
     failed: Arc<AtomicBool>,
 ) {
-    let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
+    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, headroom);
     stack.device.tun_recycle = recycle;
     let _ = wake.set_nonblocking(true);
     loop {
@@ -1359,16 +1360,17 @@ pub(crate) fn serve_tun_device(
 
 /// Run the server stack over a TUN until its reader is dropped.
 #[cfg(not(unix))]
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub(crate) fn serve_tun_device(
     config: DeviceConfig,
     packets: Receiver<Packet>,
     to_tunnel: SyncSender<Vec<u8>>,
     out: Outbound,
     recycle: Option<SyncSender<Vec<u8>>>,
+    headroom: usize,
     failed: Arc<AtomicBool>,
 ) {
-    let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
+    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, headroom);
     stack.device.tun_recycle = recycle;
     loop {
         if failed.load(Ordering::Relaxed) {
@@ -1766,8 +1768,13 @@ impl ServerStack {
     }
 
     /// Build the same interface over a TUN whose packets already carry their IP header.
-    fn new_tun(config: &DeviceConfig, to_tunnel: impl Into<ToTunnel>, out: Outbound) -> Self {
-        Self::with_mtu(config, to_tunnel, out, 0, config.mtu, config.mtu)
+    fn new_tun(
+        config: &DeviceConfig,
+        to_tunnel: impl Into<ToTunnel>,
+        out: Outbound,
+        headroom: usize,
+    ) -> Self {
+        Self::with_mtu(config, to_tunnel, out, headroom, config.mtu, config.mtu)
     }
 
     fn with_mtu(
