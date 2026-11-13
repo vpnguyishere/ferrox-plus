@@ -140,9 +140,10 @@ carrier-xhttp  xhttp_h2::tests::a_credit_grants_both_windows_in_one_write  xhttp
 carrier-xhttp  xhttp_h2::tests::a_data_window_leaves_as_one_write  xhttp_h2::H2Conn::send_data
 carrier-xhttp  xhttp::tests::a_body_window_is_the_readers_own_buffer  xhttp::Reader<core::io::cursor::Cursor<alloc::vec::Vec<u8>>>
 carrier-xhttp  xhttp::tests::the_chunk_line_costs_one_walk  xhttp::tests::xhttp_line_probe
-mux-cool  mux::tests::a_new_frame_is_the_bytes_the_fields_add_up_to  ferrox_core::mux::Frame::encode
+mux-cool  mux::tests::the_frame_probe_costs_the_metadata_and_payload_write_and_nothing_else  ferrox_core::mux::Outgoing::encode_into
 mux-cool  proxy::tests::a_read_into_the_tail_appends_exactly_what_the_stream_held  ferrox_app::proxy::read_into_tail
 mux-cool  mux::tests::the_decode_probe_costs_the_frame_walk_and_nothing_else  ferrox_core::mux::decode
+mux-cool  mux::tests::the_header_probe_costs_the_metadata_write_and_nothing_else  ferrox_core::mux::Outgoing::encode_header_into
 kcp  kcp::oracle::the_scripted_core_matches_the_pinned_go  ferrox_core::kcp::Segment::serialize
 kcp  kcp::connection::tests::every_read_size_delivers_the_same_stream  ferrox_core::kcp::worker::ReceivingWorker::read
 kcp  kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next  ferrox_core::kcp::Connection::input

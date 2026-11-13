@@ -875,6 +875,40 @@ mod tests {
         assert_eq!(sink, 4096 * (NEW_DOMAIN.len() + 4 + 1), "the loop ran");
     }
 
+    /// `encode_into` driven over one fixed frame, again and again, so a callgrind
+    /// frame prices the metadata and payload write and nothing else.
+    #[test]
+    fn the_frame_probe_costs_the_metadata_and_payload_write_and_nothing_else() {
+        let out = Outgoing {
+            id: 1,
+            status: Status::New,
+            options: DATA,
+            target: Some(Target::of(Network::Tcp, "example.com", 80)),
+            global_id: None,
+        };
+        let mut buf = [0u8; 64];
+        let mut sink = 0usize;
+        for _ in 0..4096 {
+            sink += out.encode_into(Some(b"abcd"), &mut buf);
+        }
+        assert_eq!(sink, 4096 * NEW_DOMAIN.len(), "the loop ran");
+    }
+
+    /// `encode_header_into` driven over one fixed Keep, again and again, so a
+    /// callgrind frame prices the header write and nothing else.
+    #[test]
+    fn the_header_probe_costs_the_metadata_write_and_nothing_else() {
+        let out = Outgoing::bare(1, Status::Keep, DATA);
+        let mut header = Vec::with_capacity(8);
+        let mut sink = 0usize;
+        for _ in 0..4096 {
+            let at = out.encode_header_into(&mut header);
+            out.patch_payload_len(&mut header, at, CHUNK_MAX);
+            sink += header.len();
+        }
+        assert_eq!(sink, 4096 * 8, "the loop ran");
+    }
+
     #[test]
     fn the_ipv4_and_ipv6_families_sit_where_the_field_says() {
         let v4 = Outgoing {
