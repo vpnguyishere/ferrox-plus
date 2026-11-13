@@ -149,13 +149,14 @@ services() {
 }
 
 start_ferrox() {
+    mode=$1
     [ -n "$FERROX" ] || return 1
-    printf '%s\n' "{\"inbounds\":[{\"tag\":\"tun\",\"protocol\":\"tun\",\"settings\":{\"name\":\"fx0\",\"mtu\":$MTU,\"stack\":\"smoltcp\",\"address\":\"$TUN_ADDR\",\"prefix\":$TUN_PREFIX,\"queues\":$QUEUES}}],\"outbounds\":[{\"tag\":\"proxy\",\"protocol\":\"socks\",\"settings\":{\"servers\":[{\"address\":\"$VETH_SERVER\",\"port\":$SOCKS_PORT}]}}]}" \
-        > "$OUT_DIR/ferrox.json"
-    "$FERROX" run -c "$OUT_DIR/ferrox.json" > "$OUT_DIR/ferrox.log" 2>&1 &
+    printf '%s\n' "{\"inbounds\":[{\"tag\":\"tun\",\"protocol\":\"tun\",\"settings\":{\"name\":\"fx0\",\"mtu\":$MTU,\"stack\":\"$mode\",\"address\":\"$TUN_ADDR\",\"prefix\":$TUN_PREFIX,\"queues\":$QUEUES}}],\"outbounds\":[{\"tag\":\"proxy\",\"protocol\":\"socks\",\"settings\":{\"servers\":[{\"address\":\"$VETH_SERVER\",\"port\":$SOCKS_PORT}]}}]}" \
+        > "$OUT_DIR/ferrox-$mode.json"
+    "$FERROX" run -c "$OUT_DIR/ferrox-$mode.json" > "$OUT_DIR/ferrox-$mode.log" 2>&1 &
     ENGINE_PIDS=$!
     if ! wait_dev fx0; then
-        note "ferrox did not create fx0"; cat "$OUT_DIR/ferrox.log" >&2; return 1
+        note "ferrox-$mode did not create fx0"; cat "$OUT_DIR/ferrox-$mode.log" >&2; return 1
     fi
     ip addr replace "$TUN_ADDR/$TUN_PREFIX" dev fx0
     ip link set fx0 up
@@ -226,7 +227,10 @@ start_engine() {
     ENGINE_PIDS=""
     remove_routes
     case "$engine" in
-        ferrox) start_ferrox ;;
+        ferrox) start_ferrox smoltcp ;;
+        ferrox-userspace) start_ferrox userspace ;;
+        ferrox-system) start_ferrox system ;;
+        ferrox-hybrid) start_ferrox hybrid ;;
         zeptun-userspace) start_zeptun userspace ;;
         zeptun-hybrid) start_zeptun hybrid ;;
         zeptun-system) start_zeptun system ;;
@@ -410,7 +414,7 @@ while [ "$rep" -le "$REPEAT" ]; do
     for engine in $(order_for_round "$rep"); do
         slot=$((slot + 1))
         case "$engine" in
-            ferrox) [ -n "$FERROX" ] || continue ;;
+            ferrox|ferrox-*) [ -n "$FERROX" ] || continue ;;
             zeptun-*) [ -n "$ZEPTUN" ] || continue ;;
             hev) [ -n "$HEV" ] || continue ;;
             singbox-*) [ -n "$SINGBOX" ] || continue ;;
