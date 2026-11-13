@@ -152,13 +152,14 @@ pub(crate) fn dial() -> Duration {
 }
 
 thread_local! {
-    static HANDSHAKE_CAP: Cell<Option<Duration>> = const { Cell::new(None) };
+    static HANDSHAKE_CAP: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
 }
 
-pub(crate) struct HandshakeCap(Option<Duration>);
+pub(crate) struct HandshakeCap(Option<std::time::Instant>);
 
 pub(crate) fn cap_handshake(remaining: Duration) -> HandshakeCap {
-    let previous = HANDSHAKE_CAP.with(|cell| cell.replace(Some(remaining)));
+    let until = std::time::Instant::now() + remaining;
+    let previous = HANDSHAKE_CAP.with(|cell| cell.replace(Some(until)));
     HandshakeCap(previous)
 }
 
@@ -171,7 +172,14 @@ impl Drop for HandshakeCap {
 
 pub(crate) fn handshake() -> Duration {
     let configured = wait(Named::Handshake);
-    HANDSHAKE_CAP.with(|cell| cell.get().map_or(configured, |cap| configured.min(cap)))
+    handshake_cap().map_or(configured, |cap| configured.min(cap))
+}
+
+pub(crate) fn handshake_cap() -> Option<Duration> {
+    HANDSHAKE_CAP.with(|cell| {
+        cell.get()
+            .map(|until| until.saturating_duration_since(std::time::Instant::now()))
+    })
 }
 
 pub(crate) fn head_arrival() -> Duration {
@@ -341,7 +349,9 @@ mod tests {
     fn a_setup_lane_spends_its_queue_time_from_the_handshake_budget() {
         let full = handshake();
         let cap = cap_handshake(Duration::from_millis(1));
-        assert_eq!(handshake(), Duration::from_millis(1));
+        assert!(handshake() <= Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(handshake(), Duration::ZERO);
         drop(cap);
         assert_eq!(handshake(), full);
     }

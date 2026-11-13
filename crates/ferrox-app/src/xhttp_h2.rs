@@ -485,23 +485,14 @@ impl H2StreamReader {
     }
 }
 
-/// The next body wait: the remaining arrival budget when one is set, bounded by the stall.
-fn body_wait(stall: std::time::Duration) -> std::time::Duration {
+/// The next body wait: the remaining arrival budget when one is set, bounded by the stall, and
+/// whether the budget rather than the stall ended it.
+fn body_wait(stall: std::time::Duration) -> (std::time::Duration, bool) {
     let Some(until) = crate::proxy::body_deadline() else {
-        return stall;
+        return (stall, false);
     };
-    until
-        .saturating_duration_since(std::time::Instant::now())
-        .min(stall)
-}
-
-/// The error a body wait ends with: a poll grain while the arrival budget remains, else the stall's end.
-fn body_wait_timeout() -> std::io::Error {
-    if crate::proxy::body_deadline().is_some_and(|until| std::time::Instant::now() >= until) {
-        std::io::Error::from(std::io::ErrorKind::WouldBlock)
-    } else {
-        std::io::Error::other("h2 body stalled")
-    }
+    let left = until.saturating_duration_since(std::time::Instant::now());
+    (left.min(stall), left <= stall)
 }
 
 impl H2StreamReader {
@@ -627,16 +618,21 @@ impl Read for H2StreamReader {
                 continue;
             }
             // A body read carries its arrival deadline, so a withheld DATA frame ends there instead of at the stall.
+            let (wait_for, deadline_bounded) = body_wait(crate::budgets::relay_stall());
             let (next, wait) = self
                 .stream
                 .cv
-                .wait_timeout(st, body_wait(crate::budgets::relay_stall()))
+                .wait_timeout(st, wait_for)
                 .unwrap_or_else(PoisonError::into_inner);
             st = next;
             if wait.timed_out() {
                 drop(st);
                 self.conn.forget_upload(self.id);
-                return Err(body_wait_timeout());
+                return Err(if deadline_bounded {
+                    std::io::Error::from(std::io::ErrorKind::WouldBlock)
+                } else {
+                    std::io::Error::other("h2 body stalled")
+                });
             }
         }
     }

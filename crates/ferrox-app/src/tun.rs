@@ -7,13 +7,15 @@
 //! inbound produces from a given packet stream must match the pinned reference. Proven by
 //! the loopback test set; the oracle lives in `scripts/tun-oracle`.
 //!
-//! Platform opens: Linux `/dev/net/tun` + `TUNSETIFF`, macOS utun, and an inherited
-//! descriptor (`FERROX_TUN_FD`). The privileged opens are compile-checked only — no CI
-//! runner holds `CAP_NET_ADMIN` — while the inherited-fd path runs fully in tests.
+//! Platform opens: the `tun-rs` builder on Linux and macOS, or an inherited descriptor
+//! (`FERROX_TUN_FD`). The privileged opens are compile-checked only — no CI runner holds
+//! `CAP_NET_ADMIN` — while the inherited-fd path runs fully in tests.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
+};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{mpsc, Arc};
 
@@ -23,24 +25,61 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use crate::budgets;
 use crate::conn::Connection;
 use ferrox_core::foxy::connectip::{
-    icmp_echo_reply, ipv4_checksum, ipv4_head, tcp_checksum, udp_datagram, udp_head, Ipv4Head,
-    UdpDatagram, IPV4_HEADER, PROTOCOL_UDP, UDP_HEADER,
+    checksum, icmp_echo_reply, ipv4_checksum, ipv4_head, ipv6_head, tcp_checksum, udp_datagram,
+    udp_head, UdpDatagram, IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP, UDP_HEADER,
 };
 
 const DEFAULT_MTU: usize = 1500;
+/// The largest IP packet a device can carry.
+const MAX_PACKET: usize = u16::MAX as usize;
 /// The head of a framed datagram: the RSV/FRAG prefix and the widest address (IPv6 plus its port). The payload stays the device's buffer and is handed to the socket by pointer.
 const FRAME_CAP: usize = 3 + 1 + 16 + 2;
 const TCP_PROTO: u8 = 6;
 const ICMP_PROTO: u8 = 1;
-/// An ICMP echo request is type 8; its answer flips that to type 0 and carries the message back.
+const ICMPV6_PROTO: u8 = 58;
+/// An ICMP echo request is type 8 (128 over IPv6); its answer flips that to 0 (129) and carries the message back.
 const ICMP_ECHO_REQUEST: u8 = 8;
+const ICMPV6_ECHO_REQUEST: u8 = 128;
+/// A path-MTU report carries no usable MTU below the version's smallest link, and no TCP segment is worth less than this.
+const IPV4_SMALLEST_MTU: u32 = 576;
+const IPV6_SMALLEST_MTU: u32 = 1280;
+const SMALLEST_MSS: u32 = 48;
 #[cfg(all(test, unix))]
 const ICMP_ECHO_REPLY: u8 = 0;
+#[cfg(test)]
+const ICMPV6_ECHO_REPLY: u8 = 129;
 const FLAG_FIN: u8 = 0x01;
 const FLAG_SYN: u8 = 0x02;
 const FLAG_RST: u8 = 0x04;
 const FLAG_PSH: u8 = 0x08;
 const FLAG_ACK: u8 = 0x10;
+
+const VIRTIO_NET_HDR_LEN: usize = 10;
+const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
+const VIRTIO_NET_HDR_GSO_TCPV6: u8 = 4;
+const UTUN_HEADER_LEN: usize = 4;
+const UTUN_AF_INET: u8 = 2;
+const UTUN_AF_INET6: u8 = 30;
+
+/// How a descriptor frames a packet: raw IP, the macOS utun family word, or the Linux virtio header that carries GSO and checksum offload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // the variants are platform-specific; each build constructs only its own
+enum Framing {
+    Raw,
+    Utun,
+    Virtio,
+}
+
+impl Framing {
+    const fn header_len(self) -> usize {
+        match self {
+            Self::Raw => 0,
+            Self::Utun => UTUN_HEADER_LEN,
+            Self::Virtio => VIRTIO_NET_HDR_LEN,
+        }
+    }
+}
 
 pub(crate) fn is_device(protocol: &str) -> bool {
     matches!(protocol, "tun" | "utun" | "wintun" | "tun2socks")
@@ -233,16 +272,153 @@ fn tcp_head(body: &[u8]) -> Option<(TcpHead, &[u8])> {
     ))
 }
 
-/// Whether an ICMP body is an IPv4 echo request worth answering: type 8, code 0, and at
-/// least the eight-byte header. A reply, another code or a truncated message is refused.
-fn is_echo_request(body: &[u8]) -> bool {
-    body.len() >= 8 && body[0] == ICMP_ECHO_REQUEST && body[1] == 0
+/// Whether an ICMP body is an echo request the handler answers: the version's request type, code 0, and at least the eight-byte header. A reply, another code or a truncated message is refused.
+fn is_echo_request(protocol: u8, body: &[u8]) -> bool {
+    let request = match protocol {
+        ICMP_PROTO => ICMP_ECHO_REQUEST,
+        ICMPV6_PROTO => ICMPV6_ECHO_REQUEST,
+        _ => return false,
+    };
+    body.len() >= 8 && body[0] == request && body[1] == 0
+}
+
+/// One IP packet read in place, whichever version carried it.
+#[derive(Debug, Clone, Copy)]
+struct IpHead {
+    source: IpAddr,
+    destination: IpAddr,
+    protocol: u8,
+}
+
+/// Walk an IPv4 or IPv6 packet, including the IPv6 extension headers this handler can skip, and hand back the transport body borrowed from the read buffer.
+fn ip_head(packet: &[u8]) -> Option<(IpHead, &[u8])> {
+    if let Some((ip, body)) = ipv4_head(packet) {
+        return Some((
+            IpHead {
+                source: IpAddr::V4(Ipv4Addr::from(ip.source)),
+                destination: IpAddr::V4(Ipv4Addr::from(ip.destination)),
+                protocol: ip.protocol,
+            },
+            body,
+        ));
+    }
+    let (ip, body) = ipv6_head(packet)?;
+    let (protocol, body) = walk_extensions(ip.next_header, body)?;
+    Some((
+        IpHead {
+            source: IpAddr::V6(Ipv6Addr::from(ip.source)),
+            destination: IpAddr::V6(Ipv6Addr::from(ip.destination)),
+            protocol,
+        },
+        body,
+    ))
+}
+
+/// Skip the IPv6 extension headers this handler can walk, handing back the transport protocol and its slice.
+fn walk_extensions(mut protocol: u8, mut body: &[u8]) -> Option<(u8, &[u8])> {
+    loop {
+        match protocol {
+            0 | 43 | 60 => {
+                if body.len() < 8 {
+                    return None;
+                }
+                let size = (usize::from(body[1]) + 1) * 8;
+                if size > body.len() {
+                    return None;
+                }
+                protocol = body[0];
+                body = &body[size..];
+            }
+            51 => {
+                if body.len() < 2 {
+                    return None;
+                }
+                let size = (usize::from(body[1]) + 2) * 4;
+                if size < 12 || size > body.len() {
+                    return None;
+                }
+                protocol = body[0];
+                body = &body[size..];
+            }
+            // A fragment is not reassembled here, and an encrypted payload is not this handler's.
+            44 | 50 | 59 => return None,
+            _ => return Some((protocol, body)),
+        }
+    }
+}
+
+/// The flow a quoted packet names, read from the header plus the four port bytes an ICMP error carries. The quote is the packet this handler wrote to the device — remote to client — so its source is the flow's destination and its two ports are reversed. The quoted total length is usually larger than what arrived, so this does not ask the full-packet walk to accept it.
+fn quoted_flow(quoted: &[u8]) -> Option<FlowKey> {
+    let first = *quoted.first()?;
+    let (protocol, remote, transport) = if first >> 4 == 4 {
+        let header = usize::from(first & 0x0f) * 4;
+        if header < IPV4_HEADER || header > quoted.len() {
+            return None;
+        }
+        let remote = *quoted.get(12..16)?.first_chunk::<4>()?;
+        (
+            *quoted.get(9)?,
+            IpAddr::V4(Ipv4Addr::from(remote)),
+            quoted.get(header..)?,
+        )
+    } else if first >> 4 == 6 {
+        if quoted.len() < IPV6_HEADER {
+            return None;
+        }
+        let remote = *quoted.get(8..24)?.first_chunk::<16>()?;
+        let (protocol, transport) = walk_extensions(*quoted.get(6)?, quoted.get(IPV6_HEADER..)?)?;
+        (protocol, IpAddr::V6(Ipv6Addr::from(remote)), transport)
+    } else {
+        return None;
+    };
+    if protocol != TCP_PROTO || transport.len() < 4 {
+        return None;
+    }
+    Some(FlowKey {
+        source_port: u16::from_be_bytes([transport[2], transport[3]]),
+        destination: remote,
+        destination_port: u16::from_be_bytes([transport[0], transport[1]]),
+    })
+}
+
+/// The flow a v4 or v6 ICMP error quotes, when the quoted segment is TCP this handler carried: type 3 over v4, type 1 and packet-too-big type 2 over v6.
+fn icmp_error_flow(protocol: u8, body: &[u8]) -> Option<FlowKey> {
+    let quoted = match (protocol, body.first().copied()) {
+        (ICMP_PROTO, Some(3)) | (ICMPV6_PROTO, Some(1 | 2)) => body.get(8..)?,
+        _ => return None,
+    };
+    quoted_flow(quoted)
+}
+
+/// The path MTU a packet-too-big message reports: v4 fragmentation-needed (type 3 code 4) or v6 type 2, clamped to the smallest link each version allows.
+fn reported_mtu(protocol: u8, body: &[u8]) -> Option<u32> {
+    match (protocol, body.first().copied()) {
+        (ICMP_PROTO, Some(3)) if body.get(1) == Some(&4) => {
+            let mtu = u32::from(u16::from_be_bytes(body.get(6..8)?.try_into().ok()?));
+            Some(mtu.max(IPV4_SMALLEST_MTU))
+        }
+        (ICMPV6_PROTO, Some(2)) => {
+            let mtu = u32::from_be_bytes(body.get(4..8)?.try_into().ok()?);
+            Some(mtu.max(IPV6_SMALLEST_MTU))
+        }
+        _ => None,
+    }
+}
+
+/// The segment size a path MTU leaves after the IP and TCP headers, never below the floor the references believe.
+fn path_mss(mtu: u32, ipv6: bool) -> u32 {
+    let header = if ipv6 {
+        (IPV6_HEADER + 20) as u32
+    } else {
+        (IPV4_HEADER + 20) as u32
+    };
+    mtu.saturating_sub(header).max(SMALLEST_MSS)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FlowKey {
     source_port: u16,
-    destination: [u8; 4],
+    destination: IpAddr,
     destination_port: u16,
 }
 
@@ -250,34 +426,68 @@ struct FlowKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct UdpKey {
     source_port: u16,
-    destination: [u8; 4],
+    destination: IpAddr,
     destination_port: u16,
 }
 
 /// A flow a thread has left: its entry goes at the next packet, so the packet path pays nothing for the reap.
 enum Ended {
-    Stream(FlowKey),
+    Stream(FlowKey, u64),
     Datagram(UdpKey),
 }
 
-/// A TUN device: a file descriptor carrying raw IP packets (`IFF_TUN` | `IFF_NO_PI` on Linux).
+/// A TUN device: a file descriptor carrying IP packets, with the framing its platform puts in front of each one.
 pub(crate) struct Device {
     handle: std::fs::File,
     mtu: usize,
+    framing: Framing,
+    /// The builder enabled `TUN_F_TSO4|TUN_F_TSO6`; an inherited descriptor's `IFF_VNET_HDR` says nothing about that.
+    gso: bool,
 }
 
 impl Device {
     pub(crate) fn open(spec: &Spec) -> io::Result<Self> {
         if let Some(handle) = inherited_handle() {
+            let framing = inherited_framing(&handle);
             return Ok(Self {
                 handle,
                 mtu: spec.mtu,
+                framing,
+                gso: false,
             });
         }
-        #[cfg(target_os = "linux")]
-        return Self::open_linux(spec);
-        #[cfg(target_os = "macos")]
-        return Self::open_macos(spec);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::unix::io::IntoRawFd;
+            #[cfg(target_os = "linux")]
+            let (device, offload, _) = match crate::tun_stack::build(spec, false, true) {
+                Ok(built) => built,
+                Err(error) if offload_refused(&error) => {
+                    crate::tun_stack::build(spec, false, false)?
+                }
+                Err(error) => return Err(error),
+            };
+            #[cfg(target_os = "macos")]
+            let (device, _, _) = crate::tun_stack::build(spec, false, true)?;
+            #[cfg(target_os = "linux")]
+            let framing = if offload {
+                Framing::Virtio
+            } else {
+                Framing::Raw
+            };
+            #[cfg(target_os = "macos")]
+            let framing = Framing::Utun;
+            let handle = unsafe { std::fs::File::from_raw_fd(device.into_raw_fd()) };
+            Ok(Self {
+                handle,
+                mtu: spec.mtu,
+                framing,
+                #[cfg(target_os = "linux")]
+                gso: offload,
+                #[cfg(target_os = "macos")]
+                gso: false,
+            })
+        }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -285,22 +495,196 @@ impl Device {
         ))
     }
 
-    fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let limit = buf.len().min(self.mtu + 4);
-        self.handle.read(&mut buf[..limit])
+    pub(crate) fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let head = self.framing.header_len();
+        if head == 0 {
+            return self.handle.read(buf);
+        }
+        #[cfg(unix)]
+        {
+            let mut header = [0u8; VIRTIO_NET_HDR_LEN];
+            let mut iov = [
+                libc::iovec {
+                    iov_base: header.as_mut_ptr().cast(),
+                    iov_len: head,
+                },
+                libc::iovec {
+                    iov_base: buf.as_mut_ptr().cast(),
+                    iov_len: buf.len(),
+                },
+            ];
+            loop {
+                let n = unsafe { libc::readv(self.handle.as_raw_fd(), iov.as_mut_ptr(), 2) };
+                if n < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                return Ok((n as usize).saturating_sub(head));
+            }
+        }
+        #[cfg(not(unix))]
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "framed TUN reads need a unix descriptor",
+        ))
     }
 
     fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
-        write_packet_to(&mut self.handle, packet).map(|_| ())
+        write_framed(&mut self.handle, self.framing, None, packet).map(|_| ())
     }
 
-    fn clone_writer(&self) -> io::Result<std::fs::File> {
-        self.handle.try_clone()
+    pub(crate) fn clone_writer(&self) -> io::Result<PacketWriter> {
+        Ok(PacketWriter {
+            handle: self.handle.try_clone()?,
+            framing: self.framing,
+            gso: self.gso,
+        })
+    }
+
+    /// A packet tunnel's descriptor: the reference dups it, closes it on exec, and makes it nonblocking.
+    pub(crate) fn from_inherited(fd: i32, mtu: usize) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            let duplicated = unsafe { libc::dup(fd) };
+            if duplicated < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe { libc::fcntl(duplicated, libc::F_SETFD, libc::FD_CLOEXEC) };
+            let flags = unsafe { libc::fcntl(duplicated, libc::F_GETFL) };
+            if flags >= 0 {
+                unsafe { libc::fcntl(duplicated, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            }
+            let handle = unsafe { std::fs::File::from_raw_fd(duplicated) };
+            Ok(Self {
+                framing: inherited_framing(&handle),
+                handle,
+                mtu,
+                gso: false,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (fd, mtu);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "packet tunnel needs a Unix descriptor",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.handle.as_raw_fd()
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn raw_fd(&self) -> i32 {
+        -1
+    }
+
+    fn mss(&self, remote: IpAddr) -> u32 {
+        let header = if remote.is_ipv6() {
+            IPV6_HEADER + 20
+        } else {
+            IPV4_HEADER + 20
+        };
+        self.mtu.saturating_sub(header).max(1) as u32
     }
 
     #[cfg(all(test, unix))]
     fn from_handle(handle: std::fs::File, mtu: usize) -> Self {
-        Self { handle, mtu }
+        Self {
+            handle,
+            mtu,
+            framing: Framing::Raw,
+            gso: false,
+        }
+    }
+}
+
+/// A flow's writer: the descriptor clone plus the framing an emit owes it.
+pub(crate) struct PacketWriter {
+    handle: std::fs::File,
+    framing: Framing,
+    gso: bool,
+}
+
+impl PacketWriter {
+    pub(crate) fn write_packet(&mut self, packet: &[u8]) -> io::Result<bool> {
+        write_framed(&mut self.handle, self.framing, None, packet)
+    }
+
+    fn write_gso(&mut self, packet: &[u8], mss: u16) -> io::Result<bool> {
+        write_framed(&mut self.handle, self.framing, Some(mss), packet)
+    }
+
+    fn gso(&self) -> bool {
+        self.gso
+    }
+}
+
+/// The virtio header a GSO packet needs: native-endian fields, checksum offload from the TCP header, and the segment size the kernel splits at.
+fn virtio_header(packet: &[u8], gso: Option<u16>) -> [u8; VIRTIO_NET_HDR_LEN] {
+    let mut header = [0u8; VIRTIO_NET_HDR_LEN];
+    let Some(mss) = gso else {
+        return header;
+    };
+    let ip_header = if packet.first().is_some_and(|byte| byte >> 4 == 6) {
+        IPV6_HEADER
+    } else {
+        IPV4_HEADER
+    };
+    header[0] = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+    header[1] = if ip_header == IPV6_HEADER {
+        VIRTIO_NET_HDR_GSO_TCPV6
+    } else {
+        VIRTIO_NET_HDR_GSO_TCPV4
+    };
+    header[2..4].copy_from_slice(&(ip_header as u16 + 20).to_ne_bytes());
+    header[4..6].copy_from_slice(&mss.to_ne_bytes());
+    header[6..8].copy_from_slice(&(ip_header as u16).to_ne_bytes());
+    header[8..10].copy_from_slice(&16u16.to_ne_bytes());
+    header
+}
+
+/// One packet write with the descriptor's framing in front of it, all-or-nothing: a full write is carried, a short or refused write is dropped.
+fn write_framed(
+    handle: &mut std::fs::File,
+    framing: Framing,
+    gso: Option<u16>,
+    packet: &[u8],
+) -> io::Result<bool> {
+    match framing {
+        Framing::Raw => write_packet_to(handle, packet),
+        Framing::Utun => {
+            let family = if packet.first().is_some_and(|byte| byte >> 4 == 6) {
+                UTUN_AF_INET6
+            } else {
+                UTUN_AF_INET
+            };
+            write_pair(handle, &[0, 0, 0, family], packet)
+        }
+        Framing::Virtio => write_pair(handle, &virtio_header(packet, gso), packet),
+    }
+}
+
+/// One framed packet in one writev, so the header and payload reach the device as one packet. A short write drops the packet rather than sending its tail as another.
+fn write_pair<W: Write>(writer: &mut W, header: &[u8], packet: &[u8]) -> io::Result<bool> {
+    let total = header.len() + packet.len();
+    let parts = [std::io::IoSlice::new(header), std::io::IoSlice::new(packet)];
+    loop {
+        match writer.write_vectored(&parts) {
+            Ok(written) if written == total => return Ok(true),
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if crate::tun_stack::refused(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -324,10 +708,46 @@ impl AsRawFd for Device {
     }
 }
 
+/// The framing an inherited descriptor already carries, read from the descriptor rather than the environment: a Linux TUN reports its virtio header, and a macOS utun always has its family word.
+#[cfg(target_os = "linux")]
+fn inherited_framing(handle: &std::fs::File) -> Framing {
+    const TUNGETIFF: libc::c_ulong = 0x8004_54d2;
+    const IFF_VNET_HDR: libc::c_short = 0x4000;
+    #[repr(C)]
+    struct IfReq {
+        ifr_name: [u8; 16],
+        ifr_flags: libc::c_short,
+        _pad: [u8; 22],
+    }
+    let mut req = IfReq {
+        ifr_name: [0; 16],
+        ifr_flags: 0,
+        _pad: [0; 22],
+    };
+    if unsafe { libc::ioctl(handle.as_raw_fd(), TUNGETIFF as _, &mut req) } < 0 {
+        return Framing::Raw;
+    }
+    if req.ifr_flags & IFF_VNET_HDR != 0 {
+        Framing::Virtio
+    } else {
+        Framing::Raw
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn inherited_framing(_handle: &std::fs::File) -> Framing {
+    Framing::Utun
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn inherited_framing(_handle: &std::fs::File) -> Framing {
+    Framing::Raw
+}
+
 fn inherited_handle() -> Option<std::fs::File> {
     let fd_str = std::env::var_os("FERROX_TUN_FD")?;
     let fd: i64 = fd_str.to_str()?.parse().ok()?;
-    if fd < 0 {
+    if fd < 3 {
         return None;
     }
     #[cfg(unix)]
@@ -339,121 +759,135 @@ fn inherited_handle() -> Option<std::fs::File> {
     }
 }
 
+/// A Linux open refused the optional offload, so the same spec is retried without it.
 #[cfg(target_os = "linux")]
-impl Device {
-    fn open_linux(spec: &Spec) -> io::Result<Self> {
-        use std::ffi::CString;
-        const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
-        const IFF_TUN: libc::c_short = 0x0001;
-        const IFF_NO_PI: libc::c_short = 0x1000;
-        #[repr(C)]
-        struct IfReq {
-            ifr_name: [u8; 16],
-            ifr_flags: libc::c_short,
-            _pad: [u8; 22],
-        }
-        let path = CString::new("/dev/net/tun").unwrap();
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut req = IfReq {
-            ifr_name: [0; 16],
-            ifr_flags: IFF_TUN | IFF_NO_PI,
-            _pad: [0; 22],
-        };
-        let n = spec.name.as_bytes();
-        let l = n.len().min(15);
-        req.ifr_name[..l].copy_from_slice(&n[..l]);
-        let rc = unsafe { libc::ioctl(fd, TUNSETIFF as _, &req) };
-        if rc < 0 {
-            let e = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(e);
-        }
-        Ok(Self {
-            handle: unsafe { std::fs::File::from_raw_fd(fd) },
-            mtu: spec.mtu,
-        })
-    }
+fn offload_refused(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+    ) || matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EOPNOTSUPP || code == libc::ENOTSUP
+    )
 }
 
-#[cfg(target_os = "macos")]
-impl Device {
-    fn open_macos(spec: &Spec) -> io::Result<Self> {
-        const SYSPROTO_CONTROL: libc::c_int = 2;
-        const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control\0";
-        const CTLIOCGINFO: libc::c_ulong = 0xc064_4e03;
-        #[repr(C)]
-        struct CtlInfo {
-            ci_id: u32,
-            ci_name: [u8; 128],
-            ci_rcvbuf: libc::c_int,
-            ci_sndbuf: libc::c_int,
-            ci_flags: u16,
-            _p: [u8; 6],
-            ci_maxunits: libc::c_int,
-            _r: [u8; 2],
+/// The pseudo-header checksum a GSO segment carries into the kernel: the field holds the folded sum before the segment, and the kernel folds the payload onto it.
+fn partial_tcp_checksum(source: IpAddr, destination: IpAddr, tcp_len: usize) -> u16 {
+    let mut pseudo = [0u8; IPV6_HEADER + 8];
+    let len = match (source, destination) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            pseudo[..4].copy_from_slice(&source.octets());
+            pseudo[4..8].copy_from_slice(&destination.octets());
+            pseudo[9] = TCP_PROTO;
+            pseudo[10..12].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+            12
         }
-        #[repr(C)]
-        struct SockaddrCtl {
-            sc_len: u8,
-            sc_family: u8,
-            ss_sysaddr: u16,
-            sc_id: u32,
-            sc_unit: u32,
-            _r: [u8; 8],
+        (IpAddr::V6(source), IpAddr::V6(destination)) => {
+            pseudo[..16].copy_from_slice(&source.octets());
+            pseudo[16..32].copy_from_slice(&destination.octets());
+            pseudo[32..36].copy_from_slice(&(tcp_len as u32).to_be_bytes());
+            pseudo[39] = TCP_PROTO;
+            40
         }
-        let fd = unsafe { libc::socket(libc::AF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut info = CtlInfo {
-            ci_id: 0,
-            ci_name: [0; 128],
-            ci_rcvbuf: 0,
-            ci_sndbuf: 0,
-            ci_flags: 0,
-            _p: [0; 6],
-            ci_maxunits: 0,
-            _r: [0; 2],
-        };
-        let nl = UTUN_CONTROL_NAME.len();
-        info.ci_name[..nl].copy_from_slice(UTUN_CONTROL_NAME);
-        if unsafe { libc::ioctl(fd, CTLIOCGINFO as _, &mut info) } < 0 {
-            let e = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(e);
-        }
-        let addr = SockaddrCtl {
-            sc_len: std::mem::size_of::<SockaddrCtl>() as u8,
-            sc_family: libc::AF_SYSTEM as u8,
-            ss_sysaddr: 2,
-            sc_id: info.ci_id,
-            sc_unit: 0,
-            _r: [0; 8],
-        };
-        let rc = unsafe {
-            libc::connect(
-                fd,
-                (&raw const addr).cast::<libc::sockaddr>(),
-                std::mem::size_of::<SockaddrCtl>() as libc::socklen_t,
-            )
-        };
-        if rc < 0 {
-            let e = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(e);
-        }
-        Ok(Self {
-            handle: unsafe { std::fs::File::from_raw_fd(fd) },
-            mtu: spec.mtu,
-        })
-    }
+        _ => return 0,
+    };
+    !checksum(&pseudo[..len])
 }
 
-/// Render one IPv4/TCP packet into `out` — the caller's reused buffer — so a steady stream of SYN-ACKs, pure ACKs and response packets allocates and zero-fills nothing per packet. The IPv4 and TCP headers are built on the stack and extended, the payload is extended once, and both checksums are computed in place, the twelve-byte pseudo-header summed as words and never written. The bytes are what a freshly zero-filled buffer would hold for the same arguments: every header byte is named explicitly and the checksum field is read as zero until it is computed.
-#[allow(clippy::too_many_arguments)] // the fields of one IPv4/TCP header, plus the caller's reused out buffer
+fn write_tcp_checksum(source: IpAddr, destination: IpAddr, partial: bool, out: &mut [u8]) {
+    let ip_header = if source.is_ipv6() {
+        IPV6_HEADER
+    } else {
+        IPV4_HEADER
+    };
+    let tcp_len = out.len() - ip_header;
+    let field = ip_header + 16;
+    let value = if partial {
+        partial_tcp_checksum(source, destination, tcp_len)
+    } else {
+        let (source, destination) = octets(source, destination);
+        tcp_checksum(&source, &destination, &out[ip_header..])
+    };
+    out[field..field + 2].copy_from_slice(&value.to_be_bytes());
+}
+
+fn octets(source: IpAddr, destination: IpAddr) -> ([u8; 16], [u8; 16]) {
+    let mut from = [0u8; 16];
+    let mut to = [0u8; 16];
+    match source {
+        IpAddr::V4(address) => from[..4].copy_from_slice(&address.octets()),
+        IpAddr::V6(address) => from.copy_from_slice(&address.octets()),
+    }
+    match destination {
+        IpAddr::V4(address) => to[..4].copy_from_slice(&address.octets()),
+        IpAddr::V6(address) => to.copy_from_slice(&address.octets()),
+    }
+    (from, to)
+}
+
+/// Render one IP/TCP packet into `out` — the caller's reused buffer. The headers are built on the stack and extended, the payload is extended once, and both checksums are computed in place. A GSO render leaves the TCP field as the pseudo-header sum the kernel completes.
+#[allow(clippy::too_many_arguments)]
+fn render_tcp_packet_ip(
+    src: (IpAddr, u16),
+    dst: (IpAddr, u16),
+    seq: u32,
+    ack_num: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+    partial: bool,
+    out: &mut Vec<u8>,
+) {
+    let (src_ip, src_port) = src;
+    let (dst_ip, dst_port) = dst;
+    let tcp_len = 20 + payload.len();
+    out.clear();
+    let ip_len = if src_ip.is_ipv6() {
+        IPV6_HEADER + tcp_len
+    } else {
+        IPV4_HEADER + tcp_len
+    };
+    out.reserve(ip_len);
+    if let (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) = (src_ip, dst_ip) {
+        let mut ip = [0u8; IPV4_HEADER];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+        ip[6] = 0x40;
+        ip[8] = 64;
+        ip[9] = TCP_PROTO;
+        ip[12..16].copy_from_slice(&src_ip.octets());
+        ip[16..20].copy_from_slice(&dst_ip.octets());
+        let c = ipv4_checksum(&ip);
+        ip[10..12].copy_from_slice(&c.to_be_bytes());
+        out.extend_from_slice(&ip);
+    } else if let (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) = (src_ip, dst_ip) {
+        let mut ip = [0u8; IPV6_HEADER];
+        ip[0] = 0x60;
+        ip[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+        ip[6] = TCP_PROTO;
+        ip[7] = 64;
+        ip[8..24].copy_from_slice(&src_ip.octets());
+        ip[24..40].copy_from_slice(&dst_ip.octets());
+        out.extend_from_slice(&ip);
+    } else {
+        return;
+    }
+    let mut tcp = [0u8; 20];
+    tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+    tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack_num.to_be_bytes());
+    tcp[12] = 0x50;
+    tcp[13] = flags;
+    tcp[14..16].copy_from_slice(&window.to_be_bytes());
+    out.extend_from_slice(&tcp);
+    out.extend_from_slice(payload);
+    write_tcp_checksum(src_ip, dst_ip, partial, out);
+}
+
+/// Render one IPv4/TCP packet with no offload, the shape the caller's tests and the v4-only path already exercised.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn render_tcp_packet(
     src: ([u8; 4], u16),
     dst: ([u8; 4], u16),
@@ -464,44 +898,31 @@ fn render_tcp_packet(
     payload: &[u8],
     out: &mut Vec<u8>,
 ) {
-    let (src, src_port) = src;
-    let (dst, dst_port) = dst;
-    let tcp_len = 20 + payload.len();
-    let ip_len = IPV4_HEADER + tcp_len;
-    out.clear();
-    out.reserve(ip_len);
-    let mut ip = [0u8; IPV4_HEADER];
-    ip[0] = 0x45;
-    ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
-    ip[6] = 0x40;
-    ip[8] = 64;
-    ip[9] = TCP_PROTO;
-    ip[12..16].copy_from_slice(&src);
-    ip[16..20].copy_from_slice(&dst);
-    let c = ipv4_checksum(&ip);
-    ip[10..12].copy_from_slice(&c.to_be_bytes());
-    let mut tcp = [0u8; 20];
-    tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
-    tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
-    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
-    tcp[8..12].copy_from_slice(&ack_num.to_be_bytes());
-    tcp[12] = 0x50;
-    tcp[13] = flags;
-    tcp[14..16].copy_from_slice(&window.to_be_bytes());
-    out.extend_from_slice(&ip);
-    out.extend_from_slice(&tcp);
-    out.extend_from_slice(payload);
-    let tc = tcp_checksum(&src, &dst, &out[IPV4_HEADER..]);
-    out[IPV4_HEADER + 16..IPV4_HEADER + 18].copy_from_slice(&tc.to_be_bytes());
+    render_tcp_packet_ip(
+        (IpAddr::from(src.0), src.1),
+        (IpAddr::from(dst.0), dst.1),
+        seq,
+        ack_num,
+        flags,
+        window,
+        payload,
+        false,
+        out,
+    );
 }
 
 /// An ICMP echo request answered as the device's own destination would: the shared renderer
 /// flips the type, swaps the addresses and recomputes both checksums into the caller's reused
 /// `out`, so a ping storm allocates nothing per reply. `src` and `dst` are the reply's, the
 /// request's the other way round.
-fn render_icmp_reply(src: [u8; 4], dst: [u8; 4], request: &[u8], out: &mut Vec<u8>) {
+fn render_icmp_reply_ip(src: IpAddr, dst: IpAddr, request: &[u8], out: &mut Vec<u8>) {
     out.clear();
-    let _ = icmp_echo_reply(IpAddr::from(dst), IpAddr::from(src), request, out);
+    let _ = icmp_echo_reply(dst, src, request, out);
+}
+
+#[cfg(test)]
+fn render_icmp_reply(src: [u8; 4], dst: [u8; 4], request: &[u8], out: &mut Vec<u8>) {
+    render_icmp_reply_ip(IpAddr::from(src), IpAddr::from(dst), request, out);
 }
 
 /// Test-only: the render pair behind a fresh vector, so a caller that only wants to inspect one packet need not thread a buffer. Production emits reach the device through `render_*_packet` into a reused buffer.
@@ -527,19 +948,40 @@ fn build_icmp_reply(src: [u8; 4], dst: [u8; 4], request: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
+fn build_ipv6_tcp_packet(
+    src: (IpAddr, u16),
+    dst: (IpAddr, u16),
+    seq: u32,
+    ack_num: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    render_tcp_packet_ip(
+        src, dst, seq, ack_num, flags, window, payload, false, &mut out,
+    );
+    out
+}
+
 /// One active TCP flow's state. The two cursors are shared with the response
 /// thread: `rcv_nxt` advances as the handler delivers payload to the proxy, and
 /// `snd_nxt` advances as the response thread sends payload out, so a pure ACK
 /// carries both numbers truthfully.
 struct Flow {
+    /// The generation this entry was inserted at, so a late reaper cannot remove a replacement with the same tuple.
+    id: u64,
     write_half: TcpStream,
     rcv_nxt: Arc<AtomicU32>,
     snd_nxt: Arc<AtomicU32>,
     /// Payload reached the proxy since the response thread's last idle expiry: a flow is alive when either direction spoke inside the budget.
     busy: Arc<AtomicBool>,
     last_acked: u32,
-    local: ([u8; 4], u16),
-    remote: ([u8; 4], u16),
+    local: (IpAddr, u16),
+    remote: (IpAddr, u16),
+    /// The largest payload the response thread may put in one segment; a path-MTU report lowers it.
+    mss: Arc<AtomicU32>,
     /// One close packet — `FIN` or `RST` — leaves per flow, whichever thread sees the end first.
     signaled: Arc<AtomicBool>,
 }
@@ -592,6 +1034,7 @@ pub(crate) struct Handler {
     association: Option<Association>,
     ended_tx: mpsc::Sender<Ended>,
     ended_rx: mpsc::Receiver<Ended>,
+    next_flow_id: u64,
 }
 
 impl Handler {
@@ -609,11 +1052,12 @@ impl Handler {
             association: None,
             ended_tx,
             ended_rx,
+            next_flow_id: 0,
         }
     }
 
     pub(crate) fn serve(&mut self) -> io::Result<()> {
-        let mut buf = vec![0u8; self.device.mtu + 64];
+        let mut buf = vec![0u8; MAX_PACKET + 64];
         loop {
             let n = self.device.read_packet(&mut buf)?;
             if n == 0 {
@@ -629,27 +1073,29 @@ impl Handler {
         // Threads that left their flow report here, so neither table keeps a dead entry or the socket inside it.
         while let Ok(ended) = self.ended_rx.try_recv() {
             match ended {
-                Ended::Stream(key) => {
-                    self.flows.remove(&key);
+                Ended::Stream(key, id) => {
+                    if self.flows.get(&key).is_some_and(|flow| flow.id == id) {
+                        self.flows.remove(&key);
+                    }
                 }
                 Ended::Datagram(key) => {
                     self.legs.remove(&key);
                 }
             }
         }
-        let Some((ip, body)) = ipv4_head(packet) else {
+        let Some((ip, body)) = ip_head(packet) else {
             return Ok(());
         };
         match ip.protocol {
             TCP_PROTO => self.handle_tcp(&ip, body),
             PROTOCOL_UDP => self.handle_udp(&ip, body),
-            ICMP_PROTO => self.handle_icmp(&ip, body),
+            ICMP_PROTO | ICMPV6_PROTO => self.handle_icmp(&ip, body),
             _ => Ok(()),
         }
     }
 
     /// Relay one datagram: the flow's leg is raised on the association's relay address and every packet afterwards rides it, framed with the destination the device asked for. A packet whose association or leg cannot be raised is lost, as an unroutable datagram is at every other front.
-    fn handle_udp(&mut self, ip: &Ipv4Head, body: &[u8]) -> io::Result<()> {
+    fn handle_udp(&mut self, ip: &IpHead, body: &[u8]) -> io::Result<()> {
         let Some((udp, payload)) = udp_head(body) else {
             return Ok(());
         };
@@ -662,7 +1108,7 @@ impl Handler {
             return Ok(());
         };
         let relay = association.relay;
-        let target = SocketAddr::from((ip.destination, udp.destination_port));
+        let target = SocketAddr::new(ip.destination, udp.destination_port);
         let key = UdpKey {
             source_port: udp.source_port,
             destination: ip.destination,
@@ -689,7 +1135,7 @@ impl Handler {
         Ok(())
     }
 
-    fn handle_tcp(&mut self, ip: &Ipv4Head, body: &[u8]) -> io::Result<()> {
+    fn handle_tcp(&mut self, ip: &IpHead, body: &[u8]) -> io::Result<()> {
         let Some((tcp, payload)) = tcp_head(body) else {
             return Ok(());
         };
@@ -727,7 +1173,7 @@ impl Handler {
                 let snd = flow.snd_nxt.load(Relaxed);
                 let rcv = flow.rcv_nxt.load(Relaxed);
                 let mut emit = std::mem::take(&mut self.emit);
-                render_tcp_packet(
+                render_tcp_packet_ip(
                     (ip.destination, tcp.destination_port),
                     (ip.source, tcp.source_port),
                     snd,
@@ -735,6 +1181,7 @@ impl Handler {
                     FLAG_ACK,
                     65535,
                     &[],
+                    false,
                     &mut emit,
                 );
                 let _ = self.device.write_packet(&emit);
@@ -750,15 +1197,16 @@ impl Handler {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn accept_flow(&mut self, ip: &Ipv4Head, tcp: &TcpHead, key: FlowKey) -> io::Result<()> {
+    fn accept_flow(&mut self, ip: &IpHead, tcp: &TcpHead, key: FlowKey) -> io::Result<()> {
         let local_ip = ip.destination;
         let remote_ip = ip.source;
         let local_port = tcp.destination_port;
         let remote_port = tcp.source_port;
         let syn_seq = tcp.seq;
+        let mss = Arc::new(AtomicU32::new(self.device.mss(remote_ip)));
 
         let mut emit = std::mem::take(&mut self.emit);
-        render_tcp_packet(
+        render_tcp_packet_ip(
             (local_ip, local_port),
             (remote_ip, remote_port),
             syn_seq.wrapping_add(1),
@@ -766,13 +1214,14 @@ impl Handler {
             FLAG_SYN | FLAG_ACK,
             65535,
             &[],
+            false,
             &mut emit,
         );
         let wrote = self.device.write_packet(&emit);
         self.emit = emit;
         wrote?;
 
-        let target = SocketAddr::from((ip.destination, tcp.destination_port));
+        let target = SocketAddr::new(ip.destination, tcp.destination_port);
         let destination = crate::proxy::Destination::from(target);
         let relay = Arc::clone(&self.relay);
 
@@ -788,9 +1237,12 @@ impl Handler {
         let snd_nxt = Arc::new(AtomicU32::new(syn_seq.wrapping_add(2)));
         let busy = Arc::new(AtomicBool::new(false));
         let signaled = Arc::new(AtomicBool::new(false));
+        let id = self.next_flow_id;
+        self.next_flow_id = self.next_flow_id.wrapping_add(1);
         self.flows.insert(
             key,
             Flow {
+                id,
                 write_half,
                 rcv_nxt: Arc::clone(&rcv_nxt),
                 snd_nxt: Arc::clone(&snd_nxt),
@@ -798,6 +1250,7 @@ impl Handler {
                 last_acked: syn_seq.wrapping_add(1),
                 local: (local_ip, local_port),
                 remote: (remote_ip, remote_port),
+                mss: Arc::clone(&mss),
                 signaled: Arc::clone(&signaled),
             },
         );
@@ -817,10 +1270,25 @@ impl Handler {
         });
 
         std::thread::spawn(move || {
-            let mut buf = vec![0u8; 4096];
-            let mut pkt = Vec::with_capacity(4096 + 40);
+            let gso_capable = dev_writer.gso();
+            let initial = (mss.load(Relaxed) as usize).max(1);
+            let mut buf = vec![
+                0u8;
+                if gso_capable {
+                    MAX_PACKET - IPV6_HEADER - 20
+                } else {
+                    initial
+                }
+            ];
+            let mut pkt = Vec::with_capacity(if gso_capable {
+                MAX_PACKET
+            } else {
+                IPV6_HEADER + 20 + initial
+            });
             let end = loop {
-                match read_half.read(&mut buf) {
+                let max = (mss.load(Relaxed) as usize).max(1);
+                let limit = max.min(buf.len());
+                match read_half.read(&mut buf[..limit]) {
                     Ok(0) => {
                         // A clean close ends with FIN, a refused leg with RST; a relay that never reports is dead.
                         let clean = match outcome_rx.try_recv() {
@@ -836,7 +1304,8 @@ impl Handler {
                     }
                     Ok(n) => {
                         let seq = snd_nxt.load(Relaxed);
-                        render_tcp_packet(
+                        let gso = gso_capable && n > max;
+                        render_tcp_packet_ip(
                             (local_ip, local_port),
                             (remote_ip, remote_port),
                             seq,
@@ -844,9 +1313,15 @@ impl Handler {
                             FLAG_PSH | FLAG_ACK,
                             65535,
                             &buf[..n],
+                            gso,
                             &mut pkt,
                         );
-                        match write_packet_to(&mut dev_writer, &pkt) {
+                        let wrote = if gso {
+                            dev_writer.write_gso(&pkt, max as u16)
+                        } else {
+                            dev_writer.write_packet(&pkt)
+                        };
+                        match wrote {
                             Ok(true) => {
                                 snd_nxt.fetch_add(n as u32, Relaxed);
                             }
@@ -870,7 +1345,7 @@ impl Handler {
                 }
             };
             if !signaled.swap(true, Relaxed) {
-                render_tcp_packet(
+                render_tcp_packet_ip(
                     (local_ip, local_port),
                     (remote_ip, remote_port),
                     snd_nxt.load(Relaxed),
@@ -878,12 +1353,13 @@ impl Handler {
                     end,
                     65535,
                     &[],
+                    false,
                     &mut pkt,
                 );
-                let _ = write_packet_to(&mut dev_writer, &pkt);
+                let _ = dev_writer.write_packet(&pkt);
             }
             // Queue the entry's removal before the shutdown that wakes the relay leg, so a caller that sees the leg end can reap the entry at its next dispatch.
-            let _ = ended_tx.send(Ended::Stream(key));
+            let _ = ended_tx.send(Ended::Stream(key, id));
             // Both halves, because the handler's write half is a clone of this descriptor and only a shutdown tells it the flow is over.
             let _ = read_half.shutdown(Shutdown::Both);
         });
@@ -894,15 +1370,31 @@ impl Handler {
     /// Answer an ICMP echo request as the device's own address would, so a ping off the
     /// interface returns instead of vanishing; a message that is not a well-formed echo
     /// request is left unanswered, exactly as the reference's handler returns.
-    fn handle_icmp(&mut self, ip: &Ipv4Head, body: &[u8]) -> io::Result<()> {
-        if !is_echo_request(body) {
-            return Ok(());
+    fn handle_icmp(&mut self, ip: &IpHead, body: &[u8]) -> io::Result<()> {
+        if is_echo_request(ip.protocol, body) {
+            let mut emit = std::mem::take(&mut self.emit);
+            render_icmp_reply_ip(ip.destination, ip.source, body, &mut emit);
+            let wrote = self.device.write_packet(&emit);
+            self.emit = emit;
+            return wrote;
         }
-        let mut emit = std::mem::take(&mut self.emit);
-        render_icmp_reply(ip.destination, ip.source, body, &mut emit);
-        let wrote = self.device.write_packet(&emit);
-        self.emit = emit;
-        wrote
+        if let Some(key) = icmp_error_flow(ip.protocol, body) {
+            if let Some(mtu) = reported_mtu(ip.protocol, body) {
+                self.shrink_flow(key, mtu);
+            } else {
+                self.close_flow(key, Some(FLAG_RST | FLAG_ACK));
+            }
+        }
+        Ok(())
+    }
+
+    /// Take a path-MTU report for the rest of a flow: only a smaller segment size is believed, and the floor keeps a forged report from stopping the flow.
+    fn shrink_flow(&mut self, key: FlowKey, mtu: u32) {
+        if let Some(flow) = self.flows.get(&key) {
+            let mss = path_mss(mtu, flow.remote.0.is_ipv6());
+            let current = flow.mss.load(Relaxed);
+            flow.mss.store(current.min(mss), Relaxed);
+        }
     }
 
     fn close_flow(&mut self, key: FlowKey, signal: Option<u8>) {
@@ -910,7 +1402,7 @@ impl Handler {
             match signal {
                 Some(flags) if !flow.signaled.swap(true, Relaxed) => {
                     let mut emit = std::mem::take(&mut self.emit);
-                    render_tcp_packet(
+                    render_tcp_packet_ip(
                         flow.local,
                         flow.remote,
                         flow.snd_nxt.load(Relaxed),
@@ -918,6 +1410,7 @@ impl Handler {
                         flags,
                         65535,
                         &[],
+                        false,
                         &mut emit,
                     );
                     let _ = self.device.write_packet(&emit);
@@ -944,20 +1437,23 @@ impl Drop for Handler {
 fn open_leg(
     device: &Device,
     relay: SocketAddr,
-    endpoint: ([u8; 4], u16),
-    client: ([u8; 4], u16),
+    endpoint: (IpAddr, u16),
+    client: (IpAddr, u16),
     key: UdpKey,
     ended: &mpsc::Sender<Ended>,
 ) -> io::Result<UdpSocket> {
     let leg = crate::proxy::relay_leg(relay)?;
-    let target = SocketAddr::from(endpoint);
+    let target = SocketAddr::new(endpoint.0, endpoint.1);
     let reader = leg.try_clone()?;
     let mut dev_writer = device.clone_writer()?;
     let mtu = device.mtu;
     let ended = ended.clone();
+    let (endpoint_bytes, client_bytes) = octets(endpoint.0, client.0);
+    let endpoint_len = if endpoint.0.is_ipv6() { 16 } else { 4 };
+    let client_len = if client.0.is_ipv6() { 16 } else { 4 };
     std::thread::spawn(move || {
         let mut buf = crate::proxy::udp_buffer();
-        let mut out: Vec<u8> = Vec::with_capacity(IPV4_HEADER + UDP_HEADER + mtu);
+        let mut out: Vec<u8> = Vec::with_capacity(IPV6_HEADER + UDP_HEADER + mtu);
         while let Ok(n) = reader.recv(&mut buf) {
             let Some((source, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
                 continue;
@@ -966,8 +1462,8 @@ fn open_leg(
                 continue;
             }
             let datagram = UdpDatagram {
-                source: endpoint.0.as_slice(),
-                destination: client.0.as_slice(),
+                source: &endpoint_bytes[..endpoint_len],
+                destination: &client_bytes[..client_len],
                 source_port: endpoint.1,
                 destination_port: client.1,
                 payload,
@@ -976,7 +1472,7 @@ fn open_leg(
             if !udp_datagram(&datagram, &mut out) {
                 continue;
             }
-            if write_packet_to(&mut dev_writer, &out).is_err() {
+            if dev_writer.write_packet(&out).is_err() {
                 break;
             }
         }
@@ -1079,6 +1575,188 @@ mod tests {
     #[test]
     fn tcp_head_refuses_short_segment() {
         assert!(tcp_head(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn a_virtio_gso_header_names_the_tcp_segment() {
+        assert_eq!(Framing::Virtio.header_len(), VIRTIO_NET_HDR_LEN);
+        assert_eq!(Framing::Utun.header_len(), UTUN_HEADER_LEN);
+        let packet = build_ipv6_tcp_packet(
+            ("2001:db8::2".parse().unwrap(), 1),
+            ("2001:db8::1".parse().unwrap(), 2),
+            0,
+            0,
+            FLAG_ACK,
+            4096,
+            b"",
+        );
+        let header = virtio_header(&packet, Some(1400));
+        assert_eq!(header[0], VIRTIO_NET_HDR_F_NEEDS_CSUM);
+        assert_eq!(header[1], VIRTIO_NET_HDR_GSO_TCPV6);
+        assert_eq!(u16::from_ne_bytes([header[2], header[3]]), 60);
+        assert_eq!(u16::from_ne_bytes([header[4], header[5]]), 1400);
+        assert_eq!(u16::from_ne_bytes([header[6], header[7]]), 40);
+        assert_eq!(u16::from_ne_bytes([header[8], header[9]]), 16);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_offload_refusal_is_retried_without_it() {
+        assert!(offload_refused(&io::Error::from_raw_os_error(libc::EINVAL)));
+        assert!(offload_refused(&io::Error::new(
+            io::ErrorKind::Unsupported,
+            "offload"
+        )));
+        assert!(!offload_refused(&io::Error::from_raw_os_error(libc::EPERM)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_descriptor_does_not_claim_gso() {
+        let (handle, _peer) = unix_socketpair().unwrap();
+        let device = Device::from_handle(handle, 1500);
+        assert!(!device.clone_writer().unwrap().gso());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_framed_packet_takes_one_write() {
+        let (mut writer, mut reader) = unix_socketpair().unwrap();
+        let packet = [0x45u8; 20];
+        for framing in [Framing::Raw, Framing::Utun, Framing::Virtio] {
+            let mut expected = match framing {
+                Framing::Raw => Vec::new(),
+                Framing::Utun => vec![0, 0, 0, UTUN_AF_INET],
+                Framing::Virtio => virtio_header(&packet, None).to_vec(),
+            };
+            expected.extend_from_slice(&packet);
+            assert!(write_framed(&mut writer, framing, None, &packet).unwrap());
+            let mut got = [0u8; 64];
+            let n = reader.read(&mut got).unwrap();
+            assert_eq!(&got[..n], expected, "{framing:?} split its frame");
+        }
+    }
+
+    #[test]
+    fn a_quoted_v6_flow_is_read_through_an_extension_header() {
+        let mut quoted = vec![0u8; IPV6_HEADER + 16];
+        quoted[0] = 0x60;
+        quoted[6] = 0;
+        quoted[7] = 64;
+        quoted[8..24].copy_from_slice(&"2001:db8::2".parse::<Ipv6Addr>().unwrap().octets());
+        quoted[24..40].copy_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        quoted[40] = TCP_PROTO;
+        quoted[48..50].copy_from_slice(&443u16.to_be_bytes());
+        quoted[50..52].copy_from_slice(&12345u16.to_be_bytes());
+        let flow = quoted_flow(&quoted).unwrap();
+        assert_eq!(flow.source_port, 12345);
+        assert_eq!(flow.destination_port, 443);
+        assert_eq!(flow.destination, "2001:db8::2".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn an_ipv6_tcp_packet_parses_and_renders_with_its_checksum() {
+        let source: IpAddr = "2001:db8::2".parse().unwrap();
+        let destination: IpAddr = "2001:db8::1".parse().unwrap();
+        let pkt = build_ipv6_tcp_packet(
+            (source, 12345),
+            (destination, 443),
+            1000,
+            1001,
+            FLAG_SYN | FLAG_ACK,
+            65535,
+            b"v6",
+        );
+        assert_eq!(pkt[0] >> 4, 6);
+        let (ip, body) = ip_head(&pkt).unwrap();
+        assert_eq!(ip.source, source);
+        assert_eq!(ip.destination, destination);
+        assert_eq!(ip.protocol, TCP_PROTO);
+        let (tcp, payload) = tcp_head(body).unwrap();
+        assert_eq!(tcp.source_port, 12345);
+        assert_eq!(tcp.destination_port, 443);
+        assert_eq!(payload, b"v6");
+        let (from, to) = octets(source, destination);
+        assert_eq!(tcp_checksum(&from, &to, body), 0);
+    }
+
+    #[test]
+    fn an_ipv6_extension_header_is_walked_to_the_transport() {
+        let source: IpAddr = "2001:db8::2".parse().unwrap();
+        let destination: IpAddr = "2001:db8::1".parse().unwrap();
+        let tcp = build_ipv6_tcp_packet((source, 7), (destination, 8), 1, 2, FLAG_ACK, 4096, b"x");
+        let mut pkt = Vec::with_capacity(tcp.len() + 8);
+        pkt.extend_from_slice(&tcp[..IPV6_HEADER]);
+        pkt[6] = 60;
+        pkt[4..6].copy_from_slice(&((tcp.len() - IPV6_HEADER + 8) as u16).to_be_bytes());
+        pkt.extend_from_slice(&[TCP_PROTO, 0, 1, 4, 0, 0, 0, 0]);
+        pkt.extend_from_slice(&tcp[IPV6_HEADER..]);
+        let (ip, body) = ip_head(&pkt).unwrap();
+        assert_eq!(ip.protocol, TCP_PROTO);
+        assert_eq!(tcp_head(body).unwrap().1, b"x");
+    }
+
+    #[test]
+    fn an_icmp_error_quotes_the_flow_it_ends() {
+        let remote: IpAddr = "2001:db8::2".parse().unwrap();
+        let client: IpAddr = "2001:db8::1".parse().unwrap();
+        let quoted =
+            build_ipv6_tcp_packet((remote, 443), (client, 5555), 9, 10, FLAG_ACK, 4096, b"");
+        let mut body = vec![2, 0, 0, 0, 0, 0, 0, 0];
+        body.extend_from_slice(&quoted[..IPV6_HEADER + 8]);
+        let key = icmp_error_flow(ICMPV6_PROTO, &body).unwrap();
+        assert_eq!(key.source_port, 5555);
+        assert_eq!(key.destination, remote);
+        assert_eq!(key.destination_port, 443);
+    }
+
+    #[test]
+    fn a_v4_icmp_error_quotes_the_flow_it_ends() {
+        let quoted = build_tcp_packet(
+            ([203, 0, 113, 7], 443),
+            ([10, 0, 0, 2], 5555),
+            9,
+            10,
+            FLAG_ACK,
+            4096,
+            b"",
+        );
+        let mut body = vec![3, 0, 0, 0, 0, 0, 0, 0];
+        body.extend_from_slice(&quoted[..IPV4_HEADER + 8]);
+        let key = icmp_error_flow(ICMP_PROTO, &body).unwrap();
+        assert_eq!(key.source_port, 5555);
+        assert_eq!(key.destination, IpAddr::V4([203, 0, 113, 7].into()));
+        assert_eq!(key.destination_port, 443);
+    }
+
+    #[test]
+    fn a_path_mtu_report_names_the_segment_size_left_for_the_path() {
+        let v4 = [3, 4, 0, 0, 0, 0, 0x04, 0xb0];
+        assert_eq!(reported_mtu(ICMP_PROTO, &v4), Some(1200));
+        assert_eq!(
+            reported_mtu(ICMP_PROTO, &[3, 3, 0, 0, 0, 0, 0x04, 0xb0]),
+            None
+        );
+        let v6 = [2, 0, 0, 0, 0, 0, 0x04, 0xb0];
+        assert_eq!(reported_mtu(ICMPV6_PROTO, &v6), Some(1280));
+        assert_eq!(reported_mtu(ICMPV6_PROTO, &[1, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(path_mss(1200, false), 1160);
+        assert_eq!(path_mss(1200, true), 1140);
+        assert_eq!(path_mss(40, true), SMALLEST_MSS);
+    }
+
+    #[test]
+    fn a_v6_echo_request_flips_to_a_v6_reply() {
+        let request = [128u8, 0, 0, 0, 0, 1, 0, 1, b'p', b'i', b'n', b'g'];
+        let mut out = Vec::new();
+        render_icmp_reply_ip(
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::2".parse().unwrap(),
+            &request,
+            &mut out,
+        );
+        assert_eq!(out[0] >> 4, 6);
+        assert_eq!(out[IPV6_HEADER], ICMPV6_ECHO_REPLY);
     }
 
     #[test]
@@ -1379,18 +2057,25 @@ mod tests {
     #[test]
     fn a_non_echo_icmp_message_is_refused() {
         // The three shapes that are not an IPv4 echo request the handler would answer.
-        assert!(!is_echo_request(&[0, 0, 0, 0, 0, 0, 0, 0]), "an echo reply");
         assert!(
-            !is_echo_request(&[8, 3, 0, 0, 0, 0, 0, 0]),
+            !is_echo_request(ICMP_PROTO, &[0, 0, 0, 0, 0, 0, 0, 0]),
+            "an echo reply"
+        );
+        assert!(
+            !is_echo_request(ICMP_PROTO, &[8, 3, 0, 0, 0, 0, 0, 0]),
             "a non-zero code"
         );
         assert!(
-            !is_echo_request(&[8, 0, 0, 0]),
+            !is_echo_request(ICMP_PROTO, &[8, 0, 0, 0]),
             "shorter than the eight-byte header"
         );
         assert!(
-            is_echo_request(&[8, 0, 0, 0, 0, 0, 0, 0]),
+            is_echo_request(ICMP_PROTO, &[8, 0, 0, 0, 0, 0, 0, 0]),
             "a well-formed request"
+        );
+        assert!(
+            is_echo_request(ICMPV6_PROTO, &[128, 0, 0, 0, 0, 0, 0, 0]),
+            "a well-formed v6 request"
         );
     }
 
@@ -1457,6 +2142,128 @@ mod tests {
         );
         assert_eq!(&rbody[4..8], &[0x12, 0x34, 0x00, 0x07]);
         assert_eq!(&rbody[8..], b"ping data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_packet_too_big_shrinks_the_response_segment() {
+        let (a, b) = unix_socketpair().unwrap();
+        let (_release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = Arc::new(std::sync::Mutex::new(hold));
+        let relay: Relay = Arc::new(move |_conn, _dest| {
+            let _ = hold.lock().unwrap().recv();
+            Ok(())
+        });
+        let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
+        let mut peer = b;
+        let client = ([10, 0, 0, 2], 44444);
+        let endpoint = ([10, 0, 0, 1], 8080);
+        let syn = build_tcp_packet(client, endpoint, 1000, 0, FLAG_SYN, 65535, &[]);
+        peer.write_all(&syn).unwrap();
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+
+        let key = FlowKey {
+            source_port: 44444,
+            destination: IpAddr::V4(endpoint.0.into()),
+            destination_port: 8080,
+        };
+        assert_eq!(
+            handler.flows.get(&key).unwrap().mss.load(Relaxed),
+            (DEFAULT_MTU - IPV4_HEADER - 20) as u32
+        );
+
+        let quoted = build_tcp_packet(
+            (endpoint.0, 8080),
+            (client.0, 44444),
+            1001,
+            1001,
+            FLAG_ACK,
+            65535,
+            &[],
+        );
+        let mut pkt = vec![0u8; IPV4_HEADER + 8 + IPV4_HEADER + 8];
+        let len = pkt.len() as u16;
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&len.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = ICMP_PROTO;
+        pkt[12..16].copy_from_slice(&endpoint.0);
+        pkt[16..20].copy_from_slice(&client.0);
+        let body = &mut pkt[IPV4_HEADER..];
+        body[0] = 3;
+        body[1] = 4;
+        body[6..8].copy_from_slice(&1200u16.to_be_bytes());
+        body[8..8 + IPV4_HEADER + 8].copy_from_slice(&quoted[..IPV4_HEADER + 8]);
+        handler.dispatch(&pkt).unwrap();
+
+        assert_eq!(handler.flows.get(&key).unwrap().mss.load(Relaxed), 1160);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_v6_packet_too_big_shrinks_the_response_segment() {
+        let (a, b) = unix_socketpair().unwrap();
+        let (_release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = Arc::new(std::sync::Mutex::new(hold));
+        let relay: Relay = Arc::new(move |_conn, _dest| {
+            let _ = hold.lock().unwrap().recv();
+            Ok(())
+        });
+        let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
+        let mut peer = b;
+        let client: IpAddr = "2001:db8::2".parse().unwrap();
+        let endpoint: IpAddr = "2001:db8::1".parse().unwrap();
+        let syn = build_ipv6_tcp_packet(
+            (client, 44444),
+            (endpoint, 8080),
+            1000,
+            0,
+            FLAG_SYN,
+            65535,
+            &[],
+        );
+        peer.write_all(&syn).unwrap();
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+
+        let key = FlowKey {
+            source_port: 44444,
+            destination: endpoint,
+            destination_port: 8080,
+        };
+        assert_eq!(
+            handler.flows.get(&key).unwrap().mss.load(Relaxed),
+            (DEFAULT_MTU - IPV6_HEADER - 20) as u32
+        );
+
+        let quoted = build_ipv6_tcp_packet(
+            (endpoint, 8080),
+            (client, 44444),
+            1001,
+            1001,
+            FLAG_ACK,
+            65535,
+            &[],
+        );
+        let mut pkt = vec![0u8; IPV6_HEADER + 8 + IPV6_HEADER + 8];
+        let payload = (pkt.len() - IPV6_HEADER) as u16;
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&payload.to_be_bytes());
+        pkt[6] = ICMPV6_PROTO;
+        pkt[7] = 64;
+        let (from, to) = octets(endpoint, client);
+        pkt[8..24].copy_from_slice(&from);
+        pkt[24..40].copy_from_slice(&to);
+        let body = &mut pkt[IPV6_HEADER..];
+        body[0] = 2;
+        body[4..8].copy_from_slice(&1200u32.to_be_bytes());
+        body[8..8 + IPV6_HEADER + 8].copy_from_slice(&quoted[..IPV6_HEADER + 8]);
+        handler.dispatch(&pkt).unwrap();
+
+        assert_eq!(handler.flows.get(&key).unwrap().mss.load(Relaxed), 1220);
     }
 
     #[cfg(unix)]
@@ -2255,7 +3062,7 @@ mod tests {
         handler.dispatch(&buf[..n]).unwrap();
         FlowKey {
             source_port,
-            destination: endpoint.0,
+            destination: IpAddr::V4(*destination.ip()),
             destination_port: endpoint.1,
         }
     }
@@ -2301,9 +3108,12 @@ mod tests {
         assert_eq!(handler.flows.len(), 1, "only the live flow is left");
 
         // The client's goodbye outranks the budget: a reset flow hands its leg back at once.
+        let IpAddr::V4(second_ip) = second.destination else {
+            panic!("the test flow names an IPv4 destination");
+        };
         peer.write_all(&build_tcp_packet(
             (SCRIPT_CLIENT, second.source_port),
-            (second.destination, second.destination_port),
+            (second_ip.octets(), second.destination_port),
             9501,
             0,
             FLAG_RST | FLAG_ACK,

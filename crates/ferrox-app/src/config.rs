@@ -2167,7 +2167,7 @@ fn xmc_uuid(value: &str) -> Option<[u8; 16]> {
     let bytes = value.as_bytes();
     let text = if bytes.len() == 45 && bytes[..9].eq_ignore_ascii_case(b"urn:uuid:") {
         &bytes[9..]
-    } else if bytes.len() == 38 && bytes[0] == b'{' && bytes[37] == b'}' {
+    } else if bytes.len() == 38 {
         &bytes[1..37]
     } else {
         bytes
@@ -3786,6 +3786,7 @@ mod tests {
             "urn:uuid:123e4567-e89b-12d3-a456-426614174000",
             "URN:UUID:123E4567-E89B-12D3-A456-426614174000",
             "{123e4567-e89b-12d3-a456-426614174000}",
+            "!123e4567-e89b-12d3-a456-426614174000!",
         ] {
             let valid = format!(
                 r#"{{"network":"tcp","finalmask":{{"tcp":[{{"type":"xmc","settings":{{"password":"pw","profiles":[{{"username":"Steve","uuid":"{uuid}","texturesValue":"value","texturesSignature":"signature"}}]}}}}]}}}}"#

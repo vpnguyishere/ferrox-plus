@@ -16,6 +16,7 @@ mod budgets;
 #[macro_use]
 mod census;
 mod blackhole;
+mod browser_dialer;
 mod commander;
 mod config;
 mod conn;
@@ -60,6 +61,7 @@ mod psiphon_h3;
 mod psiphon_light;
 mod psiphon_meek;
 mod psiphon_osl;
+mod psiphon_packet_tunnel;
 mod psiphon_quic;
 mod psiphon_rate;
 mod psiphon_replay;
@@ -656,6 +658,7 @@ fn cmd_psiphon_broker<I: Iterator<Item = String>>(args: &mut I) {
 }
 
 fn main() {
+    let _ = browser_dialer::active();
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else {
         serve_from_flags(&[]);

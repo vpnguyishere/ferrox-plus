@@ -100,8 +100,15 @@ struct XmcWriter {
 }
 
 /// A handshake that outlives a peer's interest is a stalled connection, not a slow one; the
-/// reference's own bound is two minutes.
+/// reference's own bound is two minutes, and an admission shortens it to what the lane has left.
 const XMC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The reference's two minutes, unless an admission has less of its budget left to spend.
+fn xmc_deadline(left: Option<Duration>) -> Duration {
+    left.map_or(XMC_HANDSHAKE_TIMEOUT, |left| {
+        left.min(XMC_HANDSHAKE_TIMEOUT)
+    })
+}
 
 /// A read source whose clock can be re-armed for one read, so a handshake can hold a single
 /// deadline across every read it makes instead of restarting a per-read timeout.
@@ -192,7 +199,8 @@ impl XmcState {
             let _ = stream.set_read_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
             let _ = stream.set_write_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
             let result = (|| {
-                let deadline = HandshakeDeadline::begin(XMC_HANDSHAKE_TIMEOUT);
+                let deadline =
+                    HandshakeDeadline::begin(xmc_deadline(crate::budgets::handshake_cap()));
                 let reader = DeadlineReader::new(stream.try_clone()?, deadline.clone());
                 let writer = XmcWriter {
                     stream: stream.try_clone()?,
@@ -3645,5 +3653,20 @@ mod tests {
             "the handshake outlived its one deadline"
         );
         peer.join().expect("joins");
+    }
+
+    /// The login keeps the reference's two minutes on a dial, and an admission shortens it to the
+    /// budget the lane still has.
+    #[test]
+    fn the_xmc_deadline_is_the_smaller_of_two_minutes_and_what_admission_left() {
+        assert_eq!(xmc_deadline(None), XMC_HANDSHAKE_TIMEOUT);
+        assert_eq!(
+            xmc_deadline(Some(Duration::from_secs(5))),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            xmc_deadline(Some(Duration::from_secs(300))),
+            XMC_HANDSHAKE_TIMEOUT
+        );
     }
 }

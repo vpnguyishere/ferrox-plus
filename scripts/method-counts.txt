@@ -752,6 +752,11 @@ front-tun datagram-reply-packets-checksummed 1 ferrox-app-tun::tests::the_reply_
 front-tun datagram-dial-set-flows-matching-the-pinned-stack 5 ferrox-app-tun::tests::the_datagram_dial_set_matches_the_pinned_stream
 front-tun icmp-echo-replies-verified 1 ferrox-app-tun::tests::an_icmp_echo_request_is_answered_as_a_reply
 front-tun icmp-non-echo-messages-refused 3 ferrox-app-tun::tests::a_non_echo_icmp_message_is_refused
+front-tun ipv6-tcp-packets-parsed 1 ferrox-app-tun::tests::an_ipv6_tcp_packet_parses_and_renders_with_its_checksum
+front-tun ipv6-extension-headers-walked 1 ferrox-app-tun::tests::an_ipv6_extension_header_is_walked_to_the_transport
+front-tun icmpv6-echo-replies-verified 1 ferrox-app-tun::tests::a_v6_echo_request_flips_to_a_v6_reply
+front-tun icmp-error-quoted-flows-named 1 ferrox-app-tun::tests::an_icmp_error_quotes_the_flow_it_ends
+front-tun virtio-gso-headers-written 1 ferrox-app-tun::tests::a_virtio_gso_header_names_the_tcp_segment
 front-tun emit-packet-reallocations-per-render 0 ferrox-app-tun::tests::an_emitted_packet_reuses_its_render_buffer
 
 # --- finalmask post-TLS TCP mask chain --------------------------------------

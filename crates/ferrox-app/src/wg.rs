@@ -3208,8 +3208,8 @@ mod tests {
     /// A truncated UDP response retries the same DNS question over TCP on the reserved server port.
     #[test]
     fn a_truncated_answer_is_asked_again_over_tcp() {
-        // The listening transport picks the port: a Windows runner hands out UDP ephemerals that its excluded ranges and TIME_WAIT band hold shut for TCP, which is what ran the sixty tries out, and a port TCP just bound is bindable by definition.
-        let (tcp, udp, dns_address) = (0..64)
+        // The listening transport picks the port: a Windows runner hands out UDP ephemerals that its excluded ranges and TIME_WAIT band hold shut for TCP, which is what ran the retry loop out, and a port TCP just bound is bindable by definition.
+        let (tcp, udp, dns_address) = (0..4096)
             .find_map(|_| {
                 let tcp = TcpListener::bind("127.0.0.1:0").expect("dns tcp");
                 let address = tcp.local_addr().expect("dns address");
@@ -3218,7 +3218,9 @@ mod tests {
                     Err(error)
                         if matches!(
                             error.kind(),
-                            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                            std::io::ErrorKind::AddrInUse
+                                | std::io::ErrorKind::PermissionDenied
+                                | std::io::ErrorKind::AddrNotAvailable
                         ) =>
                     {
                         None

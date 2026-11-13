@@ -1,0 +1,173 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Browser Dialer</title>
+<script>
+"use strict";
+const token = "csrfToken";
+const endpoint = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/websocket?token=${token}`;
+const IDLE = 8;
+const LIVE_MAX = 64;
+const HIGH_WATER = 1 << 20;
+const RECONNECT_MIN = 100;
+const RECONNECT_MAX = 5000;
+let reconnect = RECONNECT_MIN;
+let live = 0;
+
+function initFor(task) {
+  const init = {};
+  const extra = task.extra || {};
+  if (extra.referrer) {
+    try {
+      const url = new URL(extra.referrer);
+      init.referrer = url.pathname + url.search + url.hash;
+      init.referrerPolicy = "unsafe-url";
+    } catch (_) {}
+  }
+  if (extra.headers) init.headers = extra.headers;
+  return init;
+}
+
+async function drain(ws) {
+  while (ws.bufferedAmount > HIGH_WATER) {
+    if (ws.readyState !== WebSocket.OPEN) throw new Error("closed");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function run(ws, task) {
+  if (task.method === "WS") {
+    const extra = task.extra || {};
+    let target;
+    try {
+      target = new WebSocket(task.url, extra.protocol || undefined);
+    } catch (_) {
+      try { ws.send("fail"); } catch (_) {}
+      ws.close();
+      return;
+    }
+    target.binaryType = "arraybuffer";
+    let open = false;
+    ws.onmessage = (event) => {
+      if (target.readyState === WebSocket.OPEN) {
+        try { target.send(event.data); } catch (_) { target.close(); }
+      }
+    };
+    target.onopen = () => { open = true; try { ws.send("ok"); } catch (_) { target.close(); } };
+    target.onmessage = (event) => ws.send(event.data);
+    target.onclose = () => ws.close();
+    target.onerror = () => { if (!open) try { ws.send("fail"); } catch (_) {} target.close(); };
+    ws.onclose = () => { target.close(); closed(ws); };
+    return;
+  }
+
+  if (task.method === "GET" && task.streamResponse) {
+    const init = initFor(task);
+    const abort = new AbortController();
+    let reader = null;
+    let acknowledged = false;
+    init.signal = abort.signal;
+    ws.onclose = () => {
+      try { reader && reader.cancel(); } catch (_) {}
+      try { abort.abort(); } catch (_) {}
+      closed(ws);
+    };
+    try {
+      const response = await fetch(task.url, init);
+      if (!response.ok || !response.body) throw new Error("downlink refused");
+      ws.send("ok");
+      acknowledged = true;
+      reader = response.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (value) {
+          await drain(ws);
+          ws.send(value);
+        }
+        if (done) break;
+      }
+    } catch (_) {
+      if (!acknowledged && ws.readyState === WebSocket.OPEN) {
+        try { ws.send("fail"); } catch (_) {}
+      }
+    } finally {
+      ws.close();
+    }
+    return;
+  }
+
+  if (!task.streamResponse) {
+    const init = initFor(task);
+    init.method = task.method;
+    ws.send("ok");
+    ws.onmessage = async (event) => {
+      try {
+        if (event.data.byteLength > 0) init.body = event.data;
+        const response = await fetch(task.url, init);
+        ws.send(response.ok ? "ok" : "fail");
+      } catch (_) {
+        try { ws.send("fail"); } catch (_) {}
+      } finally {
+        ws.close();
+      }
+    };
+    return;
+  }
+
+  ws.send("fail");
+  ws.close();
+}
+
+function closed(ws) {
+  if (ws.closed) return;
+  ws.closed = true;
+  live -= 1;
+  if (!ws.replaced) respawn();
+}
+
+function respawn() {
+  const wait = reconnect;
+  reconnect = Math.min(reconnect * 2, RECONNECT_MAX);
+  setTimeout(connect, wait);
+}
+
+function connect() {
+  if (live >= LIVE_MAX) return false;
+  let ws;
+  try {
+    ws = new WebSocket(endpoint);
+  } catch (_) {
+    respawn();
+    return false;
+  }
+  live += 1;
+  ws.closed = false;
+  ws.consumed = false;
+  ws.replaced = false;
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { reconnect = RECONNECT_MIN; };
+  ws.onmessage = (event) => {
+    if (ws.consumed) return;
+    ws.consumed = true;
+    ws.replaced = connect();
+    let task;
+    try {
+      task = JSON.parse(event.data);
+    } catch (_) {
+      ws.close();
+      return;
+    }
+    try {
+      const pending = run(ws, task);
+      if (pending && pending.catch) pending.catch(() => ws.close());
+    } catch (_) {
+      try { ws.send("fail"); } catch (_) {}
+      ws.close();
+    }
+  };
+  ws.onclose = () => closed(ws);
+  ws.onerror = () => { try { ws.close(); } catch (_) {} };
+  return true;
+}
+
+for (let i = 0; i < IDLE; i++) connect();
+</script>

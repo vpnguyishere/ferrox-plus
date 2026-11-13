@@ -255,6 +255,7 @@ fn connection(
     if tls.handshake().is_err() {
         return;
     }
+    deadline.arm(Instant::now() + HANDSHAKE);
     if tls.alpn() == Some(b"http/1.1") {
         deadline.clear();
         tls.get_ref().get_ref().set_read_timeout(Some(READ_WAIT));

@@ -663,11 +663,29 @@ impl<R: Read> crate::proxy::WindowRead for WsReader<R> {
 }
 
 impl WsWriter {
+    /// Arm the write side for one bounded task send; `None` hands the socket back to the relay.
+    pub(crate) fn set_write_timeout(&self, timeout: Option<std::time::Duration>) {
+        let Ok(mut stream) = self.shared.stream.lock() else {
+            return;
+        };
+        match timeout {
+            Some(timeout) => stream.arm_write(timeout),
+            None => stream.clear_write_timeout(),
+        }
+    }
+
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return false;
         };
         write_frame(&mut **stream, self.masked, OP_DATA, data)
+    }
+
+    pub(crate) fn send_text(&self, data: &[u8]) -> bool {
+        let Ok(mut stream) = self.shared.stream.lock() else {
+            return false;
+        };
+        write_frame(&mut **stream, self.masked, OP_TEXT, data)
     }
 
     pub(crate) fn push_ready(&self, data: &[u8]) -> crate::proxy::Push {
@@ -841,6 +859,15 @@ fn write_frame(
 pub(crate) fn accept(stream: Connection, path: &str) -> Option<(WsReader, WsWriter)> {
     let mut read = stream;
     let (head, at) = read_head(&mut read)?;
+    accept_head(read, head, at, path)
+}
+
+pub(crate) fn accept_head(
+    mut read: Connection,
+    head: Vec<u8>,
+    at: usize,
+    path: &str,
+) -> Option<(WsReader, WsWriter)> {
     let Upgrade {
         key,
         offered,
