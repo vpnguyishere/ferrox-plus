@@ -368,6 +368,7 @@ pub(crate) fn wake_signal(wake: &WakeWriter) {
 pub(crate) fn wake_signal(_: &WakeWriter) {}
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::needless_pass_by_value)]
 fn send_packets_offset(
     device: Arc<SyncDevice>,
     packets: Receiver<Vec<u8>>,
