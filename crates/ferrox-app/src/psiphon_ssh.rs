@@ -1607,6 +1607,8 @@ pub(crate) struct Identity<'a> {
     pub(crate) split_tunnel_regions: &'a [String],
     pub(crate) api_encoding: ApiEncoding,
     pub(crate) compress_tactics: bool,
+    pub(crate) disable_api: bool,
+    pub(crate) ssh_algorithms: Option<&'a [String; 4]>,
 }
 
 /// The server's handshake reply: new server entries, client region, tactics and steering IP.
@@ -1729,6 +1731,7 @@ impl Session {
             our_version,
             &version,
             &server.host_key,
+            identity.ssh_algorithms,
         )?;
         output.activate(kex.client_cipher.0, kex.client_cipher.1, kex.client_mac);
         input.activate(kex.server_cipher.0, kex.server_cipher.1, kex.server_mac);
@@ -1741,15 +1744,19 @@ impl Session {
             identity.sponsor,
         )?;
         // A Psiphon server refuses every port forward until this handshake completes.
-        let handshake = handshake(
-            &mut output,
-            &mut input,
-            relay_protocol,
-            identity,
-            server.ssh_api,
-            &mut relay,
-            requests.as_deref(),
-        )?;
+        let handshake = if identity.disable_api {
+            HandshakeState::default()
+        } else {
+            handshake(
+                &mut output,
+                &mut input,
+                relay_protocol,
+                identity,
+                server.ssh_api,
+                &mut relay,
+                requests.as_deref(),
+            )?
+        };
         control
             .set_timeout(None)
             .map_err(|error| format!("psiphon ssh socket: {error}"))?;
@@ -3673,21 +3680,25 @@ fn kex(
     client_version: &[u8],
     server_version: &[u8],
     expected_host_key: &[u8],
+    algorithms: Option<&[String; 4]>,
 ) -> Result<Keys, String> {
+    let [kex_name, cipher, mac, host_key] = match algorithms {
+        Some(names) => (*names).clone(),
+        None => [
+            "curve25519-sha256,curve25519-sha256@libssh.org".to_owned(),
+            "aes128-ctr".to_owned(),
+            "hmac-sha2-256".to_owned(),
+            "rsa-sha2-256,rsa-sha2-512,ssh-rsa,ssh-ed25519".to_owned(),
+        ],
+    };
     let mut kexinit = vec![MSG_KEXINIT];
     kexinit.extend_from_slice(&random::<16>());
-    put_name_list(
-        &mut kexinit,
-        b"curve25519-sha256,curve25519-sha256@libssh.org",
-    );
-    put_name_list(
-        &mut kexinit,
-        b"rsa-sha2-256,rsa-sha2-512,ssh-rsa,ssh-ed25519",
-    );
-    put_name_list(&mut kexinit, b"aes128-ctr");
-    put_name_list(&mut kexinit, b"aes128-ctr");
-    put_name_list(&mut kexinit, b"hmac-sha2-256");
-    put_name_list(&mut kexinit, b"hmac-sha2-256");
+    put_name_list(&mut kexinit, kex_name.as_bytes());
+    put_name_list(&mut kexinit, host_key.as_bytes());
+    put_name_list(&mut kexinit, cipher.as_bytes());
+    put_name_list(&mut kexinit, cipher.as_bytes());
+    put_name_list(&mut kexinit, mac.as_bytes());
+    put_name_list(&mut kexinit, mac.as_bytes());
     put_name_list(&mut kexinit, b"none");
     put_name_list(&mut kexinit, b"none");
     put_name_list(&mut kexinit, b"");

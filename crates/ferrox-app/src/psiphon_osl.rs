@@ -217,6 +217,7 @@ impl ServerEvents {
 /// One OSL registry entry: the file ID and the shares that reconstruct its key.
 pub(crate) struct FileSpec {
     pub(crate) id: Vec<u8>,
+    pub(crate) md5: Option<[u8; 16]>,
     shares: KeyShares,
 }
 
@@ -308,7 +309,12 @@ fn parse_file_spec(spec: &Json) -> Option<FileSpec> {
         .and_then(Json::as_str)
         .and_then(|value| ferrox_core::b64::decode(value.as_bytes()))?;
     let shares = parse_key_shares(spec.get("KeyShares")?)?;
-    Some(FileSpec { id, shares })
+    let md5 = spec
+        .get("MD5Sum")
+        .and_then(Json::as_str)
+        .and_then(|value| ferrox_core::b64::decode(value.as_bytes()))
+        .and_then(|value| value.try_into().ok());
+    Some(FileSpec { id, md5, shares })
 }
 
 fn parse_key_shares(shares: &Json) -> Option<KeyShares> {
@@ -501,6 +507,19 @@ mod tests {
             & 0o777;
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn a_registry_file_spec_carries_its_md5_sum() {
+        let md5 = ferrox_core::b64::encode(&[7u8; 16]);
+        let text = format!(
+            r#"{{"ID":"AQ==","MD5Sum":"{md5}","KeyShares":{{"Threshold":1,"BoxedShares":["Ag=="],"SLOKIDs":["Aw=="]}}}}"#
+        );
+        let spec = parse_file_spec(&json::parse(&text).expect("spec")).expect("file spec");
+        assert_eq!(spec.md5, Some([7u8; 16]));
+        let text = r#"{"ID":"AQ==","KeyShares":{"Threshold":1,"BoxedShares":["Ag=="],"SLOKIDs":["Aw=="]}}"#;
+        let spec = parse_file_spec(&json::parse(text).expect("spec")).expect("file spec");
+        assert_eq!(spec.md5, None);
     }
 
     #[test]

@@ -957,6 +957,7 @@ struct Inner {
     requests: Arc<crate::psiphon_osl::ServerEvents>,
     osl_seeded: Arc<AtomicBool>,
     last_osl: Mutex<Option<Instant>>,
+    last_osl_failure: Mutex<Option<Instant>>,
     sessions: Mutex<Vec<Arc<Session>>>,
     next_session: AtomicUsize,
     affinity: Mutex<Option<(String, u16)>>,
@@ -1184,8 +1185,12 @@ struct Settings {
     server_lists_explicit: bool,
     remote_fetch_disabled: bool,
     server_list_key: String,
-    osl_roots: Vec<String>,
+    osl_roots: Vec<TransferRoot>,
     remote_list_key: String,
+    remote_list_retry: Duration,
+    limit_cpu: bool,
+    disable_api: bool,
+    ssh_algorithms: Option<[String; 4]>,
     emit_sloks: bool,
     emit_server_alerts: bool,
     headers: Vec<(String, String)>,
@@ -1249,6 +1254,14 @@ impl FrontedOverride {
         ) && regex_matches_any(&self.match_dials, &dials)
             && regex_matches_any(&self.match_hosts, &[meek.host.as_str()])
     }
+}
+
+/// One `ObfuscatedServerListRootURLs` entry: a base URL and its per-URL transfer policy.
+#[derive(Debug, Clone)]
+struct TransferRoot {
+    url: String,
+    skip_verify: bool,
+    headers: Vec<(String, String)>,
 }
 
 fn regex_matches_any(patterns: &[regex::Regex], values: &[&str]) -> bool {
@@ -1342,6 +1355,7 @@ impl PsiphonOut {
             requests,
             osl_seeded,
             last_osl: Mutex::new(None),
+            last_osl_failure: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
@@ -1672,6 +1686,8 @@ impl Inner {
             let limit_meek_buffers = self.settings.limit_meek_buffers;
             let tls_shape = self.settings.tls_shape.clone();
             let burst = self.settings.burst;
+            let disable_api = self.settings.disable_api;
+            let ssh_algorithms = self.settings.ssh_algorithms.clone();
             let config_state = self.config_state;
             let replay = Arc::clone(&self.replay);
             let conduit =
@@ -1712,6 +1728,8 @@ impl Inner {
                     split_tunnel_regions: &split_tunnel_regions,
                     api_encoding,
                     compress_tactics,
+                    disable_api,
+                    ssh_algorithms: ssh_algorithms.as_ref(),
                 };
                 match Session::connect(
                     selected,
@@ -2091,7 +2109,7 @@ impl Inner {
     /// Fill the configured pool a batch of tunnels at a time, so a wide pool costs
     /// one handshake window instead of one per tunnel.
     fn fill(self: &Arc<Self>) -> Result<(), String> {
-        const FILL_WORKERS: usize = 8;
+        let fill_workers = if self.settings.limit_cpu { 1 } else { 8 };
         self.replay.start_pass();
         let mut first_round = true;
         loop {
@@ -2115,7 +2133,7 @@ impl Inner {
                 self.remember(session.server());
                 continue;
             }
-            let width = missing.min(FILL_WORKERS);
+            let width = missing.min(fill_workers);
             let (base, lead) = self.start();
             let count = lock(&self.entries).len();
             if count == 0 {
@@ -2164,6 +2182,12 @@ impl Inner {
             return;
         }
         let forced = self.osl_seeded.swap(false, Ordering::AcqRel);
+        let failed = lock(&self.last_osl_failure);
+        let retry = self.settings.remote_list_retry;
+        if !forced && failed.is_some_and(|at| retry > Duration::ZERO && at.elapsed() < retry) {
+            return;
+        }
+        drop(failed);
         let mut last = lock(&self.last_osl);
         if !forced && last.is_some_and(|at| at.elapsed() < OSL_REFRESH) {
             return;
@@ -2172,12 +2196,16 @@ impl Inner {
         drop(last);
         match fetch_osl_entries(&self.settings, &self.sloks) {
             Ok(entries) => {
+                *lock(&self.last_osl_failure) = None;
                 let added = self.add_entries(entries);
                 if added > 0 {
                     eprintln!("psiphon: imported {added} obfuscated server entries");
                 }
             }
-            Err(why) => eprintln!("psiphon: {why}"),
+            Err(why) => {
+                *lock(&self.last_osl_failure) = Some(Instant::now());
+                eprintln!("psiphon: {why}");
+            }
         }
     }
 
@@ -3420,6 +3448,11 @@ impl Settings {
         let aggressive = aggressive_setting.unwrap_or(selection.is_some())
             || env_flag("AETHER_PSIPHON_BEAST")
             || env_flag("AETHER_PSIPHON_AGGRESSIVE");
+        let limit_cpu = flag(
+            settings,
+            "LimitCPUThreads",
+            "AETHER_PSIPHON_LIMIT_CPU_THREADS",
+        );
         let workers = number(settings, "ConnectionWorkerPoolSize")
             .or_else(|| env("AETHER_PSIPHON_WORKERS").and_then(|value| value.parse().ok()))
             .unwrap_or(DIAL_WORKERS as u64)
@@ -3443,10 +3476,15 @@ impl Settings {
         } else {
             workers
         };
+        let workers = if limit_cpu { 1 } else { workers };
         let intensive_workers = number(settings, "LimitIntensiveConnectionWorkers")
             .unwrap_or(0)
-            .min(u64::try_from(workers).unwrap_or(u64::MAX))
-            as usize;
+            .min(u64::try_from(workers).unwrap_or(u64::MAX));
+        let intensive_workers = if limit_cpu {
+            1
+        } else {
+            intensive_workers as usize
+        };
         let stagger = Duration::from_millis(
             number(settings, "StaggerConnectionWorkersMilliseconds")
                 .or_else(|| env("AETHER_PSIPHON_STAGGER_MS").and_then(|value| value.parse().ok()))
@@ -3545,6 +3583,22 @@ impl Settings {
                 return Err(format!("psiphon: invalid TargetAPIEncoding {other:?}"));
             }
         };
+        let remote_list_retry = Duration::from_millis(
+            number(settings, "FetchRemoteServerListRetryPeriodMilliseconds")
+                .unwrap_or(0)
+                .min(3_600_000),
+        );
+        let disable_api = flag(settings, "DisableApi", "AETHER_PSIPHON_DISABLE_API");
+        let ssh_algorithms = ssh_algorithms(settings);
+        match text(settings, "TargetAPIProtocol").as_deref() {
+            None | Some("ssh") => {}
+            Some("web") => {
+                eprintln!("psiphon: TargetAPIProtocol web is not carried; using the ssh API");
+            }
+            Some(other) => {
+                return Err(format!("psiphon: invalid TargetAPIProtocol {other:?}"));
+            }
+        }
         let light = light_settings(
             settings,
             &tls_shape,
@@ -3680,6 +3734,10 @@ impl Settings {
                 .or_else(|| text(settings, "remoteServerListSignaturePublicKey"))
                 .or_else(|| env("AETHER_PSIPHON_REMOTE_LIST_KEY"))
                 .unwrap_or_else(|| ferrox_core::psiphon::SERVER_LIST_SIGNATURE_KEY.to_owned()),
+            remote_list_retry,
+            limit_cpu,
+            disable_api,
+            ssh_algorithms,
             emit_sloks: flag(settings, "EmitSLOKs", "AETHER_PSIPHON_EMIT_SLOKS"),
             emit_server_alerts: flag(
                 settings,
@@ -4888,14 +4946,128 @@ fn string_list(settings: Option<&Json>, key: &str) -> Vec<String> {
 }
 
 /// The OSL roots, preferring the plural list and falling back to the legacy single URL.
-fn osl_roots(settings: Option<&Json>) -> Vec<String> {
-    let mut roots = json_list(settings, "ObfuscatedServerListRootURLs");
+fn osl_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
+    let global = custom_headers(settings);
+    let mut roots = Vec::new();
+    if let Some(Json::Arr(items)) = settings.and_then(|settings| {
+        settings
+            .get("ObfuscatedServerListRootURLs")
+            .or_else(|| settings.get("obfuscatedServerListRootURLs"))
+    }) {
+        for item in items {
+            match item {
+                Json::Str(value) => {
+                    if let Some(url) = transfer_url(value) {
+                        roots.push(TransferRoot {
+                            url,
+                            skip_verify: false,
+                            headers: global.clone(),
+                        });
+                    }
+                }
+                Json::Obj(fields) => {
+                    let url = fields
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("URL"))
+                        .and_then(|(_, value)| value.as_str())
+                        .and_then(transfer_url);
+                    let Some(url) = url else {
+                        eprintln!("psiphon: ObfuscatedServerListRootURLs entry names no URL");
+                        continue;
+                    };
+                    let skip_verify = fields
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("SkipVerify"))
+                        .and_then(|(_, value)| value.as_bool())
+                        .unwrap_or(false);
+                    let local = fields
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("RequestHeaders"))
+                        .map(|(_, value)| header_fields(value))
+                        .unwrap_or_default();
+                    let mut headers = global.clone();
+                    headers.retain(|(name, _)| {
+                        !local
+                            .iter()
+                            .any(|(added, _)| added.eq_ignore_ascii_case(name))
+                    });
+                    headers.extend(local);
+                    roots.push(TransferRoot {
+                        url,
+                        skip_verify,
+                        headers,
+                    });
+                }
+                _ => eprintln!("psiphon: ObfuscatedServerListRootURLs entry is not an object"),
+            }
+        }
+    }
     if roots.is_empty() {
         if let Some(root) = text(settings, "ObfuscatedServerListRootURL") {
-            roots.push(list_url(root.trim()));
+            if let Some(url) = transfer_url(root.trim()) {
+                roots.push(TransferRoot {
+                    url,
+                    skip_verify: false,
+                    headers: global,
+                });
+            }
         }
     }
     roots
+}
+
+/// A TransferURL's URL is base64 encoded; plain HTTPS URLs are accepted for existing configs.
+fn transfer_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.starts_with("https://") || value.starts_with("http://") {
+        return Some(list_url(value));
+    }
+    let decoded = ferrox_core::b64::decode(value.as_bytes())?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    (decoded.starts_with("https://") || decoded.starts_with("http://")).then(|| list_url(&decoded))
+}
+
+/// `ObfuscatedSSHAlgorithms` is [kex, cipher, mac, host key]; names this engine cannot carry keep the defaults.
+fn ssh_algorithms(settings: Option<&Json>) -> Option<[String; 4]> {
+    let names = string_list(settings, "ObfuscatedSSHAlgorithms");
+    if names.is_empty() {
+        return None;
+    }
+    let Ok([kex, cipher, mac, host]): Result<[String; 4], _> = names.try_into() else {
+        eprintln!("psiphon: ObfuscatedSSHAlgorithms needs four names; using the defaults");
+        return None;
+    };
+    let supported: [&[&str]; 4] = [
+        &["curve25519-sha256", "curve25519-sha256@libssh.org"],
+        &["aes128-ctr"],
+        &["hmac-sha2-256"],
+        &["rsa-sha2-256", "rsa-sha2-512", "ssh-rsa", "ssh-ed25519"],
+    ];
+    for (name, allowed) in [&kex, &cipher, &mac, &host].into_iter().zip(supported) {
+        if !allowed.contains(&name.as_str()) {
+            eprintln!("psiphon: ObfuscatedSSHAlgorithms {name} is not carried; using the defaults");
+            return None;
+        }
+    }
+    Some([kex, cipher, mac, host])
+}
+
+fn header_fields(value: &Json) -> Vec<(String, String)> {
+    let Json::Obj(fields) = value else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .flat_map(|(name, value)| match value {
+            Json::Str(text) => vec![(name.clone(), text.clone())],
+            Json::Arr(items) => items
+                .iter()
+                .filter_map(Json::as_str)
+                .map(|text| (name.clone(), text.to_owned()))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
 }
 
 /// Split-tunnel regions are ISO 3166-1 alpha-2 codes; accept either case and drop duplicates.
@@ -4916,6 +5088,9 @@ fn custom_headers(settings: Option<&Json>) -> Vec<(String, String)> {
     let mut headers = header_map(settings, "CustomHeaders");
     if headers.is_empty() {
         headers = header_map(settings, "customHeaders");
+    }
+    if headers.is_empty() {
+        headers = header_map(settings, "UpstreamProxyCustomHeaders");
     }
     merge_headers(headers, header_map(settings, "AdditionalCustomHeaders"))
 }
@@ -5023,7 +5198,10 @@ const KNOWN_SETTINGS: &[&str] = &[
     "serverListSignaturePublicKey",
     "remoteServerListSignaturePublicKey",
     "RemoteServerListSignaturePublicKey",
+    "ServerEntrySignaturePublicKey",
+    "FetchRemoteServerListRetryPeriodMilliseconds",
     "ObfuscatedServerListRootURLs",
+    "obfuscatedServerListRootURLs",
     "ObfuscatedServerListRootURL",
     "EmitSLOKs",
     "EmitServerAlerts",
@@ -5070,6 +5248,8 @@ const KNOWN_SETTINGS: &[&str] = &[
     "upstream",
     "UpstreamProxyURL",
     "UpstreamProxyUrl",
+    "UpstreamProxyCustomHeaders",
+    "UpstreamProxyAllowAllServerEntrySources",
     "protocolSelection",
     "beastMode",
     "AggressiveEstablishment",
@@ -5079,6 +5259,7 @@ const KNOWN_SETTINGS: &[&str] = &[
     "ConnectionWorkerPoolSize",
     "ConnectionWorkerPoolMaxSize",
     "LimitIntensiveConnectionWorkers",
+    "LimitCPUThreads",
     "DisableConnectionWorkerPool",
     "EstablishTunnelTimeoutSeconds",
     "TunnelConnectTimeoutSeconds",
@@ -5239,6 +5420,9 @@ const KNOWN_SETTINGS: &[&str] = &[
     "TrustedCACertificatesFilename",
     "TLSFragmentClientHelloProbability",
     "TargetAPIEncoding",
+    "TargetAPIProtocol",
+    "ClientAPILevel",
+    "DisableApi",
     "TLSFragmentClientHelloLimitProtocols",
     "PickUserAgentProbability",
     "QUICDialEarlyProbability",
@@ -5276,6 +5460,7 @@ const KNOWN_SETTINGS: &[&str] = &[
     "FrontedHTTPProtocolTransformProbability",
     "FrontedHTTPProtocolTransformScopedSpecNames",
     "FrontedHTTPProtocolTransformSpecs",
+    "ObfuscatedSSHAlgorithms",
     "ObfuscatedSSHMinPadding",
     "ObfuscatedSSHMaxPadding",
     "RateLimits",
@@ -5781,6 +5966,8 @@ pub(crate) fn broker_offer(
         split_tunnel_regions: &settings.split_tunnel_regions,
         api_encoding: settings.api_encoding,
         compress_tactics: settings.compress_tactics,
+        disable_api: settings.disable_api,
+        ssh_algorithms: settings.ssh_algorithms.as_ref(),
     };
     let fronts = broker_fronts(broker);
     if fronts.is_empty() {
@@ -5876,6 +6063,8 @@ fn fetch_tactics_from(
         split_tunnel_regions: &settings.split_tunnel_regions,
         api_encoding: settings.api_encoding,
         compress_tactics: settings.compress_tactics,
+        disable_api: settings.disable_api,
+        ssh_algorithms: settings.ssh_algorithms.as_ref(),
     };
     let timing = tactics_timing(settings.raw.as_ref());
     let timeout = timing.timeout.unwrap_or(settings.ready);
@@ -8052,6 +8241,20 @@ fn fetch_bytes(
     roots: &crate::psiphon_ssh::TlsRoots,
     insecure: bool,
 ) -> Result<Vec<u8>, String> {
+    let reply = fetch_reply(url, custom, roots, insecure, &[])?;
+    if reply.status != 200 {
+        return Err(format!("psiphon: {url}: HTTP {}", reply.status));
+    }
+    Ok(reply.body)
+}
+
+fn fetch_reply(
+    url: &str,
+    custom: &[(String, String)],
+    roots: &crate::psiphon_ssh::TlsRoots,
+    insecure: bool,
+    extra: &[(&str, &str)],
+) -> Result<crate::foxy_account::Reply, String> {
     let roots = if insecure {
         Vec::new().into()
     } else {
@@ -8060,18 +8263,84 @@ fn fetch_bytes(
     let endpoint = crate::foxy_account::Endpoint::parse(url, roots)
         .ok_or_else(|| format!("psiphon: {url} is not https"))?
         .with_insecure(insecure);
-    let mut headers: Vec<(&str, &str)> = Vec::with_capacity(custom.len() + 1);
+    let mut headers: Vec<(&str, &str)> = Vec::with_capacity(custom.len() + extra.len() + 1);
     headers.push(("Accept", "*/*"));
     headers.extend(
         custom
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str())),
     );
-    let reply = crate::foxy_account::ask(&endpoint, "GET", &endpoint.url(""), &headers, &[])?;
-    if reply.status != 200 {
-        return Err(format!("psiphon: {url}: HTTP {}", reply.status));
+    headers.extend_from_slice(extra);
+    crate::foxy_account::ask(&endpoint, "GET", &endpoint.url(""), &headers, &[])
+}
+
+/// A URL's cached body and ETag, keyed by its own identity under the lane's state directory.
+#[derive(Clone, Copy)]
+struct CacheSlot<'a> {
+    dir: &'a Path,
+    key: &'a str,
+}
+
+impl CacheSlot<'_> {
+    fn path(self, suffix: &str) -> PathBuf {
+        let digest = Sha256::digest(self.key.as_bytes());
+        self.dir.join(format!("{}.{suffix}", hex(&digest)))
     }
-    Ok(reply.body)
+
+    fn body(self) -> Option<Vec<u8>> {
+        std::fs::read(self.path("body")).ok()
+    }
+
+    fn save(self, body: &[u8], etag: Option<&str>) {
+        if std::fs::create_dir_all(self.dir).is_err() {
+            return;
+        }
+        let _ = std::fs::write(self.path("body"), body);
+        match etag.filter(|etag| !etag.is_empty()) {
+            Some(etag) => {
+                let _ = std::fs::write(self.path("etag"), etag);
+            }
+            None => {
+                let _ = std::fs::remove_file(self.path("etag"));
+            }
+        }
+    }
+
+    fn etag(self) -> Option<String> {
+        std::fs::read_to_string(self.path("etag"))
+            .ok()
+            .filter(|etag| !etag.is_empty())
+    }
+}
+
+/// Fetch a URL, honouring its ETag: a 304 reuses the cached body instead of downloading it again.
+fn fetch_cached(
+    url: &str,
+    headers: &[(String, String)],
+    roots: &crate::psiphon_ssh::TlsRoots,
+    insecure: bool,
+    cache: Option<CacheSlot<'_>>,
+) -> Result<Vec<u8>, String> {
+    let cached = cache.and_then(CacheSlot::body);
+    let etag = cached
+        .as_ref()
+        .and_then(|_| cache.and_then(CacheSlot::etag));
+    let conditional = etag
+        .as_deref()
+        .map(|etag| ("If-None-Match", etag))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let reply = fetch_reply(url, headers, roots, insecure, &conditional)?;
+    match reply.status {
+        200 => {
+            if let Some(cache) = cache {
+                cache.save(&reply.body, reply.header("ETag"));
+            }
+            Ok(reply.body)
+        }
+        304 => cached.ok_or_else(|| format!("psiphon: {url}: HTTP 304 without a cached body")),
+        status => Err(format!("psiphon: {url}: HTTP {status}")),
+    }
 }
 
 /// Download, authenticate and decrypt every seeded OSL under the configured roots.
@@ -8083,13 +8352,20 @@ fn fetch_osl_entries(
     let mut servers = Vec::new();
     let mut seen = HashSet::new();
     let mut last = String::new();
+    let cache_dir = settings.state.join("osl-cache");
+    let cache_enabled = state_is_ours(&settings.state);
     for root in &settings.osl_roots {
-        let root = root.trim_end_matches('/');
-        let registry = match fetch_bytes(
-            &format!("{root}/osl-registry"),
-            &settings.headers,
+        let base = root.url.trim_end_matches('/');
+        let registry_cache = cache_enabled.then(|| CacheSlot {
+            dir: &cache_dir,
+            key: base,
+        });
+        let registry = match fetch_cached(
+            &format!("{base}/osl-registry"),
+            &root.headers,
             &settings.tls_shape.roots,
-            settings.tls_shape.disable_system_root_cas,
+            root.skip_verify,
+            registry_cache,
         ) {
             Ok(body) => body,
             Err(why) => {
@@ -8108,19 +8384,38 @@ fn fetch_osl_entries(
             if !spec.seeded(&lookup) {
                 continue;
             }
-            let url = format!("{root}/osl-{}", hex(&spec.id));
-            let body = match fetch_bytes(
-                &url,
-                &settings.headers,
-                &settings.tls_shape.roots,
-                settings.tls_shape.disable_system_root_cas,
-            ) {
-                Ok(body) => body,
-                Err(why) => {
-                    last = why;
-                    continue;
+            let key = format!("{base}/osl-{}", hex(&spec.id));
+            let slot = cache_enabled.then(|| CacheSlot {
+                dir: &cache_dir,
+                key: &key,
+            });
+            let cached = slot.and_then(CacheSlot::body);
+            let fresh = cached
+                .as_ref()
+                .is_some_and(|body| spec.md5.is_some_and(|md5| md5::compute(body).0 == md5));
+            let body = if fresh {
+                cached.unwrap_or_default()
+            } else {
+                match fetch_cached(
+                    &key,
+                    &root.headers,
+                    &settings.tls_shape.roots,
+                    root.skip_verify,
+                    slot,
+                ) {
+                    Ok(body) => body,
+                    Err(why) => {
+                        last = why;
+                        continue;
+                    }
                 }
             };
+            if let Some(md5) = spec.md5 {
+                if md5::compute(&body).0 != md5 {
+                    last = format!("psiphon: {key}: MD5 sum does not match");
+                    continue;
+                }
+            }
             match crate::psiphon_osl::decrypt_osl(&body, &spec, &lookup, &settings.remote_list_key)
             {
                 Ok(text) => absorb(
@@ -10731,13 +11026,53 @@ mod tests {
             r#"{{"ObfuscatedServerListRootURLs":[{{"URL":"{encoded}"}},{{"URL":"https://plain.example"}}]}}"#
         );
         let settings = json::parse(&text).expect("settings");
-        assert_eq!(
-            osl_roots(Some(&settings)),
-            ["https://osl.example/root", "https://plain.example"]
-        );
+        let roots = osl_roots(Some(&settings));
+        let urls: Vec<&str> = roots.iter().map(|root| root.url.as_str()).collect();
+        assert_eq!(urls, ["https://osl.example/root", "https://plain.example"]);
+        assert!(!roots[0].skip_verify);
         let settings = json::parse(r#"{"ObfuscatedServerListRootURL":"https://legacy.example"}"#)
             .expect("settings");
-        assert_eq!(osl_roots(Some(&settings)), ["https://legacy.example"]);
+        assert_eq!(osl_roots(Some(&settings))[0].url, "https://legacy.example");
+    }
+
+    #[test]
+    fn transfer_root_carries_per_url_headers_and_skip_verify() {
+        let settings = json::parse(
+            r#"{"CustomHeaders":{"X-Global":"g","X-Both":"global"},"ObfuscatedServerListRootURLs":[{"URL":"https://osl.example","SkipVerify":true,"RequestHeaders":{"X-Both":["local"],"X-Local":"v"}}]}"#,
+        )
+        .expect("settings");
+        let roots = osl_roots(Some(&settings));
+        assert!(roots[0].skip_verify);
+        assert_eq!(
+            roots[0].headers,
+            [
+                ("X-Global".to_owned(), "g".to_owned()),
+                ("X-Both".to_owned(), "local".to_owned()),
+                ("X-Local".to_owned(), "v".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_algorithms_accept_only_the_names_this_engine_carries() {
+        let settings = json::parse(
+            r#"{"ObfuscatedSSHAlgorithms":["curve25519-sha256","aes128-ctr","hmac-sha2-256","ssh-ed25519"]}"#,
+        )
+        .expect("settings");
+        assert_eq!(
+            ssh_algorithms(Some(&settings)),
+            Some([
+                "curve25519-sha256".to_owned(),
+                "aes128-ctr".to_owned(),
+                "hmac-sha2-256".to_owned(),
+                "ssh-ed25519".to_owned()
+            ])
+        );
+        let settings = json::parse(
+            r#"{"ObfuscatedSSHAlgorithms":["diffie-hellman-group14-sha256","aes128-ctr","hmac-sha2-256","ssh-ed25519"]}"#,
+        )
+        .expect("settings");
+        assert_eq!(ssh_algorithms(Some(&settings)), None);
     }
 
     #[test]
@@ -12482,6 +12817,7 @@ mod tests {
             }),
             osl_seeded: Arc::new(AtomicBool::new(false)),
             last_osl: Mutex::new(None),
+            last_osl_failure: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
@@ -12543,6 +12879,7 @@ mod tests {
             }),
             osl_seeded: Arc::new(AtomicBool::new(false)),
             last_osl: Mutex::new(None),
+            last_osl_failure: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
@@ -13066,6 +13403,7 @@ mod tests {
             }),
             osl_seeded: Arc::new(AtomicBool::new(false)),
             last_osl: Mutex::new(None),
+            last_osl_failure: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(Some(affinity.clone())),

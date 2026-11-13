@@ -421,6 +421,8 @@ mod tests {
             split_tunnel_regions: &[],
             api_encoding: crate::psiphon_ssh::ApiEncoding::Json,
             compress_tactics: false,
+            disable_api: false,
+            ssh_algorithms: None,
         };
         assert!(api_params(&identity, false).contains(r#""authorizations":["a\"b"]"#));
         assert!(api_params(&identity, true).contains(r#""psiphon_api_response_version":"1""#));
