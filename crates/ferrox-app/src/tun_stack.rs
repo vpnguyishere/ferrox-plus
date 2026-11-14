@@ -334,7 +334,7 @@ fn send_loop(
             return;
         };
         static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        if SEEN.fetch_add(1, Ordering::Relaxed) < 5 {
+        if packet.len() > headroom + 100 && SEEN.fetch_add(1, Ordering::Relaxed) < 20 {
             let header = VirtioNetHdr::decode(&packet[..headroom]);
             eprintln!(
                 "send len={} gso={} header={:?} front={:02x?}",
