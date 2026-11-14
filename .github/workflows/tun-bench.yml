@@ -6,7 +6,7 @@ on:
       engines:
         description: Space-separated engines
         type: string
-        default: "ferrox zeptun-userspace zeptun-hybrid hev tun2socks singbox-system"
+        default: "ferrox ferrox-native zeptun-userspace zeptun-hybrid hev tun2socks singbox-system"
       scenarios:
         description: Space-separated scenarios
         type: string

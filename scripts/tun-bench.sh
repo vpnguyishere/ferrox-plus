@@ -32,7 +32,7 @@ MTU=${MTU:-1500}
 SETTLE=${SETTLE:-3}
 CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-$((DURATION + 20))}
 PROBE_SECONDS=${PROBE_SECONDS:-1}
-ENGINES=${ENGINES:-"ferrox zeptun-userspace zeptun-hybrid hev tun2socks singbox-system"}
+ENGINES=${ENGINES:-"ferrox ferrox-native zeptun-userspace zeptun-hybrid hev tun2socks singbox-system"}
 SCENARIOS=${SCENARIOS:-"tcp-up-1 tcp-up-10 tcp-down-1 tcp-down-10 rr rr-8x1k udp-100k"}
 
 VETH_CLIENT=192.168.77.1
@@ -228,6 +228,7 @@ start_engine() {
     remove_routes
     case "$engine" in
         ferrox) start_ferrox smoltcp ;;
+        ferrox-native) start_ferrox loopback ;;
         ferrox-userspace) start_ferrox userspace ;;
         ferrox-system) start_ferrox system ;;
         ferrox-hybrid) start_ferrox hybrid ;;
