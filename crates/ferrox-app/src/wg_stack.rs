@@ -134,6 +134,21 @@ pub(crate) struct Packet {
     pub(crate) at: usize,
 }
 
+/// A pool of transmit slots: the stack builds each segment in a slot the writer
+/// returns, so GRO can extend it without allocating and the writer never copies.
+pub(crate) struct TxPool {
+    free: Receiver<Vec<u8>>,
+    buffers: Vec<Vec<u8>>,
+}
+
+impl TxPool {
+    pub(crate) fn new(count: usize, capacity: usize) -> (Self, SyncSender<Vec<u8>>) {
+        let (sender, free) = mpsc::sync_channel(count);
+        let buffers = (0..count).map(|_| Vec::with_capacity(capacity)).collect();
+        (Self { free, buffers }, sender)
+    }
+}
+
 /// One local stream the client asks the stack to connect.
 pub(crate) struct ClientFlow {
     pub(crate) client: Connection,
@@ -155,6 +170,7 @@ struct QueueDevice {
     headroom: usize,
     recycle: Option<Sender<Vec<u8>>>,
     tun_recycle: Option<SyncSender<Vec<u8>>>,
+    tx_pool: Option<TxPool>,
 }
 
 impl QueueDevice {
@@ -167,6 +183,7 @@ impl QueueDevice {
             headroom,
             recycle: None,
             tun_recycle: None,
+            tx_pool: None,
         }
     }
 
@@ -240,6 +257,7 @@ impl Drop for QueueRx {
 struct QueueTx<'a> {
     tx: &'a mut VecDeque<Vec<u8>>,
     headroom: usize,
+    pool: Option<&'a mut TxPool>,
 }
 
 /// Build an outgoing segment in one buffer with its tunnel headroom reserved.
@@ -249,7 +267,12 @@ impl TxToken for QueueTx<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = Vec::with_capacity(self.headroom + len + WG_TAG_SIZE);
+        let mut buffer = self
+            .pool
+            .as_mut()
+            .and_then(|pool| pool.buffers.pop())
+            .unwrap_or_else(|| Vec::with_capacity(self.headroom + len + WG_TAG_SIZE));
+        buffer.clear();
         buffer.resize(self.headroom + len, 0);
         let answer = f(&mut buffer[self.headroom..]);
         self.tx.push_back(buffer);
@@ -270,6 +293,11 @@ impl Device for QueueDevice {
     /// Pop one queued packet and offer its slot to smoltcp.
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let (buffer, at) = self.rx.pop_front()?;
+        if let Some(pool) = &mut self.tx_pool {
+            while let Ok(buffer) = pool.free.try_recv() {
+                pool.buffers.push(buffer);
+            }
+        }
         Some((
             QueueRx {
                 buffer,
@@ -288,15 +316,22 @@ impl Device for QueueDevice {
             QueueTx {
                 tx: &mut self.tx,
                 headroom: self.headroom,
+                pool: self.tx_pool.as_mut(),
             },
         ))
     }
 
     /// Offer a token that appends one segment to the transmit queue.
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        if let Some(pool) = &mut self.tx_pool {
+            while let Ok(buffer) = pool.free.try_recv() {
+                pool.buffers.push(buffer);
+            }
+        }
         Some(QueueTx {
             tx: &mut self.tx,
             headroom: self.headroom,
+            pool: self.tx_pool.as_mut(),
         })
     }
 
@@ -1324,10 +1359,11 @@ pub(crate) fn serve_tun_device(
     out: Outbound,
     recycle: Option<SyncSender<Vec<u8>>>,
     headroom: usize,
+    tx_pool: Option<TxPool>,
     wake: std::os::unix::net::UnixStream,
     failed: Arc<AtomicBool>,
 ) {
-    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, headroom);
+    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, headroom, tx_pool);
     stack.device.tun_recycle = recycle;
     let _ = wake.set_nonblocking(true);
     loop {
@@ -1368,9 +1404,10 @@ pub(crate) fn serve_tun_device(
     out: Outbound,
     recycle: Option<SyncSender<Vec<u8>>>,
     headroom: usize,
+    tx_pool: Option<TxPool>,
     failed: Arc<AtomicBool>,
 ) {
-    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, headroom);
+    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, headroom, tx_pool);
     stack.device.tun_recycle = recycle;
     loop {
         if failed.load(Ordering::Relaxed) {
@@ -1773,8 +1810,11 @@ impl ServerStack {
         to_tunnel: impl Into<ToTunnel>,
         out: Outbound,
         headroom: usize,
+        tx_pool: Option<TxPool>,
     ) -> Self {
-        Self::with_mtu(config, to_tunnel, out, headroom, config.mtu, config.mtu)
+        let mut stack = Self::with_mtu(config, to_tunnel, out, headroom, config.mtu, config.mtu);
+        stack.device.tx_pool = tx_pool;
+        stack
     }
 
     fn with_mtu(
