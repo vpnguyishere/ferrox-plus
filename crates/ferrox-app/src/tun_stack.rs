@@ -214,7 +214,14 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
     });
     let send_device = Arc::clone(&device);
     thread::spawn(move || {
-        send_loop(send_device, writes, offload, headroom, tx_free.as_ref(), &failed);
+        send_loop(
+            send_device,
+            writes,
+            offload,
+            headroom,
+            tx_free.as_ref(),
+            &failed,
+        );
     });
     let mtu = spec.mtu();
     thread::spawn(move || recv_loop(device, packets, reused, mtu, headroom, wake_write));
