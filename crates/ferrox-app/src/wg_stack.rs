@@ -141,10 +141,14 @@ pub(crate) struct TxPool {
     buffers: Vec<Vec<u8>>,
 }
 
+/// The most slots one stack keeps for a TUN writer; a burst wider than this
+/// allocates a slot and lets the extra one fall away, so memory stays bounded.
+const TX_POOL_MAX: usize = 128;
+
 #[cfg(target_os = "linux")]
 impl TxPool {
-    pub(crate) fn new(count: usize, capacity: usize) -> (Self, SyncSender<Vec<u8>>) {
-        let (sender, free) = mpsc::sync_channel(count);
+    pub(crate) fn new(count: usize, capacity: usize, slots: usize) -> (Self, SyncSender<Vec<u8>>) {
+        let (sender, free) = mpsc::sync_channel(slots);
         let buffers = (0..count).map(|_| Vec::with_capacity(capacity)).collect();
         (Self { free, buffers }, sender)
     }
@@ -185,6 +189,17 @@ impl QueueDevice {
             recycle: None,
             tun_recycle: None,
             tx_pool: None,
+        }
+    }
+
+    /// Take back every slot the writer finished with, up to the pool's bound.
+    fn refill_tx(&mut self) {
+        if let Some(pool) = &mut self.tx_pool {
+            while let Ok(buffer) = pool.free.try_recv() {
+                if pool.buffers.len() < TX_POOL_MAX {
+                    pool.buffers.push(buffer);
+                }
+            }
         }
     }
 
@@ -268,11 +283,14 @@ impl TxToken for QueueTx<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = self
-            .pool
-            .as_mut()
-            .and_then(|pool| pool.buffers.pop())
-            .unwrap_or_else(|| Vec::with_capacity(self.headroom + len + WG_TAG_SIZE));
+        let headroom = self.headroom;
+        let mut buffer = match self.pool.as_mut() {
+            Some(pool) => pool
+                .buffers
+                .pop()
+                .unwrap_or_else(|| Vec::with_capacity(headroom + 65_535)),
+            None => Vec::with_capacity(headroom + len + WG_TAG_SIZE),
+        };
         buffer.clear();
         buffer.resize(self.headroom + len, 0);
         let answer = f(&mut buffer[self.headroom..]);
@@ -294,11 +312,7 @@ impl Device for QueueDevice {
     /// Pop one queued packet and offer its slot to smoltcp.
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let (buffer, at) = self.rx.pop_front()?;
-        if let Some(pool) = &mut self.tx_pool {
-            while let Ok(buffer) = pool.free.try_recv() {
-                pool.buffers.push(buffer);
-            }
-        }
+        self.refill_tx();
         Some((
             QueueRx {
                 buffer,
@@ -324,11 +338,7 @@ impl Device for QueueDevice {
 
     /// Offer a token that appends one segment to the transmit queue.
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        if let Some(pool) = &mut self.tx_pool {
-            while let Ok(buffer) = pool.free.try_recv() {
-                pool.buffers.push(buffer);
-            }
-        }
+        self.refill_tx();
         Some(QueueTx {
             tx: &mut self.tx,
             headroom: self.headroom,
