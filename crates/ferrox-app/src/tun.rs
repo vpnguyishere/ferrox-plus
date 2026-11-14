@@ -1120,7 +1120,7 @@ impl SendWindow {
                 self.parked.store(false, SeqCst);
                 return None;
             }
-            if let Some(thread) = self.thread.get() {
+            if self.thread.get().is_some() {
                 std::thread::park_timeout(deadline - now);
             }
             self.parked.store(false, SeqCst);
