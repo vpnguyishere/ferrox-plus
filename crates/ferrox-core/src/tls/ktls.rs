@@ -335,7 +335,10 @@ fn set_ulp(fd: RawFd) -> io::Result<()> {
     };
     if set < 0 {
         let error = io::Error::last_os_error();
-        return Err(io::Error::new(error.kind(), format!("ktls: set tcp_ulp: {error}")));
+        return Err(io::Error::new(
+            error.kind(),
+            format!("ktls: set tcp_ulp: {error}"),
+        ));
     }
     Ok(())
 }
