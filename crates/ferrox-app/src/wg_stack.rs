@@ -141,6 +141,7 @@ pub(crate) struct TxPool {
     buffers: Vec<Vec<u8>>,
 }
 
+#[cfg(target_os = "linux")]
 impl TxPool {
     pub(crate) fn new(count: usize, capacity: usize) -> (Self, SyncSender<Vec<u8>>) {
         let (sender, free) = mpsc::sync_channel(count);
