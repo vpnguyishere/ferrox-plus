@@ -177,6 +177,10 @@ struct Gate {
     posted: Option<bool>,
     /// The first `content-type` is a gRPC one.
     typed: Option<bool>,
+    /// The trailer's status, read as a decimal without a buffer of its own.
+    grpc_status: Option<u32>,
+    /// A `grpc-status` that was present but not a decimal, which is the peer's failure even though no code was read.
+    grpc_status_bad: bool,
 }
 
 impl Gate {
@@ -200,6 +204,14 @@ impl Gate {
                     self.posted = Some(value == b"POST");
                 }
             }
+            11 if name.eq_ignore_ascii_case(b"grpc-status") => {
+                if self.grpc_status.is_none() && !self.grpc_status_bad {
+                    match decimal(value) {
+                        Some(status) => self.grpc_status = Some(status),
+                        None => self.grpc_status_bad = true,
+                    }
+                }
+            }
             12 if self.typed.is_none() && name.eq_ignore_ascii_case(b"content-type") => {
                 self.typed = Some(value.starts_with(b"application/grpc"));
             }
@@ -214,6 +226,20 @@ fn served_method(gate: &Gate) -> Method {
         Some(false) => Method::Hunk,
         None => Method::Both,
     }
+}
+
+fn decimal(value: &[u8]) -> Option<u32> {
+    let mut out = 0u32;
+    if value.is_empty() {
+        return None;
+    }
+    for &byte in value {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        out = out.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+    }
+    Some(out)
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -265,6 +291,10 @@ pub(crate) struct GrpcReader<R: Read = Connection> {
     remote_end: bool,
     /// The socket answers a poll instead of blocking, so a read past `END_STREAM` can pump control frames and hand the turn back.
     poll: bool,
+    /// The status a served call left in its trailer: a non-zero one ends the read as an error rather than a clean close.
+    grpc_status: Option<u32>,
+    /// The peer sent a `grpc-status` that is not a decimal, which is a failure rather than a missing status.
+    grpc_status_bad: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -282,6 +312,8 @@ pub(crate) struct GrpcWriter {
     shared: Arc<Shared>,
     stream: u32,
     multi: bool,
+    /// The served half ends a call with a `HEADERS` trailer, where the dialled half only closes its request body.
+    trailers: bool,
 }
 
 impl GrpcReader<Connection> {
@@ -422,6 +454,11 @@ impl<R: Read> GrpcReader<R> {
         }
         if id != self.stream {
             return Some(());
+        }
+        if gate.grpc_status_bad {
+            self.grpc_status_bad = true;
+        } else if let Some(status) = gate.grpc_status {
+            self.grpc_status = Some(status);
         }
         if !self.answered {
             if gate.status != Some(true) {
@@ -937,28 +974,38 @@ impl<R: Read> GrpcReader<R> {
             // The next message may already be in the buffer behind the one just taken, and reading the socket first would block on it; that holds at END_STREAM too — the flag ends the frames, not the bytes.
             if self.decode().is_none() {
                 self.eof = true;
-                if self.remote_end && self.poll {
-                    self.pump_after_end()?;
-                }
-                return Ok(None);
+                return self.end();
             }
             if self.msg_at < self.pay_end {
                 continue;
             }
             if self.eof {
-                if self.remote_end && self.poll {
-                    self.pump_after_end()?;
-                }
-                return Ok(None);
+                return self.end();
             }
             if self.pump()?.is_none() {
                 self.eof = true;
-                if self.remote_end && self.poll {
-                    self.pump_after_end()?;
-                }
-                return Ok(None);
+                return self.end();
             }
         }
+    }
+
+    fn end(&mut self) -> std::io::Result<Option<(usize, usize)>> {
+        if self.grpc_status_bad {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed gRPC status",
+            ));
+        }
+        if let Some(status) = self.grpc_status.filter(|status| *status != 0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("gRPC status {status}"),
+            ));
+        }
+        if self.remote_end && self.poll {
+            self.pump_after_end()?;
+        }
+        Ok(None)
     }
 }
 
@@ -1531,6 +1578,15 @@ impl GrpcWriter {
         if self.shared.ended.swap(true, Ordering::SeqCst) {
             return;
         }
+        if self.trailers {
+            let block = block_encode(&[("grpc-status", "0")]);
+            if !self.emit(T_HEADERS, F_END_HEADERS | F_END, self.stream, &block) {
+                self.shared.ended.store(false, Ordering::SeqCst);
+                return;
+            }
+            let _ = Gather::settle_blocking(&self.shared);
+            return;
+        }
         if self.shared.upload_ended.load(Ordering::SeqCst) {
             return;
         }
@@ -1543,6 +1599,13 @@ impl GrpcWriter {
         }
         self.shared.upload_ended.store(true, Ordering::SeqCst);
         let _ = Gather::settle_blocking(&self.shared);
+    }
+
+    fn emit(&self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
+        let Ok(mut stream) = self.shared.stream.lock() else {
+            return false;
+        };
+        write_frame(&mut **stream, kind, flags, id, body)
     }
 
     fn max_frame(&self) -> usize {
@@ -1965,6 +2028,7 @@ struct Batched<'a> {
     sizes: [usize; 16],
     count: usize,
     end: bool,
+    trailer: Option<&'a [u8]>,
 }
 
 impl MuxSink {
@@ -1975,6 +2039,7 @@ impl MuxSink {
             sizes: [0usize; 16],
             count: 0,
             end: false,
+            trailer: None,
         };
         let mut at = 0;
         while at < parts.len() {
@@ -1994,6 +2059,9 @@ impl MuxSink {
                 at += 1;
                 &[]
             };
+            if kind == T_HEADERS && flags & F_END != 0 {
+                batched.trailer = Some(if body.is_empty() { prefix } else { body });
+            }
             if kind == T_DATA && batched.count < batched.groups.len() {
                 let mut size = 0;
                 if !prefix.is_empty() {
@@ -2012,6 +2080,9 @@ impl MuxSink {
             if flags & F_END != 0 {
                 batched.end = true;
             }
+        }
+        if batched.trailer.is_some() && batched.count > 0 {
+            return None;
         }
         Some(batched)
     }
@@ -2032,6 +2103,9 @@ impl FrameWrite for MuxSink {
         let Some(batched) = Self::split(parts) else {
             return false;
         };
+        if let Some(trailer) = batched.trailer {
+            return self.out.trailers(trailer);
+        }
         let slices = batched.slices();
         if batched.count > 0 && !self.out.batch_parts(&slices[..batched.count]) {
             return false;
@@ -2047,6 +2121,13 @@ impl FrameWrite for MuxSink {
         let Some(batched) = Self::split(parts) else {
             return Accepted::Lost;
         };
+        if let Some(trailer) = batched.trailer {
+            return if self.out.trailers(trailer) {
+                Accepted::All
+            } else {
+                Accepted::Lost
+            };
+        }
         let slices = batched.slices();
         match self.out.try_batch_parts(&slices[..batched.count]) {
             Some(true) => {
@@ -2209,6 +2290,7 @@ fn mux_stream(
         shared: write,
         stream: sid,
         multi: method == Method::MultiHunk,
+        trailers: true,
     };
     (reader, writer)
 }
@@ -2924,6 +3006,8 @@ fn new_reader<R: Read>(
         eof: false,
         remote_end: false,
         poll: false,
+        grpc_status: None,
+        grpc_status_bad: false,
     }
 }
 
@@ -2991,6 +3075,7 @@ pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
         shared,
         stream: reader.stream,
         multi: reader.method == Method::MultiHunk,
+        trailers: true,
     };
     start_keepalive(Arc::clone(&writer.shared), settings);
     Some((reader, writer))
@@ -3086,6 +3171,7 @@ pub(crate) fn connect_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>
             shared,
             stream: 1,
             multi: settings.multi_mode,
+            trailers: false,
         },
     ))
 }
@@ -3125,7 +3211,7 @@ fn user_agent(name: &str) -> &str {
 }
 
 fn start_keepalive(shared: Arc<Shared>, settings: &GrpcSettings) {
-    // One stream per connection, so there is no idle connection for this flag to keep alive.
+    // The reference pings between streams; this connection carries one stream for its life, so there is no interval to cover.
     let _ = settings.permit_without_stream;
     if settings.idle_timeout == 0 {
         return;
@@ -3634,6 +3720,7 @@ mod tests {
             shared,
             stream: 1,
             multi: false,
+            trailers: false,
         }
     }
 
@@ -4476,6 +4563,7 @@ mod tests {
             shared: mux_shared(Box::new(write), max_frame, window),
             stream: 1,
             multi: true,
+            trailers: false,
         }
     }
 
@@ -4829,6 +4917,122 @@ mod tests {
         writer.close();
         let peer = peer.lock().unwrap();
         assert_eq!(peer.writes.concat(), frame(T_DATA, F_END, 1, &message(b"")));
+    }
+
+    /// A batch that carries both a body and a trailer cannot send both without dropping one, so it is refused rather than half-written.
+    #[test]
+    fn a_batch_with_a_trailer_and_a_body_is_refused() {
+        let data = frame(T_DATA, 0, 1, &message(b"one"));
+        let trailer = frame(
+            T_HEADERS,
+            F_END_HEADERS | F_END,
+            1,
+            &block_encode(&[("grpc-status", "0")]),
+        );
+        assert!(MuxSink::split(&[data.as_slice(), trailer.as_slice()]).is_none());
+    }
+
+    /// A served call ends with the trailer a grpc-go client reads: the status is the last `HEADERS` block and carries `END_STREAM`.
+    #[test]
+    fn a_served_call_ends_with_a_status_trailer() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let mut writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, u64::MAX);
+        writer.trailers = true;
+        writer.close();
+        let peer = peer.lock().unwrap();
+        assert_eq!(
+            peer.writes.concat(),
+            frame(
+                T_HEADERS,
+                F_END_HEADERS | F_END,
+                1,
+                &block_encode(&[("grpc-status", "0")]),
+            )
+        );
+    }
+
+    /// A non-zero status trailer is the served call's failure, not a clean `END_STREAM`.
+    #[test]
+    fn a_non_zero_status_trailer_ends_the_read_as_an_error() {
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        wire.extend_from_slice(&frame(
+            T_HEADERS,
+            F_END_HEADERS | F_END,
+            1,
+            &block_encode(&[("grpc-status", "13")]),
+        ));
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        let mut got = [0u8; 8];
+        let error = reader.read(&mut got).expect_err("status 13 is an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A trailers-only response carries the status in its first `HEADERS`; that status is still the call's verdict.
+    #[test]
+    fn a_trailers_only_status_ends_the_read_as_an_error() {
+        let wire = frame(
+            T_HEADERS,
+            F_END_HEADERS | F_END,
+            1,
+            &block_encode(&[
+                (":status", "200"),
+                ("content-type", "application/grpc"),
+                ("grpc-status", "13"),
+            ]),
+        );
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        let mut got = [0u8; 8];
+        let error = reader.read(&mut got).expect_err("status 13 is an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A status that is not a decimal is a peer failure, not a missing status that closes cleanly.
+    #[test]
+    fn a_malformed_status_trailer_ends_the_read_as_an_error() {
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        wire.extend_from_slice(&frame(
+            T_HEADERS,
+            F_END_HEADERS | F_END,
+            1,
+            &block_encode(&[("grpc-status", "nope")]),
+        ));
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        let mut got = [0u8; 8];
+        let error = reader
+            .read(&mut got)
+            .expect_err("malformed status is an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     /// A response that ends at `END_STREAM` closes the read half, not the connection: the upload
@@ -5451,6 +5655,7 @@ mod tests {
                         shared,
                         stream: 1,
                         multi: false,
+                        trailers: false,
                     };
                     let mut batch = Gather::new();
                     assert!(
@@ -5709,6 +5914,52 @@ mod tests {
         }
         got.sort();
         assert_eq!(got, vec![(1, b"one".to_vec()), (3, b"two".to_vec())]);
+        drop(client);
+        server.join().expect("joins");
+    }
+
+    /// A served muxed call closes with the `HEADERS` trailer a grpc-go client reads, after its echo.
+    #[test]
+    fn a_served_muxed_call_ends_with_a_status_trailer() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let write = stream.try_clone().expect("clones");
+            crate::xhttp_h2::serve_h2_service(stream, write, &EchoService, None);
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client.write_all(MAGIC).expect("preface");
+        assert!(write_frame(&mut client, T_SETTINGS, 0, 0, &[]));
+        let head = block_encode(&[
+            (":method", "POST"),
+            (":path", "/TunnelService/Tun"),
+            ("content-type", "application/grpc"),
+        ]);
+        assert!(write_frame(&mut client, T_HEADERS, F_END_HEADERS, 1, &head));
+        assert!(write_frame(&mut client, T_DATA, F_END, 1, &message(b"one")));
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("arms");
+        let mut ended = false;
+        let mut status = None;
+        while !ended {
+            let (len, kind, flags, id) = crate::h2::read_head(&mut client).expect("a frame");
+            let mut body = vec![0u8; len];
+            client.read_exact(&mut body).expect("body");
+            if kind == T_HEADERS && id == 1 {
+                let mut decoder = crate::h2::Decoder::default();
+                decoder
+                    .decode(&body, &mut |name, value| {
+                        if name == b"grpc-status" {
+                            status = Some(value.to_vec());
+                        }
+                    })
+                    .expect("a trailer block");
+                ended = flags & F_END != 0;
+            }
+        }
+        assert_eq!(status.as_deref(), Some(&b"0"[..]));
         drop(client);
         server.join().expect("joins");
     }

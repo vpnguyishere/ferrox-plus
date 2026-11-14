@@ -3,7 +3,8 @@
 use crate::budgets::RELAY_POLL;
 use crate::conn::Connection;
 use crate::json::Json;
-use ferrox_core::tls::{RustlsProvider, TlsConfig, TlsProvider as _};
+use ferrox_core::tls::{RealityClientConfig, RustlsProvider, TlsConfig, TlsProvider as _};
+use sha2::Digest as _;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, ErrorKind, Read, Write};
@@ -31,7 +32,7 @@ const DEFAULT_EAGER: Duration = Duration::from_millis(2000);
 const DEFAULT_HOLE: Duration = Duration::from_secs(30);
 const DEFAULT_TTL: Duration = Duration::from_secs(300);
 const DEFAULT_CONCURRENCY: usize = 8;
-const MAX_CONCURRENCY: usize = 64;
+const MAX_CONCURRENCY: usize = 256;
 const MAX_COALESCED_TICKS: usize = 8;
 const WORKER_STACK: usize = 256 * 1024;
 const DRAIN_WAIT: Duration = Duration::from_millis(500);
@@ -76,11 +77,40 @@ pub(crate) struct Settings {
     pub service: String,
     pub secrets: Vec<String>,
     pub template: Option<Json>,
+    pub s3: Option<S3Settings>,
     pub params: Params,
     /// The transport's `security`, which the reference counts in the identity of a shared store.
     pub security: String,
     /// The transport's own TLS, applied to the lanes the store dials; `None` speaks the url's scheme with system roots.
     pub tls: Option<Arc<TlsConfig>>,
+    /// The transport's REALITY identity, applied instead of TLS when `security` names it.
+    pub reality: Option<Arc<RealityClientConfig>>,
+    /// Whether the identity named its decoy; otherwise the lane's own host is the name.
+    pub reality_named: bool,
+}
+
+/// The `s3` object: where the bucket is, which region signs it, and whether the bucket rides in the path or the host.
+#[derive(Debug, Clone)]
+pub(crate) struct S3Settings {
+    endpoint: String,
+    region: String,
+    bucket: String,
+    path_style: bool,
+}
+
+/// The two mutually exclusive `xmux` bounds; their ranges steer the pool once the HTTP/2 lanes land.
+#[derive(Debug, Clone, Default)]
+struct XmuxSettings {
+    max_concurrency: u32,
+    max_connections: u32,
+}
+
+impl XmuxSettings {
+    /// The upper bound of an `Int32Range`: an integer or the `"1-4"` range string the reference also accepts.
+    fn set(value: &Json) -> Option<u32> {
+        let (left, right) = crate::xhttp::i32_range(value)?;
+        u32::try_from(left.max(right).max(0)).ok()
+    }
 }
 
 impl Settings {
@@ -104,10 +134,24 @@ impl Settings {
                 .unwrap_or(0)
         };
         let remote_folder = text("remoteFolder");
-        let service = text("service");
+        let service = match text("service").as_str() {
+            "Google Drive" | "google-drive" => "google-drive".to_owned(),
+            other => other.to_owned(),
+        };
         if remote_folder.is_empty()
-            || (service != "local" && service != "template" && service != "Google Drive")
+            || !matches!(
+                service.as_str(),
+                "local" | "template" | "google-drive" | "s3"
+            )
         {
+            return None;
+        }
+        let s3 = s3_of(drive);
+        if service == "s3" && s3.is_none() {
+            return None;
+        }
+        let xmux = xmux_of(drive)?;
+        if xmux.max_connections > 0 && xmux.max_concurrency > 0 {
             return None;
         }
         let security = stream
@@ -115,6 +159,10 @@ impl Settings {
             .and_then(Json::as_str)
             .unwrap_or("")
             .to_owned();
+        let (reality, reality_named) = transport_reality(stream);
+        if security == "reality" && reality.is_none() {
+            return None;
+        }
         let secrets = drive
             .get("secrets")
             .and_then(Json::as_arr)
@@ -144,10 +192,13 @@ impl Settings {
         Some(Self {
             params,
             template: template_of(drive),
+            s3,
             remote_folder,
             service,
             secrets,
             tls: transport_tls(stream, &security),
+            reality,
+            reality_named,
             security,
         })
     }
@@ -157,11 +208,6 @@ impl Settings {
     /// # Errors
     /// A folder that cannot be created, a template that does not describe four operations, or a Drive set without three secrets.
     pub(crate) fn store(&self, front: Option<(&str, u16)>) -> io::Result<Arc<dyn Storage>> {
-        if self.security == "reality" {
-            return Err(carrier_error(
-                "a store lane does not speak reality: the service is the destination",
-            ));
-        }
         match self.service.as_str() {
             "local" => Ok(Arc::new(Local::new(&self.remote_folder)?)),
             "template" => {
@@ -178,8 +224,11 @@ impl Settings {
                     |settings, http| Ok(Arc::new(Template::build(settings, http)?)),
                 )
             }
-            "Google Drive" => shared(self, front, DEFAULT_INFLIGHT, |settings, http| {
+            "google-drive" => shared(self, front, DEFAULT_INFLIGHT, |settings, http| {
                 Ok(Arc::new(Drive::build(settings, http)?))
+            }),
+            "s3" => shared(self, front, DEFAULT_INFLIGHT, |settings, http| {
+                Ok(Arc::new(S3::build(settings, http)?))
             }),
             other => Err(carrier_error(format!(
                 "the {other} service is not built here"
@@ -221,6 +270,61 @@ fn template_of(drive: &Json) -> Option<Json> {
         Json::Obj(items) => Some(Json::Obj(items.clone())),
         _ => None,
     }
+}
+
+/// The `s3` object; a missing one is only legal for another service.
+fn s3_of(drive: &Json) -> Option<S3Settings> {
+    let node = drive.get("s3")?;
+    let text = |name: &str| {
+        node.get(name)
+            .or_else(|| node.get(&snake_case(name)))
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    Some(S3Settings {
+        endpoint: text("endpoint"),
+        region: text("region"),
+        bucket: text("bucket"),
+        path_style: node
+            .get("pathStyle")
+            .or_else(|| node.get("path_style"))
+            .and_then(Json::as_bool)
+            .unwrap_or(true),
+    })
+}
+
+/// The `xmux` object as the reference reads it, with the same `snake_case` fallback as every other field.
+fn xmux_of(drive: &Json) -> Option<XmuxSettings> {
+    let Some(node) = drive.get("xmux") else {
+        return Some(XmuxSettings::default());
+    };
+    if !matches!(node, Json::Obj(_) | Json::Null) {
+        return None;
+    }
+    let field = |name: &str| -> Option<u32> {
+        match node.get(name).or_else(|| node.get(&snake_case(name))) {
+            Some(value) => XmuxSettings::set(value),
+            None => Some(0),
+        }
+    };
+    Some(XmuxSettings {
+        max_concurrency: field("maxConcurrency")?,
+        max_connections: field("maxConnections")?,
+    })
+}
+
+/// The transport's REALITY identity, and whether it named its own decoy rather than borrowing the lane's host.
+fn transport_reality(stream: &Json) -> (Option<Arc<RealityClientConfig>>, bool) {
+    let named = stream
+        .get("realitySettings")
+        .and_then(|reality| reality.get("serverName"))
+        .and_then(Json::as_str)
+        .is_some_and(|name| !name.is_empty());
+    (
+        crate::config::stream_reality(stream, "xdrive.invalid"),
+        named,
+    )
 }
 
 /// The transport's TLS as the store dials it: the config's server name or the url's host, its roots or the system's, and no `ALPN` because the store speaks `HTTP/1.1`.
@@ -1704,13 +1808,14 @@ const DRIVE_FILES_URL: &str = "https://www.googleapis.com/drive/v3/files";
 const DRIVE_UPLOAD_URL: &str =
     "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name";
 const MAX_ATTEMPTS: usize = 8;
-const DEFAULT_INFLIGHT: usize = 32;
+const DEFAULT_INFLIGHT: usize = 64;
 const MAX_INFLIGHT: usize = 256;
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 const LINE_CAP: usize = 8 * 1024;
 const HEAD_CAP: usize = 16 * 1024;
+const ERROR_BODY_CAP: usize = 64 * 1024;
 const TOKEN_CAP: usize = 1 << 20;
 const TOKEN_SKEW: Duration = Duration::from_secs(60);
 const TOKEN_LIFE: Duration = Duration::from_secs(3600);
@@ -1783,6 +1888,13 @@ impl Drop for Hold<'_> {
 enum Kind {
     Plain(Connection),
     Secure(Box<RustlsProvider<Connection>>),
+    Reality(
+        Box<
+            ferrox_core::tls::RealityClientSession<
+                ferrox_core::tls::reality::RecordLimiter<Connection>,
+            >,
+        >,
+    ),
 }
 
 impl Read for Kind {
@@ -1790,6 +1902,7 @@ impl Read for Kind {
         match self {
             Self::Plain(stream) => stream.read(buf),
             Self::Secure(tls) => tls.read(buf),
+            Self::Reality(tls) => tls.read(buf),
         }
     }
 }
@@ -1799,6 +1912,7 @@ impl Write for Kind {
         match self {
             Self::Plain(stream) => stream.write(buf),
             Self::Secure(tls) => tls.write(buf),
+            Self::Reality(tls) => tls.write(buf),
         }
     }
 
@@ -1806,6 +1920,7 @@ impl Write for Kind {
         match self {
             Self::Plain(stream) => stream.flush(),
             Self::Secure(tls) => tls.flush(),
+            Self::Reality(tls) => tls.flush(),
         }
     }
 }
@@ -1892,9 +2007,10 @@ impl Lane {
         Ok(())
     }
 
-    /// Everything the peer has left to say, which is a reply only a `close`ing service can give.
-    fn read_to_eof(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
+    /// Everything the peer has left to say, which is a reply only a `close`ing service can give, under the caller's cap.
+    fn read_to_eof(&mut self, out: &mut Vec<u8>, limit: Option<usize>) -> io::Result<()> {
         while self.ready()? > 0 {
+            guard(out.len() + self.buf.len() - self.at, limit)?;
             out.extend_from_slice(&self.buf[self.at..]);
             self.at = self.buf.len();
         }
@@ -1958,6 +2074,13 @@ impl Lane {
                 kept: !closing,
             });
         }
+        let limit = limit.map(|cap| {
+            if (200..300).contains(&status) {
+                cap
+            } else {
+                cap.min(ERROR_BODY_CAP)
+            }
+        });
         let mut body = Vec::new();
         let kept = if transfer {
             self.chunks(&mut body, limit)?;
@@ -1967,7 +2090,7 @@ impl Lane {
             self.append_body(want, &mut body)?;
             !closing
         } else {
-            self.read_to_eof(&mut body)?;
+            self.read_to_eof(&mut body, limit)?;
             false
         };
         Ok(Answer { status, body, kept })
@@ -1991,11 +2114,11 @@ impl Lane {
     }
 }
 
-/// A declared length the caller will not let the store spend.
+/// A body length the caller will not let the store spend.
 fn guard(want: usize, limit: Option<usize>) -> io::Result<()> {
     if limit.is_some_and(|cap| want > cap) {
         return Err(carrier_error(format!(
-            "the service declared {want} bytes past its limit"
+            "the service body reaches {want} bytes past its limit"
         )));
     }
     Ok(())
@@ -2038,6 +2161,7 @@ struct Target {
     secure: bool,
     host: String,
     port: u16,
+    named_port: bool,
     path: String,
 }
 
@@ -2055,6 +2179,10 @@ impl Target {
                 .rsplit_once(':')
                 .map_or(authority, |(host, _)| host),
         };
+        let named_port = authority.strip_prefix('[').map_or_else(
+            || authority.contains(':'),
+            |bracketed| bracketed.contains("]:"),
+        );
         let port = match authority.strip_prefix('[') {
             Some(bracketed) => bracketed
                 .split(']')
@@ -2074,6 +2202,7 @@ impl Target {
             secure,
             host: host.to_owned(),
             port,
+            named_port,
             path: if tail.is_empty() {
                 "/".to_owned()
             } else {
@@ -2094,7 +2223,7 @@ impl Target {
 
     /// The `Host` header, whose port only shows when it is not the scheme's own.
     fn authority(&self) -> String {
-        let default = self.port == if self.secure { 443 } else { 80 };
+        let default = !self.named_port && self.port == if self.secure { 443 } else { 80 };
         let host = if self.host.contains(':') {
             format!("[{}]", self.host)
         } else {
@@ -2147,15 +2276,25 @@ fn declared_length(method: &str, length: Option<usize>) -> Option<usize> {
 /// The pooled `HTTP/1.1` lanes one object service shares: a lane per in-flight request, kept for the next rather than handshaken again.
 pub(crate) struct Http {
     tls: Option<Arc<TlsConfig>>,
+    reality: Option<Arc<RealityClientConfig>>,
+    reality_named: bool,
     front: Option<(String, u16)>,
     gate: Gate,
     lanes: Mutex<HashMap<String, VecDeque<Lane>>>,
 }
 
 impl Http {
-    fn new(tls: Option<Arc<TlsConfig>>, front: Option<(String, u16)>, cap: usize) -> Arc<Self> {
+    fn new(
+        tls: Option<Arc<TlsConfig>>,
+        reality: Option<Arc<RealityClientConfig>>,
+        reality_named: bool,
+        front: Option<(String, u16)>,
+        cap: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             tls,
+            reality,
+            reality_named,
             front,
             gate: Gate::new(cap),
             lanes: Mutex::new(HashMap::new()),
@@ -2249,6 +2388,23 @@ impl Http {
             .map_err(|why| carrier_error(format!("connect {peer}: {why}")))?;
         let _ = stream.set_read_timeout(Some(SERVICE_TIMEOUT));
         let _ = stream.set_write_timeout(Some(SERVICE_TIMEOUT));
+        if let Some(reality) = &self.reality {
+            let mut cfg = reality.as_ref().clone();
+            if !self.reality_named {
+                cfg.server_name.clone_from(&target.host);
+            }
+            let now = u32::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            )
+            .unwrap_or(u32::MAX);
+            let limiter = ferrox_core::tls::reality::RecordLimiter::new(stream);
+            let session = ferrox_core::tls::RealityClientSession::connect(&cfg, now, limiter)
+                .map_err(|why| carrier_error(format!("reality {}: {why}", target.host)))?;
+            return Ok(Lane::new(Kind::Reality(Box::new(session))));
+        }
         if !target.secure {
             return Ok(Lane::new(Kind::Plain(stream)));
         }
@@ -2484,6 +2640,11 @@ struct Op {
     headers: Vec<(String, String)>,
     body: String,
     names: String,
+    /// The JSON path a two-step operation answers with the URL to call next.
+    href_path: String,
+    href_method: String,
+    /// A presigned URL is called as given, with neither the service's auth nor a second substitution.
+    presigned: bool,
 }
 
 fn op_of(node: &Json, name: &str) -> Op {
@@ -2495,6 +2656,9 @@ fn op_of(node: &Json, name: &str) -> Op {
         headers: pairs_of(at, "headers"),
         body: text_of(at, "body"),
         names: text_of(at, "namesRegex"),
+        href_path: text_of(at, "hrefPath"),
+        href_method: text_of(at, "hrefMethod"),
+        presigned: false,
     }
 }
 
@@ -2712,16 +2876,24 @@ impl Template {
         };
         retried(|| {
             let mut slots = vars.clone();
-            let mut owned: Vec<(String, String)> = match self.headers(&mut slots) {
-                Ok(headers) => headers,
-                Err(why) => return Control::Again(why.to_string()),
+            let mut owned: Vec<(String, String)> = if op.presigned {
+                Vec::new()
+            } else {
+                match self.headers(&mut slots) {
+                    Ok(headers) => headers,
+                    Err(why) => return Control::Again(why.to_string()),
+                }
             };
             owned.extend(
                 op.headers
                     .iter()
                     .map(|(key, value)| (key.clone(), slots.sub(value))),
             );
-            let url = slots.sub(&op.url);
+            let url = if op.presigned {
+                op.url.clone()
+            } else {
+                slots.sub(&op.url)
+            };
             let sent: Vec<(&str, &str)> = owned
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str()))
@@ -2731,7 +2903,7 @@ impl Template {
                 Ok(answer) => answer,
                 Err(why) => return Control::Again(format!("request failed: {why}")),
             };
-            if status == 401 && self.auth.kind == "oauth2" {
+            if status == 401 && self.auth.kind == "oauth2" && !op.presigned {
                 self.token
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -2744,6 +2916,36 @@ impl Template {
             }
             Control::Done(Ok((status, payload)))
         })
+    }
+
+    /// One operation, following the href a two-step service answers on the first leg.
+    fn run(&self, op: &Op, vars: &mut Vars, body: Option<&[u8]>) -> io::Result<(u16, Vec<u8>)> {
+        if op.href_path.is_empty() {
+            return self.do_op(op, vars, body);
+        }
+        let (status, payload) = self.do_op(op, vars, None)?;
+        if !(200..300).contains(&status) {
+            return Ok((status, payload));
+        }
+        let answer = crate::json::parse(&String::from_utf8_lossy(&payload))
+            .map_err(|why| carrier_error(format!("the href answer is not json: {why}")))?;
+        let href = walk(&answer, &op.href_path)
+            .and_then(Json::as_str)
+            .filter(|href| !href.is_empty())
+            .ok_or_else(|| {
+                carrier_error(format!("the response has no href at {}", op.href_path))
+            })?;
+        let follow = Op {
+            method: op.href_method.clone(),
+            url: href.to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+            names: String::new(),
+            href_path: String::new(),
+            href_method: String::new(),
+            presigned: true,
+        };
+        self.do_op(&follow, vars, body)
     }
 }
 
@@ -2759,7 +2961,7 @@ impl Storage for Template {
             encoded = vars.sub(&self.put.body).into_bytes();
             Some(&encoded)
         };
-        let (status, payload) = self.do_op(&self.put, &mut vars, payload)?;
+        let (status, payload) = self.run(&self.put, &mut vars, payload)?;
         if (200..300).contains(&status) {
             return Ok(());
         }
@@ -2772,7 +2974,7 @@ impl Storage for Template {
     fn get(&self, name: &str) -> io::Result<Vec<u8>> {
         let mut vars = self.base();
         vars.set("name", self.stored(name));
-        let (status, payload) = self.do_op(&self.get, &mut vars, None)?;
+        let (status, payload) = self.run(&self.get, &mut vars, None)?;
         if (200..300).contains(&status) {
             return Ok(payload);
         }
@@ -2788,7 +2990,7 @@ impl Storage for Template {
     fn delete(&self, name: &str) -> io::Result<()> {
         let mut vars = self.base();
         vars.set("name", self.stored(name));
-        let (status, payload) = self.do_op(&self.drop, &mut vars, None)?;
+        let (status, payload) = self.run(&self.drop, &mut vars, None)?;
         if status == 404 || (200..300).contains(&status) {
             return Ok(());
         }
@@ -2802,7 +3004,7 @@ impl Storage for Template {
         let mut vars = self.base();
         let flat = self.stored(prefix);
         vars.set("prefix", flat.clone());
-        let (status, payload) = self.do_op(&self.list, &mut vars, None)?;
+        let (status, payload) = self.run(&self.list, &mut vars, None)?;
         if status == 404 {
             return Ok(Vec::new());
         }
@@ -2851,6 +3053,624 @@ impl Storage for Template {
 struct Found {
     id: String,
     description: Option<Vec<u8>>,
+}
+
+/// S3 as an object store: every name is a key under the configured folder, signed with `SigV4` and listed a page at a time.
+pub(crate) struct S3 {
+    http: Arc<Http>,
+    scheme: &'static str,
+    authority: String,
+    base_path: String,
+    prefix: String,
+    region: String,
+    access: String,
+    secret: String,
+    token: String,
+}
+
+impl S3 {
+    fn build(settings: &Settings, http: Arc<Http>) -> io::Result<Self> {
+        let s3 = settings
+            .s3
+            .as_ref()
+            .ok_or_else(|| carrier_error(r#"service "s3" needs an "s3" object"#))?;
+        validate_s3(
+            &s3.endpoint,
+            &s3.region,
+            &s3.bucket,
+            s3.path_style,
+            &settings.remote_folder,
+        )?;
+        if !(2..=3).contains(&settings.secrets.len())
+            || settings.secrets[0].is_empty()
+            || settings.secrets[1].is_empty()
+        {
+            return Err(carrier_error(
+                "S3 needs AccessKeyID, SecretAccessKey and optionally SessionToken in secrets",
+            ));
+        }
+        for secret in &settings.secrets {
+            if !header_value(secret) {
+                return Err(carrier_error("invalid S3 secret"));
+            }
+        }
+        if settings.secrets[0].contains(['/', ',', ' ', '\t']) {
+            return Err(carrier_error("invalid S3 AccessKeyID"));
+        }
+        let target = Target::parse(&s3.endpoint)
+            .ok_or_else(|| carrier_error("S3 endpoint must be an http(s) URL"))?;
+        let mut base_path = escape_endpoint_path(&target.path);
+        if !base_path.ends_with('/') {
+            base_path.push('/');
+        }
+        let (authority, path) = if s3.path_style {
+            let path = format!("{base_path}{}/", s3_escape(&s3.bucket));
+            (target.authority(), path)
+        } else {
+            let host = format!("{}.{}", s3.bucket, target.host);
+            let authority = if target.named_port {
+                format!("{host}:{}", target.port)
+            } else {
+                host
+            };
+            (authority, base_path)
+        };
+        Ok(Self {
+            http,
+            scheme: if target.secure { "https" } else { "http" },
+            authority,
+            base_path: path,
+            prefix: format!(
+                "{}/",
+                settings
+                    .remote_folder
+                    .strip_suffix('/')
+                    .unwrap_or(&settings.remote_folder)
+            ),
+            region: if s3.region.is_empty() {
+                "us-east-1".to_owned()
+            } else {
+                s3.region.clone()
+            },
+            access: settings.secrets[0].clone(),
+            secret: settings.secrets[1].clone(),
+            token: settings.secrets.get(2).cloned().unwrap_or_default(),
+        })
+    }
+
+    fn key(&self, name: &str) -> io::Result<String> {
+        if !valid_s3_name(name) {
+            return Err(carrier_error("invalid relative S3 object name"));
+        }
+        let key = format!("{}{name}", self.prefix);
+        if key.len() > 1024 {
+            return Err(carrier_error("S3 object key exceeds 1024 bytes"));
+        }
+        Ok(key)
+    }
+
+    fn target(&self, key: &str, query: &str) -> (String, String) {
+        let path = format!("{}{}", self.base_path, s3_escape(key));
+        let mut url = format!("{}://{}{}", self.scheme, self.authority, path);
+        if !query.is_empty() {
+            let _ = write!(url, "?{query}");
+        }
+        (url, path)
+    }
+
+    fn sign(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        content_type: Option<&str>,
+        payload_hash: &str,
+        headers: &mut Vec<(String, String)>,
+    ) {
+        let (stamp, date) = utc_stamp();
+        headers.push(("X-Amz-Date".to_owned(), stamp.clone()));
+        headers.push(("X-Amz-Content-Sha256".to_owned(), payload_hash.to_owned()));
+        let mut signed = String::new();
+        let mut canonical_headers = String::new();
+        if let Some(content_type) = content_type {
+            headers.push(("Content-Type".to_owned(), content_type.to_owned()));
+            canonical_headers.push_str("content-type:");
+            canonical_headers.push_str(content_type);
+            canonical_headers.push('\n');
+            signed.push_str("content-type;");
+        }
+        canonical_headers.push_str("host:");
+        canonical_headers.push_str(&self.authority);
+        canonical_headers.push_str("\nx-amz-content-sha256:");
+        canonical_headers.push_str(payload_hash);
+        canonical_headers.push_str("\nx-amz-date:");
+        canonical_headers.push_str(&stamp);
+        canonical_headers.push('\n');
+        signed.push_str("host;x-amz-content-sha256;x-amz-date");
+        if !self.token.is_empty() {
+            let token = self.token.split_whitespace().collect::<Vec<_>>().join(" ");
+            headers.push(("X-Amz-Security-Token".to_owned(), self.token.clone()));
+            canonical_headers.push_str("x-amz-security-token:");
+            canonical_headers.push_str(&token);
+            canonical_headers.push('\n');
+            signed.push_str(";x-amz-security-token");
+        }
+        let canonical =
+            format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed}\n{payload_hash}");
+        let scope = format!("{date}/{}/s3/aws4_request", self.region);
+        let to_sign = format!(
+            "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
+            sha_hex(canonical.as_bytes())
+        );
+        let mut key = hmac(format!("AWS4{}", self.secret).as_bytes(), date.as_bytes());
+        key = hmac(&key, self.region.as_bytes());
+        key = hmac(&key, b"s3");
+        key = hmac(&key, b"aws4_request");
+        headers.push((
+            "Authorization".to_owned(),
+            format!(
+                "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={}",
+                self.access,
+                ferrox_core::foxy::account::hex_encode(&hmac(&key, to_sign.as_bytes()))
+            ),
+        ));
+    }
+
+    /// One request through the retry ladder: a fresh signature each try, a retryable answer worth another, and a body read before the slot is released.
+    fn ask(
+        &self,
+        method: &str,
+        key: &str,
+        query: &str,
+        body: Option<&[u8]>,
+    ) -> io::Result<(u16, Vec<u8>)> {
+        let payload_hash = sha_hex(body.unwrap_or_default());
+        let content_type = (method == "PUT").then_some("application/octet-stream");
+        retried(|| {
+            let (url, path) = self.target(key, query);
+            let mut owned = Vec::new();
+            self.sign(
+                method,
+                &path,
+                query,
+                content_type,
+                &payload_hash,
+                &mut owned,
+            );
+            let sent: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            match self
+                .http
+                .ask(method, &url, &sent, body, Some(MAX_SEGMENT_BYTES))
+            {
+                Ok((status, payload)) if retryable_status(status) => Control::Again(format!(
+                    "S3 {method} answered {status}: {}",
+                    String::from_utf8_lossy(&payload)
+                )),
+                Ok(answer) => Control::Done(Ok(answer)),
+                Err(why) => Control::Again(format!("S3 request failed: {why}")),
+            }
+        })
+    }
+
+    fn delete_object(&self, key: &str) -> io::Result<()> {
+        let (status, payload) = self.ask("DELETE", key, "", None)?;
+        if matches!(status, 200 | 204) || s3_missing(status, &payload) {
+            return Ok(());
+        }
+        Err(s3_response_error("DELETE", status, &payload))
+    }
+
+    fn pages(
+        &self,
+        prefix: &str,
+        delimiter: &str,
+        mut visit: impl FnMut(&S3Page) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut pairs = vec![("list-type", "2"), ("prefix", prefix), ("max-keys", "1000")];
+        if !delimiter.is_empty() {
+            pairs.push(("delimiter", delimiter));
+        }
+        let mut query = s3_query(&pairs);
+        let mut seen = HashSet::new();
+        loop {
+            let (status, payload) = self.ask("GET", "", &query, None)?;
+            if status != 200 {
+                return Err(s3_response_error("LIST", status, &payload));
+            }
+            let page =
+                S3Page::parse(&payload).ok_or_else(|| carrier_error("invalid S3 list response"))?;
+            for key in &page.keys {
+                if !key.starts_with(prefix) {
+                    return Err(carrier_error(
+                        "S3 returned an object outside the requested prefix",
+                    ));
+                }
+            }
+            for prefix_len in &page.prefixes {
+                if !prefix_len.starts_with(prefix) {
+                    return Err(carrier_error(
+                        "S3 returned a directory outside the requested prefix",
+                    ));
+                }
+            }
+            if page.truncated && (page.next.is_empty() || !seen.insert(page.next.clone())) {
+                return Err(carrier_error("S3 list pagination did not advance"));
+            }
+            visit(&page)?;
+            if !page.truncated {
+                return Ok(());
+            }
+            let mut pairs = vec![("list-type", "2"), ("prefix", prefix), ("max-keys", "1000")];
+            if !delimiter.is_empty() {
+                pairs.push(("delimiter", delimiter));
+            }
+            pairs.push(("continuation-token", &page.next));
+            query = s3_query(&pairs);
+        }
+    }
+}
+
+impl Storage for S3 {
+    fn put(&self, name: &str, data: &[u8]) -> io::Result<()> {
+        let key = self.key(name)?;
+        let (status, payload) = self.ask("PUT", &key, "", Some(data))?;
+        if status == 200 {
+            return Ok(());
+        }
+        Err(s3_response_error("PUT", status, &payload))
+    }
+
+    fn get(&self, name: &str) -> io::Result<Vec<u8>> {
+        let key = self.key(name)?;
+        let (status, payload) = self.ask("GET", &key, "", None)?;
+        if s3_missing(status, &payload) {
+            return Err(io::Error::from(ErrorKind::NotFound));
+        }
+        if status == 200 {
+            return Ok(payload);
+        }
+        Err(s3_response_error("GET", status, &payload))
+    }
+
+    fn delete(&self, name: &str) -> io::Result<()> {
+        let key = self.key(name)?;
+        self.delete_object(&key)?;
+        let prefix = format!("{key}/");
+        self.pages(&prefix, "", |page| {
+            for item in &page.keys {
+                self.delete_object(item)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<Entry>> {
+        let key = format!("{}/", self.key(prefix)?);
+        let mut seen = HashSet::new();
+        let mut entries = Vec::new();
+        self.pages(&key, "/", |page| {
+            for full in page.keys.iter().chain(&page.prefixes) {
+                let rest = full.strip_prefix(key.as_str()).unwrap_or(full);
+                let name = rest.split('/').next().unwrap_or(rest);
+                if !name.is_empty() && valid_s3_name(name) && seen.insert(name.to_owned()) {
+                    entries.push(Entry {
+                        name: name.to_owned(),
+                        inline: None,
+                    });
+                }
+            }
+            Ok(())
+        })?;
+        Ok(entries)
+    }
+}
+
+/// One listing page: the keys under the prefix, the directories at the delimiter, and the token that reaches the next page.
+struct S3Page {
+    truncated: bool,
+    next: String,
+    keys: Vec<String>,
+    prefixes: Vec<String>,
+}
+
+impl S3Page {
+    fn parse(payload: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(payload).ok()?;
+        let root = xml_values(text, "ListBucketResult")?.into_iter().next()?;
+        let mut keys = Vec::new();
+        for item in xml_values(root, "Contents")? {
+            keys.push(xml_text(item, "Key")?);
+        }
+        let mut prefixes = Vec::new();
+        for item in xml_values(root, "CommonPrefixes")? {
+            prefixes.push(xml_text(item, "Prefix")?);
+        }
+        Some(Self {
+            truncated: xml_text(root, "IsTruncated")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            next: xml_text(root, "NextContinuationToken").unwrap_or_default(),
+            keys,
+            prefixes,
+        })
+    }
+}
+
+/// The raw inner text of every `<tag>` element, left encoded so a container keeps its child markup for the next parse.
+fn xml_values<'a>(text: &'a str, tag: &str) -> Option<Vec<&'a str>> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(offset) = text[at..].find(&open) {
+        let start = at + offset;
+        let after = &text[start + open.len()..];
+        if !after
+            .chars()
+            .next()
+            .is_some_and(|byte| byte == '>' || byte.is_ascii_whitespace())
+        {
+            at = start + open.len();
+            continue;
+        }
+        let body = start + open.len() + after.find('>')? + 1;
+        let end = text[body..].find(&close)?;
+        found.push(&text[body..body + end]);
+        at = body + end + close.len();
+    }
+    Some(found)
+}
+
+/// The decoded text of the first `<tag>` element, which is the only place an `&amp;` in a key is decoded.
+fn xml_text(text: &str, tag: &str) -> Option<String> {
+    xml_values(text, tag)?.into_iter().next().map(xml_decode)
+}
+
+fn xml_decode(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while let Some(amp) = text[at..].find('&') {
+        let amp = at + amp;
+        out.push_str(&text[at..amp]);
+        let Some(end) = text[amp..].find(';') else {
+            out.push_str(&text[amp..]);
+            return out;
+        };
+        let end = amp + end;
+        let entity = &text[amp + 1..end];
+        match entity {
+            "amp" => out.push('&'),
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\''),
+            _ => {
+                let code = entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                    .or_else(|| entity.strip_prefix('#').and_then(|dec| dec.parse().ok()));
+                match code.and_then(char::from_u32) {
+                    Some(ch) => out.push(ch),
+                    None => out.push_str(&text[amp..=end]),
+                }
+            }
+        }
+        at = end + 1;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+fn s3_error_code(payload: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(payload).ok()?;
+    xml_text(text, "Code")
+}
+
+fn s3_missing(status: u16, payload: &[u8]) -> bool {
+    status == 404
+        && matches!(
+            s3_error_code(payload).as_deref(),
+            Some("NoSuchKey" | "NotFound")
+        )
+}
+
+fn s3_response_error(method: &str, status: u16, payload: &[u8]) -> io::Error {
+    match s3_error_code(payload) {
+        Some(code) => carrier_error(format!("S3 {method} answered {status} ({code:?})")),
+        None => carrier_error(format!("S3 {method} answered {status}")),
+    }
+}
+
+fn retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+fn header_value(value: &str) -> bool {
+    !value
+        .bytes()
+        .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+}
+
+fn valid_s3_name(name: &str) -> bool {
+    if name
+        .chars()
+        .any(|ch| ch < '\u{20}' || ch == '\u{7f}' || ch == '\\')
+    {
+        return false;
+    }
+    name.split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn validate_s3(
+    endpoint: &str,
+    region: &str,
+    bucket: &str,
+    path_style: bool,
+    folder: &str,
+) -> io::Result<()> {
+    let target = Target::parse(endpoint)
+        .filter(|_| !endpoint.contains(['?', '#']) && !endpoint_has_user(endpoint))
+        .ok_or_else(|| {
+            carrier_error(
+                "S3 endpoint must be an http(s) URL without credentials, query or fragment",
+            )
+        })?;
+    if !header_value(region) || region.contains(['/', ',', ' ', '\t']) {
+        return Err(carrier_error("invalid S3 signing region"));
+    }
+    if !valid_s3_name(bucket) || bucket.contains('/') {
+        return Err(carrier_error(
+            "S3 needs a bucket name without path separators",
+        ));
+    }
+    if !path_style {
+        if target.host.parse::<std::net::IpAddr>().is_ok() {
+            return Err(carrier_error(
+                "S3 virtual-hosted addressing requires a DNS endpoint",
+            ));
+        }
+        if !bucket.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+        }) || bucket.contains("..")
+            || bucket.starts_with('.')
+            || bucket.ends_with('.')
+        {
+            return Err(carrier_error(
+                "S3 virtual-hosted addressing requires a DNS-compatible bucket name",
+            ));
+        }
+    }
+    if !valid_s3_name(folder.strip_suffix('/').unwrap_or(folder)) {
+        return Err(carrier_error(
+            "S3 remoteFolder must be a nonempty relative prefix without empty, '.' or '..' components",
+        ));
+    }
+    Ok(())
+}
+
+fn endpoint_has_user(endpoint: &str) -> bool {
+    endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+        .is_some_and(|authority| authority.contains('@'))
+}
+
+fn escape_endpoint_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        out.push_str(&s3_escape_bytes(&percent_decode(segment), true));
+    }
+    out
+}
+
+fn percent_decode(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' && at + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_digit(bytes[at + 1]), hex_digit(bytes[at + 2])) {
+                out.push(high << 4 | low);
+                at += 3;
+                continue;
+            }
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    out
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn s3_escape(value: &str) -> String {
+    s3_escape_with(value, false)
+}
+
+fn s3_escape_with(value: &str, slash: bool) -> String {
+    s3_escape_bytes(value.as_bytes(), slash)
+}
+
+fn s3_escape_bytes(value: &[u8], slash: bool) -> String {
+    let mut out = String::with_capacity(value.len());
+    for &byte in value {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            || (byte == b'/' && !slash)
+        {
+            out.push(byte as char);
+        } else {
+            pct(&mut out, byte);
+        }
+    }
+    out
+}
+
+fn s3_query(pairs: &[(&str, &str)]) -> String {
+    query(pairs).replace('+', "%20")
+}
+
+fn sha_hex(data: &[u8]) -> String {
+    ferrox_core::foxy::account::hex_encode(&sha2::Sha256::digest(data))
+}
+
+fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(ring::hmac::sign(&key, data).as_ref());
+    out
+}
+
+fn utc_stamp() -> (String, String) {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = i64::try_from(seconds / 86_400).unwrap_or_default();
+    let rest = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    (
+        format!(
+            "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
+            rest / 3600,
+            rest % 3600 / 60,
+            rest % 60
+        ),
+        format!("{year:04}{month:02}{day:02}"),
+    )
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month as u32, day as u32)
 }
 
 /// Google Drive as an object store: a name becomes a file id, a small object rides base64 in the file's description, and a larger one its media.
@@ -3318,8 +4138,34 @@ static SHARED: LazyLock<Mutex<HashMap<String, Arc<dyn Storage>>>> =
 fn share_key(settings: &Settings, front: Option<(&str, u16)>) -> String {
     use sha2::Digest as _;
     let mut joined = vec![settings.service.clone(), settings.remote_folder.clone()];
+    if let Some(s3) = &settings.s3 {
+        joined.push(s3.endpoint.clone());
+        joined.push(if s3.region.is_empty() {
+            "us-east-1".to_owned()
+        } else {
+            s3.region.clone()
+        });
+        joined.push(s3.bucket.clone());
+        joined.push(if s3.path_style {
+            "path-style".to_owned()
+        } else {
+            "virtual-hosted-style".to_owned()
+        });
+    }
     joined.extend_from_slice(&settings.secrets);
     joined.push(settings.security.clone());
+    if let Some(reality) = &settings.reality {
+        joined.push("reality".to_owned());
+        joined.push(reality.server_name.clone());
+        joined.push(ferrox_core::foxy::account::hex_encode(&reality.public_key));
+        joined.push(ferrox_core::foxy::account::hex_encode(&reality.short_id));
+        joined.push(reality.fingerprint.clone());
+        joined.push(if settings.reality_named {
+            "named".to_owned()
+        } else {
+            "lane-host".to_owned()
+        });
+    }
     if let Some((host, port)) = front {
         let host = if host.contains(':') {
             format!("[{host}]")
@@ -3355,6 +4201,8 @@ fn shared(
     }
     let http = Http::new(
         settings.tls.clone(),
+        settings.reality.clone(),
+        settings.reality_named,
         front.map(|(host, port)| (host.to_owned(), port)),
         cap,
     );
@@ -3536,7 +4384,7 @@ mod tests {
             r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/z","segmentBytes":4000000000,"concurrency":1000,"segmentBytesBelow":0}}"#,
         );
         assert_eq!(capped.params.segment_bytes, 16 * 1024 * 1024);
-        assert_eq!(capped.params.concurrency, 64);
+        assert_eq!(capped.params.concurrency, 256);
 
         let raised = named(
             r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/w","pollIntervalMs":100,"maxPollIntervalMs":10}}"#,
@@ -4412,7 +5260,7 @@ mod tests {
                 ("GET", Some(name), _) => {
                     return objects
                         .get(name)
-                        .map_or((404, Vec::new()), |data| (200, data.clone()))
+                        .map_or((404, Vec::new()), |data| (200, data.clone()));
                 }
                 ("DELETE", Some(name), _) => {
                     objects.remove(name);
@@ -4457,9 +5305,12 @@ mod tests {
             template: Some(
                 crate::json::parse(&text.replace("<p>", &port.to_string())).expect("a template"),
             ),
+            s3: None,
             params: quick(),
             security: String::new(),
             tls: None,
+            reality: None,
+            reality_named: false,
         }
     }
 
@@ -4539,8 +5390,11 @@ mod tests {
     fn the_templated_store_sends_the_reference_bytes() {
         const WIRE: &str = r#"{"auth":{"type":"static","header":{"X-Folder":"{folder}/{secret0}"}},"put":{"method":"PUT","url":"http://127.0.0.1:<p>/o/{name}","headers":{"X-Magic":"keep"}},"get":{"url":"http://127.0.0.1:<p>/o/{name}"},"delete":{"method":"DELETE","url":"http://127.0.0.1:<p>/o/{name}"},"list":{"url":"http://127.0.0.1:<p>/l/{prefix}","namesRegex":"streams/a/([a-z0-9./~-]+)"}}"#;
         let fake = Fake::start();
-        let store =
-            Template::build(&templated(WIRE, fake.port), Http::new(None, None, 8)).expect("builds");
+        let store = Template::build(
+            &templated(WIRE, fake.port),
+            Http::new(None, None, false, None, 8),
+        )
+        .expect("builds");
         let host = format!("127.0.0.1:{}", fake.port);
         let segment = "streams/a/c2s/000000000.seg";
         let marker = "streams/a/c2s/000000003.end";
@@ -4551,11 +5405,15 @@ mod tests {
         store.delete(segment).expect("drops");
         assert_eq!(
             fake.text(0),
-            format!("PUT /o/{segment} HTTP/1.1\r\nHost: {host}\r\nX-Folder: folder/s0\r\nX-Magic: keep\r\nContent-Length: 5\r\n\r\nhello")
+            format!(
+                "PUT /o/{segment} HTTP/1.1\r\nHost: {host}\r\nX-Folder: folder/s0\r\nX-Magic: keep\r\nContent-Length: 5\r\n\r\nhello"
+            )
         );
         assert_eq!(
             fake.text(1),
-            format!("PUT /o/{marker} HTTP/1.1\r\nHost: {host}\r\nX-Folder: folder/s0\r\nX-Magic: keep\r\nContent-Length: 0\r\n\r\n"),
+            format!(
+                "PUT /o/{marker} HTTP/1.1\r\nHost: {host}\r\nX-Folder: folder/s0\r\nX-Magic: keep\r\nContent-Length: 0\r\n\r\n"
+            ),
             "a bodyless put declares zero, the way the service's own http library writes it"
         );
         assert_eq!(
@@ -4584,8 +5442,11 @@ mod tests {
     fn a_templated_body_carries_the_data_and_the_credential() {
         const ENVELOPE: &str = r#"{"auth":{"type":"basic","username":"a","password":"{secret0}"},"put":{"method":"PUT","url":"http://127.0.0.1:<p>/o/{name}","body":"{\"raw\":\"{data}\"}"},"get":{"url":"http://127.0.0.1:<p>/o/{name}"},"delete":{"method":"DELETE","url":"http://127.0.0.1:<p>/o/{name}"},"list":{"url":"http://127.0.0.1:<p>/l/{prefix}","namesRegex":"([a-z0-9./~-]+)"}}"#;
         let fake = Fake::start();
-        let store = Template::build(&templated(ENVELOPE, fake.port), Http::new(None, None, 8))
-            .expect("builds");
+        let store = Template::build(
+            &templated(ENVELOPE, fake.port),
+            Http::new(None, None, false, None, 8),
+        )
+        .expect("builds");
         store.put("a.seg", b"hello").expect("stores");
         assert_eq!(
             fake.text(0),
@@ -4601,8 +5462,11 @@ mod tests {
     fn an_oauth2_template_fetches_its_token_once_and_again_after_a_401() {
         const OAUTH: &str = r#"{"auth":{"type":"oauth2","tokenUrl":"http://127.0.0.1:<p>/token","form":{"client_id":"cid","refresh_token":"rtok"},"header":{"Authorization":"Bearer {token}"},"tokenPath":"data.access","expiryPath":"exp"},"put":{"method":"PUT","url":"http://127.0.0.1:<p>/o/{name}"},"get":{"url":"http://127.0.0.1:<p>/o/{name}"},"delete":{"method":"DELETE","url":"http://127.0.0.1:<p>/o/{name}"},"list":{"url":"http://127.0.0.1:<p>/l/{prefix}","namesRegex":"([a-z0-9./~-]+)"}}"#;
         let fake = Fake::start();
-        let store = Template::build(&templated(OAUTH, fake.port), Http::new(None, None, 8))
-            .expect("builds");
+        let store = Template::build(
+            &templated(OAUTH, fake.port),
+            Http::new(None, None, false, None, 8),
+        )
+        .expect("builds");
         let host = format!("127.0.0.1:{}", fake.port);
         fake.push(200, r#"{"data":{"access":"atok"},"exp":3600}"#);
         store.put("a.seg", b"one").expect("stores");
@@ -4617,7 +5481,9 @@ mod tests {
         );
         assert_eq!(
             fake.text(1),
-            format!("PUT /o/a.seg HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\nContent-Length: 3\r\n\r\none"),
+            format!(
+                "PUT /o/a.seg HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\nContent-Length: 3\r\n\r\none"
+            ),
             "the token lands where the header template points it"
         );
         fake.push(401, "gone");
@@ -4630,12 +5496,16 @@ mod tests {
         );
         assert_eq!(
             fake.text(3),
-            format!("PUT /o/c.seg HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\nContent-Length: 5\r\n\r\nthree"),
+            format!(
+                "PUT /o/c.seg HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\nContent-Length: 5\r\n\r\nthree"
+            ),
             "the refused try still carried the old token"
         );
         assert_eq!(
             fake.text(5),
-            format!("PUT /o/c.seg HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok2\r\nContent-Length: 5\r\n\r\nthree"),
+            format!(
+                "PUT /o/c.seg HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok2\r\nContent-Length: 5\r\n\r\nthree"
+            ),
             "and the retry carried the new one"
         );
         assert_eq!(fake.lanes(), 1, "six asks, one kept-alive lane");
@@ -4646,8 +5516,11 @@ mod tests {
     fn a_configured_answer_is_asked_again() {
         const LADDER: &str = r#"{"retry":{"status":[503],"rateReason":"slow"},"get":{"url":"http://127.0.0.1:<p>/o/{name}"},"put":{"method":"PUT","url":"http://127.0.0.1:<p>/o/{name}"},"delete":{"method":"DELETE","url":"http://127.0.0.1:<p>/o/{name}"},"list":{"url":"http://127.0.0.1:<p>/l/{prefix}","namesRegex":"([a-z0-9./~-]+)"}}"#;
         let fake = Fake::start();
-        let store = Template::build(&templated(LADDER, fake.port), Http::new(None, None, 8))
-            .expect("builds");
+        let store = Template::build(
+            &templated(LADDER, fake.port),
+            Http::new(None, None, false, None, 8),
+        )
+        .expect("builds");
         fake.push(503, "busy");
         fake.push(200, "body");
         assert_eq!(
@@ -4684,11 +5557,15 @@ mod tests {
             service: "Google Drive".to_owned(),
             secrets: vec!["cid".to_owned(), "csecret".to_owned(), "rtok".to_owned()],
             template: None,
+            s3: None,
             params: quick(),
             security: String::new(),
             tls: None,
+            reality: None,
+            reality_named: false,
         };
-        let mut drive = Drive::build(&settings, Http::new(None, None, 8)).expect("builds");
+        let mut drive =
+            Drive::build(&settings, Http::new(None, None, false, None, 8)).expect("builds");
         drive.token_url = fake.url("token");
         drive.files_url = fake.url("drive/files");
         drive.upload_url = fake.url("upload/files?uploadType=multipart");
@@ -4711,11 +5588,17 @@ mod tests {
         drive.put(segment, b"hello").expect("rides the metadata");
         assert_eq!(
             fake.text(0),
-            format!("POST /token HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{FORM}", FORM.len())
+            format!(
+                "POST /token HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{FORM}",
+                FORM.len()
+            )
         );
         assert_eq!(
             fake.text(1),
-            format!("POST /drive/files?fields=id HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: {}\r\n\r\n{INLINE}", INLINE.len())
+            format!(
+                "POST /drive/files?fields=id HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: {}\r\n\r\n{INLINE}",
+                INLINE.len()
+            )
         );
         fake.push(200, "payload");
         assert_eq!(
@@ -4725,7 +5608,9 @@ mod tests {
         );
         assert_eq!(
             fake.text(2),
-            format!("GET /drive/files/f0?alt=media&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"),
+            format!(
+                "GET /drive/files/f0?alt=media&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"
+            ),
             "and a get declares no length at all"
         );
         drive.remember("streams~a~s2c~000000001.seg", "f%1");
@@ -4740,12 +5625,16 @@ mod tests {
         );
         assert_eq!(
             fake.text(3),
-            format!("GET /drive/files/f%251?alt=media&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"),
+            format!(
+                "GET /drive/files/f%251?alt=media&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"
+            ),
             "an id is quoted as a path segment is"
         );
         assert_eq!(
             fake.text(4),
-            format!("GET /drive/files/f%251?fields=description&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n")
+            format!(
+                "GET /drive/files/f%251?fields=description&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"
+            )
         );
         assert_eq!(fake.lanes(), 1, "five asks, one kept-alive lane");
     }
@@ -4805,7 +5694,9 @@ mod tests {
         let listed = drive.list("streams/a").expect("lists");
         assert_eq!(
             fake.text(1),
-            format!("GET /drive/files?fields=nextPageToken%2Cfiles%28id%2Cname%2Cdescription%29&includeItemsFromAllDrives=true&pageSize=1000&q=%27root%27+in+parents+and+trashed+%3D+false+and+name+contains+%27streams~a~%27&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n")
+            format!(
+                "GET /drive/files?fields=nextPageToken%2Cfiles%28id%2Cname%2Cdescription%29&includeItemsFromAllDrives=true&pageSize=1000&q=%27root%27+in+parents+and+trashed+%3D+false+and+name+contains+%27streams~a~%27&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"
+            )
         );
         assert_eq!(
             listed.iter().map(|at| at.name.as_str()).collect::<Vec<_>>(),
@@ -4829,16 +5720,22 @@ mod tests {
         drive.delete("streams/a").expect("empties the prefix");
         assert_eq!(
             fake.text(2),
-            format!("GET /drive/files?fields=nextPageToken%2Cfiles%28id%2Cname%2Cdescription%29&includeItemsFromAllDrives=true&pageSize=1000&q=%27root%27+in+parents+and+trashed+%3D+false+and+name+%3D+%27streams~a%27&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"),
+            format!(
+                "GET /drive/files?fields=nextPageToken%2Cfiles%28id%2Cname%2Cdescription%29&includeItemsFromAllDrives=true&pageSize=1000&q=%27root%27+in+parents+and+trashed+%3D+false+and+name+%3D+%27streams~a%27&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"
+            ),
             "the prefix itself is looked up before its children"
         );
         assert_eq!(
             fake.text(3),
-            format!("DELETE /drive/files/fold?supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n")
+            format!(
+                "DELETE /drive/files/fold?supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"
+            )
         );
         assert_eq!(
             fake.text(5),
-            format!("DELETE /drive/files/f1?supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n")
+            format!(
+                "DELETE /drive/files/f1?supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"
+            )
         );
         assert_eq!(fake.asks(), 6, "one token for the whole walk");
     }
@@ -4895,6 +5792,34 @@ mod tests {
             !Arc::ptr_eq(&first, &named.store(None).expect("reopens again")),
             "and so does every secret"
         );
+        let mut reality = settings.clone();
+        reality.reality = Some(Arc::new(RealityClientConfig {
+            server_name: "a.example".to_owned(),
+            public_key: [1; 32],
+            short_id: [0; 8],
+            fingerprint: "chrome".to_owned(),
+            key_log: None,
+        }));
+        let mut rotated = reality.clone();
+        rotated.reality = Some(Arc::new(RealityClientConfig {
+            server_name: "a.example".to_owned(),
+            public_key: [2; 32],
+            short_id: [0; 8],
+            fingerprint: "chrome".to_owned(),
+            key_log: None,
+        }));
+        assert_ne!(
+            share_key(&reality, None),
+            share_key(&rotated, None),
+            "a rotated REALITY key is a different store"
+        );
+        let mut other_name = reality.clone();
+        other_name.reality_named = true;
+        assert_ne!(
+            share_key(&reality, None),
+            share_key(&other_name, None),
+            "and so is a named decoy"
+        );
         let mut disk = settings.clone();
         disk.service = "local".to_owned();
         let folder = scratch("shared-local");
@@ -4904,12 +5829,6 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&opened, &disk.store(None).expect("the same folder")),
             "but a folder on disk is opened fresh each time, never pooled"
-        );
-        let mut reality = settings.clone();
-        reality.security = "reality".to_owned();
-        assert!(
-            reality.store(None).is_err(),
-            "a store lane does not speak reality"
         );
         let mut unbuilt = settings.clone();
         unbuilt.service = "webdav".to_owned();
@@ -4921,7 +5840,7 @@ mod tests {
         short.service = "Google Drive".to_owned();
         short.secrets = vec!["cid".to_owned(), "csecret".to_owned()];
         assert!(
-            Drive::build(&short, Http::new(None, None, 8)).is_err(),
+            Drive::build(&short, Http::new(None, None, false, None, 8)).is_err(),
             "Drive refuses a set without three secrets"
         );
         let mut blind = templated(SIDES, 9);
@@ -4932,8 +5851,201 @@ mod tests {
             .expect("a template"),
         );
         assert!(
-            Template::build(&blind, Http::new(None, None, 8)).is_err(),
+            Template::build(&blind, Http::new(None, None, false, None, 8)).is_err(),
             "and a template whose list names no capture group, because there would be nothing to read back"
         );
+    }
+    /// An S3 store aimed at the fake origin, with the two secrets the reference's minimum asks for.
+    fn s3_over(fake: &Fake, bucket: &str) -> Settings {
+        Settings {
+            remote_folder: "root".to_owned(),
+            service: "s3".to_owned(),
+            secrets: vec!["AKID".to_owned(), "SECRET".to_owned()],
+            template: None,
+            s3: Some(S3Settings {
+                endpoint: format!("http://127.0.0.1:{}", fake.port),
+                region: "us-east-1".to_owned(),
+                bucket: bucket.to_owned(),
+                path_style: true,
+            }),
+            params: quick(),
+            security: String::new(),
+            tls: None,
+            reality: None,
+            reality_named: false,
+        }
+    }
+
+    /// S3 is a path-style signed GET, and a directory page becomes the names under the prefix.
+    #[test]
+    fn s3_lists_a_path_style_bucket_and_signs_every_request() {
+        let fake = Fake::start();
+        fake.push(
+            200,
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>root/streams/a/000.seg</Key></Contents><CommonPrefixes><Prefix>root/streams/a/sub/</Prefix></CommonPrefixes></ListBucketResult>",
+        );
+        let store = S3::build(
+            &s3_over(&fake, "bucket"),
+            Http::new(None, None, false, None, 8),
+        )
+        .expect("builds");
+        let listed = store.list("streams/a").expect("lists");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["000.seg", "sub"]
+        );
+        let request = fake.text(0);
+        assert!(
+            request.starts_with(
+                "GET /bucket/?delimiter=%2F&list-type=2&max-keys=1000&prefix=root%2Fstreams%2Fa%2F HTTP/1.1"
+            ),
+            "{request}"
+        );
+        assert!(
+            request.contains("Authorization: AWS4-HMAC-SHA256 Credential=AKID/"),
+            "{request}"
+        );
+        assert!(
+            request.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"),
+            "{request}"
+        );
+    }
+
+    /// XML is decoded at the leaf, and a body that is not one complete `ListBucketResult` is no page at all.
+    #[test]
+    fn an_s3_page_decodes_leaf_entities_once_and_refuses_malformed_xml() {
+        let page = S3Page::parse(
+            br#"<?xml version="1.0"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated><Contents><Key>root/a&amp;b/000.seg</Key></Contents><CommonPrefixes><Prefix>root/a&amp;b/sub/</Prefix></CommonPrefixes></ListBucketResult>"#,
+        )
+        .expect("one page");
+        assert_eq!(page.keys, ["root/a&b/000.seg"]);
+        assert_eq!(page.prefixes, ["root/a&b/sub/"]);
+        for body in [
+            &b""[..],
+            b"<Error><Code>NoSuchKey</Code></Error>",
+            b"<ListBucketResult><Contents><Key>a</Key>",
+            b"<ListBucketResult><Contents></Contents></ListBucketResult>",
+        ] {
+            assert!(
+                S3Page::parse(body).is_none(),
+                "not a complete listing: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// A missing S3 key is the polling reader's `NotFound`, not a lane failure.
+    #[test]
+    fn s3_maps_a_missing_key_to_not_found() {
+        let fake = Fake::start();
+        fake.push(404, "<Error><Code>NoSuchKey</Code></Error>");
+        let store = S3::build(
+            &s3_over(&fake, "bucket"),
+            Http::new(None, None, false, None, 8),
+        )
+        .expect("builds");
+        assert_eq!(
+            store.get("streams/a/000.seg").expect_err("absent").kind(),
+            ErrorKind::NotFound
+        );
+    }
+
+    /// The reference's S3 object is required, its service alias is canonical, and mutually exclusive XMUX bounds are refused.
+    #[test]
+    fn s3_and_xmux_are_read_with_the_reference_defaults() {
+        let named =
+            |text: &str| Settings::from_json(Some(&crate::json::parse(text).expect("parses")));
+        assert!(
+            named(r#"{"xdriveSettings":{"service":"s3","remoteFolder":"root"}}"#).is_none(),
+            "s3 without an s3 object is not a store"
+        );
+        let drive = named(
+            r#"{"xdriveSettings":{"service":"Google Drive","remoteFolder":"root","secrets":["a","b","c"]}}"#,
+        )
+        .expect("the deprecated spelling");
+        assert_eq!(drive.service, "google-drive");
+        for body in [
+            r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x","xmux":{"maxConnections":2,"maxConcurrency":"1-4"}}}"#,
+            r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x","xmux":{"maxConnections":"1-4","maxConcurrency":2}}}"#,
+            r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x","xmux":{"maxConnections":{"from":1,"to":2},"maxConcurrency":2}}}"#,
+        ] {
+            assert!(
+                named(body).is_none(),
+                "the reference refuses both connection bounds at once: {body}"
+            );
+        }
+        assert!(
+            named(r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x","xmux":{"maxConnections":"1-4"}}}"#).is_some(),
+            "one range bound is accepted"
+        );
+        assert!(
+            named(r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x","xmux":{"maxConnections":3,"maxConcurrency":"-2"}}}"#).is_some(),
+            "a negative bound is a sentinel, not a second bound"
+        );
+        let s3 = named(
+            r#"{"xdriveSettings":{"service":"s3","remoteFolder":"root","secrets":["ak","sk"],"s3":{"endpoint":"https://s3.example","bucket":"store"}}}"#,
+        )
+        .expect("path style is the default");
+        assert!(s3.s3.as_ref().expect("s3").path_style);
+        let built = S3::build(&s3, Http::new(None, None, false, None, 8)).expect("builds");
+        assert_eq!(built.authority, "s3.example");
+        assert_eq!(built.base_path, "/store/");
+        let virtual_hosted = named(
+            r#"{"xdriveSettings":{"service":"s3","remoteFolder":"root","secrets":["ak","sk"],"s3":{"endpoint":"https://s3.example","bucket":"store","pathStyle":false}}}"#,
+        )
+        .expect("virtual-hosted addressing is read");
+        assert!(!virtual_hosted.s3.as_ref().expect("s3").path_style);
+        let built =
+            S3::build(&virtual_hosted, Http::new(None, None, false, None, 8)).expect("builds");
+        assert_eq!(built.authority, "store.s3.example");
+        assert_eq!(built.base_path, "/");
+    }
+
+    /// REALITY is the store lane's handshake, and an unnamed decoy takes the host the endpoint names.
+    #[test]
+    fn a_reality_store_lane_keeps_its_identity() {
+        let settings = Settings::from_json(Some(&crate::json::parse(
+            r#"{"security":"reality","realitySettings":{"publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortId":""},"xdriveSettings":{"service":"template","remoteFolder":"folder","template":{"put":{"method":"PUT","url":"u"},"get":{"url":"u"},"delete":{"method":"DELETE","url":"u"},"list":{"url":"u","namesRegex":"(a)"}}}}"#,
+        ).expect("parses"))).expect("names a store");
+        assert_eq!(settings.security, "reality");
+        assert!(settings.reality.is_some());
+        assert!(!settings.reality_named);
+        assert!(settings.store(None).is_ok());
+    }
+
+    /// A two-step template calls the href the first answer names, with the payload and without the service's auth.
+    #[test]
+    fn a_template_href_carries_the_second_leg() {
+        let fake = Fake::start();
+        let text = format!(
+            r#"{{"put":{{"method":"PUT","url":"http://127.0.0.1:{p}/start/{{name}}","hrefPath":"meta.href","hrefMethod":"PUT"}},"get":{{"url":"http://127.0.0.1:{p}/o/{{name}}"}},"delete":{{"method":"DELETE","url":"http://127.0.0.1:{p}/o/{{name}}"}},"list":{{"url":"http://127.0.0.1:{p}/l/{{prefix}}","namesRegex":"([a-z0-9./~-]+)"}}}}"#,
+            p = fake.port
+        );
+        let store = Template::build(
+            &templated(&text, fake.port),
+            Http::new(None, None, false, None, 8),
+        )
+        .expect("builds");
+        fake.push(
+            200,
+            &format!(
+                r#"{{"meta":{{"href":"http://127.0.0.1:{}/o/abc"}}}}"#,
+                fake.port
+            ),
+        );
+        fake.push(200, "");
+        store.put("abc", b"x").expect("puts through the href");
+        assert_eq!(fake.asks(), 2);
+        assert!(
+            fake.text(0).starts_with("PUT /start/abc HTTP/1.1"),
+            "{}",
+            fake.text(0)
+        );
+        let second = fake.text(1);
+        assert!(second.starts_with("PUT /o/abc HTTP/1.1"), "{second}");
+        assert!(second.ends_with("\r\n\r\nx"), "{second}");
     }
 }

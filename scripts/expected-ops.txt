@@ -185,9 +185,9 @@ append_pem 562
 # Re-blessed 51893360 on e12773a6 with the clean-target ops job: an empty target
 # (cache-targets: false) reproduces this frame, as the cached runs did; dns.rs is
 # untouched and the five decisions still walk 4096 times. ops.yml run 43430333461.
-# The ECH walk's 51893198 was measured before that flag on a cached target and does
-# not reproduce: 10c0ef6a measured 51893360 from an empty target. ops.yml run 43472600991.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893360 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# The base moved this frame back to 51893198 after the clean-target rebless: dns.rs is
+# untouched and the five decisions still walk 4096 times. ops.yml run 43504930512.
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893198 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
@@ -289,9 +289,9 @@ ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47483770 psiphon_shad
 # Re-blessed 47621526 on e12773a6 with the clean-target ops job: the same frame
 # shift in the ferrox-app bin, reproduced from an empty target; psiphon_shadowsocks.rs
 # is untouched. ops.yml run 43430333461.
-# The ECH walk's 47621538 came from the same cached target and does not reproduce:
-# 10c0ef6a measured 47621526 from an empty target. ops.yml run 43472600991.
-ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+# The base moved the same ferrox-app frame back to 47621538 after the clean-target
+# rebless; psiphon_shadowsocks.rs is untouched. ops.yml run 43504930512.
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621538 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
 # The fused size-line walk: 256 turns over a twelve-byte line, the first digit
 # changed each turn so the call is not hoisted. The hex run is parsed in place
 # and only a non-closing terminator pays a second, CRLF-only pass; the line is

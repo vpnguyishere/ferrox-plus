@@ -1651,7 +1651,7 @@ fn parse_range(node: &crate::json::Json) -> Option<(u32, u32)> {
 
 /// `Int32Range` (`common.go:295`): an integer, or a string holding one, `a-b`, an empty string, or the
 /// signed forms `-a-b` and `-a--b`, ordered so the low bound is first. `null` is the zero range.
-fn i32_range(node: &crate::json::Json) -> Option<(i32, i32)> {
+pub(crate) fn i32_range(node: &crate::json::Json) -> Option<(i32, i32)> {
     let (left, right) = match node {
         crate::json::Json::Null => (0, 0),
         crate::json::Json::Num(n)

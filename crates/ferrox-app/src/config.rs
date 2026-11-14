@@ -1350,7 +1350,14 @@ pub(crate) fn outbound_reality(
     outbound: &Json,
     address: &str,
 ) -> Option<Arc<ferrox_core::tls::RealityClientConfig>> {
-    let settings = outbound.get("streamSettings")?;
+    stream_reality(outbound.get("streamSettings")?, address)
+}
+
+/// The REALITY identity a `streamSettings` object names, for a carrier that hands the stream to a store rather than binding it.
+pub(crate) fn stream_reality(
+    settings: &Json,
+    address: &str,
+) -> Option<Arc<ferrox_core::tls::RealityClientConfig>> {
     if settings.get("security").and_then(Json::as_str) != Some("reality") {
         return None;
     }
