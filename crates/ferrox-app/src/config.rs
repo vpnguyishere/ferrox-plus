@@ -691,6 +691,8 @@ pub(crate) fn tls_identity_from_settings(
         server_config_cache: std::sync::Arc::default(),
         ech_server_keys: None,
         master_key_log: None,
+        kernel_tx: false,
+        kernel_rx: false,
     };
     let tls = settings.get("tlsSettings");
     identity.alpn = tls_alpn(tls);
@@ -708,6 +710,8 @@ pub(crate) fn tls_identity_from_settings(
         .and_then(|tls| tls.get("rejectUnknownSni"))
         .and_then(Json::as_bool)
         .unwrap_or(false);
+    identity.kernel_tx = tls_kernel(tls, "kernel_tx");
+    identity.kernel_rx = tls_kernel(tls, "kernel_rx");
     identity.ech_server_keys = ech;
     if identity.ech_server_keys.is_some()
         && identity.max_version.is_some_and(|version| version < 0x0304)
@@ -1327,8 +1331,17 @@ pub(crate) fn outbound_tls(
         client_cert: tls_client_cert(tls)?,
         client_random: None,
         padding: None,
+        kernel_tx: tls_kernel(tls, "kernel_tx"),
+        kernel_rx: tls_kernel(tls, "kernel_rx"),
         ..Default::default()
     }))
+}
+
+/// A kTLS direction flag: absent or not a bool keeps the direction in userspace.
+fn tls_kernel(tls: Option<&Json>, key: &str) -> bool {
+    tls.and_then(|tls| tls.get(key))
+        .and_then(Json::as_bool)
+        .unwrap_or(false)
 }
 
 /// xray's `masterKeyLog`: an empty name or `none` logs nothing, and a path that cannot be opened is
@@ -1423,6 +1436,9 @@ pub(crate) fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
             .unwrap_or(base.max_sending_window),
         mask: base.mask,
         filters: base.filters,
+        max_sessions: num("maxSessions", "max_sessions").map_or(base.max_sessions, |n| {
+            usize::try_from(n).unwrap_or(usize::MAX).max(1)
+        }),
     }
 }
 

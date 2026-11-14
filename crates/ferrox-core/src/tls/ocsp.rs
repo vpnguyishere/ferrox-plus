@@ -182,10 +182,9 @@ fn ocsp_request(leaf: &[u8], issuer: &[u8]) -> Option<Vec<u8>> {
     if spki_children.len() < 2 {
         return None;
     }
-    let (key_at, key_end) = spki_children[1];
-    let (_, key_body, _) = element(issuer, key_at)?;
-    let _ = key_end;
-    let issuer_key = issuer.get(key_body.checked_add(1)?..)?;
+    let (key_at, _) = spki_children[1];
+    let (_, key_body, key_end) = element(issuer, key_at)?;
+    let issuer_key = issuer.get(key_body.checked_add(1)?..key_end)?;
     let name_hash = digest(issuer_name);
     let key_hash = digest(issuer_key);
     let mut cert_id_body = Vec::new();
@@ -549,6 +548,50 @@ mod tests {
     }
 
     #[test]
+    fn the_issuer_key_hash_covers_only_the_spki_value() {
+        let (issuer, issuer_key) = issuer();
+        let leaf = leaf(&issuer, &issuer_key, 8443);
+        let request = ocsp_request(&leaf, &issuer).expect("request");
+        let tbs_level = children(&request, 0).expect("tbs");
+        let [tbs] = tbs_level.as_slice() else {
+            panic!("one tbs");
+        };
+        let list_level = children(&request, tbs.0).expect("list");
+        let [list] = list_level.as_slice() else {
+            panic!("one list");
+        };
+        let single_level = children(&request, list.0).expect("list");
+        let [single] = single_level.as_slice() else {
+            panic!("one request");
+        };
+        let cert_id_level = children(&request, single.0).expect("request");
+        let [cert_id] = cert_id_level.as_slice() else {
+            panic!("one cert id");
+        };
+        let parts = children(&request, cert_id.0).expect("cert id");
+        assert_eq!(parts.len(), 4, "algorithm and two hashes and serial");
+        let (_, key_body, key_end) = element(&request, parts[2].0).expect("issuer key hash");
+        let got = &request[key_body..key_end];
+
+        let issuer_tbs = tbs_children(&issuer).expect("issuer tbs");
+        let versioned = usize::from(
+            issuer_tbs
+                .first()
+                .is_some_and(|(at, _)| issuer.get(*at) == Some(&0xa0)),
+        );
+        let spki = issuer_tbs.get(5 + versioned).expect("spki");
+        let spki_children = children(&issuer, spki.0).expect("spki children");
+        let (key_at, _) = spki_children[1];
+        let (_, bit_string_body, bit_string_end) = element(&issuer, key_at).expect("bit string");
+        let want = digest(&issuer[bit_string_body + 1..bit_string_end]);
+        assert_eq!(got, want, "SHA-1 over the SPKI BIT STRING value only");
+        assert!(
+            bit_string_end < issuer.len(),
+            "the old slice would have run into the issuer's signature"
+        );
+    }
+
+    #[test]
     fn a_chain_staples_from_a_loopback_responder() {
         use std::io::{Read as _, Write as _};
         let (issuer, issuer_key) = issuer();
@@ -789,6 +832,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         };
         assert_eq!(
             identity.reload_interval(),

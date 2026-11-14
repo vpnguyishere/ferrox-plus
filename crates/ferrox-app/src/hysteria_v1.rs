@@ -1319,6 +1319,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         };
         let address = format!("127.0.0.1:{port}");
         let serve: Serve = Arc::new(|_, _, _| {});

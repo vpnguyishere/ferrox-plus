@@ -188,6 +188,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: choco install nasm -y --no-progress || { choco list --local-only 2>/dev/null | grep -iq nasm; }
+      - name: load the kernel TLS module
+        if: runner.os == 'Linux'
+        run: sudo modprobe tls
       - name: run the full suite
         id: test
         shell: bash

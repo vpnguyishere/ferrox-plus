@@ -550,18 +550,42 @@ while read -r id traffic connections iterations payload duration_ms; do
         client_args+=(--skip-engine-for "aether=Aether's cf-connect-ip dialect is served by ferrox in this matrix")
         continue
       fi
-      if [[ "$label" == aether && "$id" == wireguard-raw-* && "$server" == xray-core ]]; then
-        client_args+=(--skip-engine-for "aether=xray-core has no WireGuard server at this pin")
+      if [[ "$label" == aether && "$id" == wireguard-raw-* ]]; then
+        client_args+=(--skip-engine-for "aether=aether's handshake advances the server's WireGuard replay state and stalls the next engine")
         continue
+      fi
+      if [[ "$id" == wireguard-raw-* ]]; then
+        wg_json="$(wireguard_client "$srvport" "$label")" || {
+          cells_failed+=("$cell (could not mint the WireGuard client for $label)")
+          status=1
+          continue 2
+        }
+        wg_config="{\"outbounds\":[{$wg_json}]}"
+        printf '%s' "$wg_config" >"$celldir/client-wg-$label.json" || {
+          cells_failed+=("$cell (could not write the WireGuard client for $label)")
+          status=1
+          continue 2
+        }
+        [[ "$label" == sing-box ]] || \
+          client_args+=(--outbound-config-for "$label=$wg_config")
       fi
       case "$label" in
         sing-box)
-          python3 scripts/xray-to-singbox.py \
-            "$celldir/client.json" "$celldir/client-sing-box.json" || {
-            cells_failed+=("$cell (could not translate the client config for sing-box)")
-            status=1
-            continue 2
-          }
+          if [[ "$id" == wireguard-raw-* ]]; then
+            python3 scripts/xray-to-singbox.py \
+              "$celldir/client-wg-sing-box.json" "$celldir/client-sing-box.json" || {
+              cells_failed+=("$cell (could not translate the WireGuard client for sing-box)")
+              status=1
+              continue 2
+            }
+          else
+            python3 scripts/xray-to-singbox.py \
+              "$celldir/client.json" "$celldir/client-sing-box.json" || {
+              cells_failed+=("$cell (could not translate the client config for sing-box)")
+              status=1
+              continue 2
+            }
+          fi
           client_args+=(--outbound-config-for "sing-box=$(cat "$celldir/client-sing-box.json")")
           ;;
         leaf)

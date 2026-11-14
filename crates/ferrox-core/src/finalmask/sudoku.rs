@@ -327,33 +327,41 @@ impl Table {
     }
 }
 
-/// A seeded `getrandom` supply shaped like the reference's `rand/v2` draws: a pool of 64-bit words
-/// and Lemire's multiply-and-reject for the bounded draw.
+/// The draws one `getrandom` serves: two per pure octet means a refill every 128 octets instead of
+/// every second one, and the words are the same stream at either width.
+const ENTROPY_DRAWS: usize = 256;
+
+/// A `getrandom` supply shaped like the reference's `rand/v2` draws: a pool of 64-bit words and
+/// Lemire's multiply-and-reject for the bounded draw.
 struct SudokuRng {
-    cache: [u64; 4],
+    cache: Box<[u64; ENTROPY_DRAWS]>,
     at: usize,
+    #[cfg(test)]
+    refills: usize,
 }
 
 impl SudokuRng {
     fn new() -> Self {
         Self {
-            cache: [0; 4],
-            at: 4,
+            cache: Box::new([0; ENTROPY_DRAWS]),
+            at: ENTROPY_DRAWS,
+            #[cfg(test)]
+            refills: 0,
         }
     }
 
     fn draw(&mut self) -> io::Result<u64> {
-        if self.at == 4 {
-            let mut raw = [0u8; 32];
+        if self.at == ENTROPY_DRAWS {
+            let mut raw = [0u8; ENTROPY_DRAWS * 8];
             getrandom::fill(&mut raw).map_err(|_| io::Error::other("sudoku entropy"))?;
-            let words = raw.as_chunks::<8>().0;
-            self.cache = [
-                u64::from_le_bytes(words[0]),
-                u64::from_le_bytes(words[1]),
-                u64::from_le_bytes(words[2]),
-                u64::from_le_bytes(words[3]),
-            ];
+            for (slot, word) in self.cache.iter_mut().zip(raw.as_chunks::<8>().0) {
+                *slot = u64::from_le_bytes(*word);
+            }
             self.at = 0;
+            #[cfg(test)]
+            {
+                self.refills += 1;
+            }
         }
         let draw = self.cache[self.at];
         self.at += 1;
@@ -1452,6 +1460,22 @@ mod tests {
     fn the_sudoku_wire_costs_the_bytes_and_nothing_else() {
         assert_eq!(encode_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
         assert_eq!(decode_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
+    }
+
+    #[test]
+    fn the_entropy_supply_serves_a_pure_encode() {
+        let config = stage("probe", "", &[]);
+        let mut writer = config.open_write(MaskRole::Client);
+        let plain = vec![0u8; PROBE_PLAINTEXT];
+        let mut sink = std::io::sink();
+        for _ in 0..PROBE_ROUNDS {
+            writer.write(&mut sink, &plain).expect("encodes");
+        }
+        let refills = writer.writer.as_ref().expect("a writer").rng.refills;
+        assert!(
+            refills == 512 || refills == 513,
+            "the pure encode should ask the OS 512 times, or 513 after a rejected draw: {refills}"
+        );
     }
 
     #[test]

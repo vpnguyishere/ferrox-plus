@@ -290,27 +290,74 @@ matrix_wireguard_dir() {
   esac
   dir="$root/$dir"
   mkdir -p "$dir"
-  if [[ ! -s "$dir/server.txt" || ! -s "$dir/client.txt" ]]; then
+  if [[ ! -s "$dir/server.txt" ]]; then
     "${ferrox_bin:?no ferrox binary to mint the WireGuard keypairs}" x25519 >"$dir/server.txt" || return 1
+  fi
+  echo "$dir"
+}
+
+matrix_wireguard_key() {
+  local file="$1" field="$2" value
+  value="$(sed -n "s/^${field}: //p" "$file")" || return 1
+  [[ -n "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+matrix_wireguard_server_private() {
+  matrix_wireguard_key "$(matrix_wireguard_dir)/server.txt" PrivateKey
+}
+
+matrix_wireguard_server_public() {
+  matrix_wireguard_key "$(matrix_wireguard_dir)/server.txt" 'Password (PublicKey)'
+}
+
+# One identity per engine: the peer's replay timestamp belongs to a key, and a shared
+# key lets one engine's handshake lock every other engine out of the server for its
+# retry interval.
+matrix_wireguard_engines() {
+  printf '%s\n' ferrox aether xray-core sing-box
+}
+
+matrix_wireguard_index() {
+  local engine="$1" index=0
+  for candidate in $(matrix_wireguard_engines); do
+    if [[ "$candidate" == "$engine" ]]; then
+      printf '%s\n' "$index"
+      return 0
+    fi
+    index=$((index + 1))
+  done
+  return 1
+}
+
+matrix_wireguard_engine_dir() {
+  local dir
+  dir="$(matrix_wireguard_dir)/$1"
+  mkdir -p "$dir" || return 1
+  if [[ ! -s "$dir/client.txt" ]]; then
     "${ferrox_bin:?no ferrox binary to mint the WireGuard keypairs}" x25519 >"$dir/client.txt" || return 1
   fi
   echo "$dir"
 }
 
-matrix_wireguard_server_private() {
-  sed -n 's/^PrivateKey: //p' "$(matrix_wireguard_dir)/server.txt"
+matrix_wireguard_engine_private() {
+  matrix_wireguard_key "$(matrix_wireguard_engine_dir "$1")/client.txt" PrivateKey
 }
 
-matrix_wireguard_server_public() {
-  sed -n 's/^Password (PublicKey): //p' "$(matrix_wireguard_dir)/server.txt"
+matrix_wireguard_engine_public() {
+  matrix_wireguard_key "$(matrix_wireguard_engine_dir "$1")/client.txt" 'Password (PublicKey)'
 }
 
-matrix_wireguard_client_private() {
-  sed -n 's/^PrivateKey: //p' "$(matrix_wireguard_dir)/client.txt"
+matrix_wireguard_engine_v4() {
+  local index
+  index="$(matrix_wireguard_index "$1")" || return 1
+  printf '10.0.0.%d/32\n' "$((index + 2))"
 }
 
-matrix_wireguard_client_public() {
-  sed -n 's/^Password (PublicKey): //p' "$(matrix_wireguard_dir)/client.txt"
+matrix_wireguard_engine_v6() {
+  local index
+  index="$(matrix_wireguard_index "$1")" || return 1
+  printf 'fd00::%d/128\n' "$((index + 2))"
 }
 
 # The server's TLS: the identity the client is asked to trust.
@@ -525,16 +572,29 @@ hysteria_v1_client_settings() {
 }
 
 wireguard_server() {
-  echo "\"protocol\": \"wireguard\", \"settings\": {\"secretKey\": \"$(matrix_wireguard_server_private)\", \"address\": [\"10.0.0.1/32\", \"fd00::1/128\"], \"mtu\": 1420, \"peers\": [{\"publicKey\": \"$(matrix_wireguard_client_public)\", \"allowedIPs\": [\"10.0.0.2/32\", \"fd00::2/128\"]}]}"
+  local peers="" engine peer public v4 v6 secret
+  secret="$(matrix_wireguard_server_private)" || return 1
+  for engine in $(matrix_wireguard_engines); do
+    public="$(matrix_wireguard_engine_public "$engine")" || return 1
+    v4="$(matrix_wireguard_engine_v4 "$engine")" || return 1
+    v6="$(matrix_wireguard_engine_v6 "$engine")" || return 1
+    peer="{\"publicKey\": \"$public\", \"allowedIPs\": [\"$v4\", \"$v6\"]}"
+    peers+="${peers:+,}$peer"
+  done
+  echo "\"protocol\": \"wireguard\", \"settings\": {\"secretKey\": \"$secret\", \"address\": [\"10.0.0.1/32\", \"fd00::1/128\"], \"mtu\": 1420, \"peers\": [$peers]}"
 }
 
 wireguard_client() {
-  local port="$1" kernel="${2:-true}"
-  echo "\"tag\": \"proxy\", \"protocol\": \"wireguard\", \"settings\": {\"isClient\": true, \"largeSegments\": true, \"noKernelTun\": $kernel, \"secretKey\": \"$(matrix_wireguard_client_private)\", \"address\": [\"10.0.0.2/32\", \"fd00::2/128\"], \"mtu\": 1420, \"peers\": [{\"publicKey\": \"$(matrix_wireguard_server_public)\", \"endpoint\": \"127.0.0.1:$port\", \"allowedIPs\": [\"0.0.0.0/0\", \"::/0\"]}]}"
+  local port="$1" engine="${2:-ferrox}" kernel="${3:-true}" secret v4 v6 server
+  secret="$(matrix_wireguard_engine_private "$engine")" || return 1
+  v4="$(matrix_wireguard_engine_v4 "$engine")" || return 1
+  v6="$(matrix_wireguard_engine_v6 "$engine")" || return 1
+  server="$(matrix_wireguard_server_public)" || return 1
+  echo "\"tag\": \"proxy\", \"protocol\": \"wireguard\", \"settings\": {\"isClient\": true, \"largeSegments\": true, \"noKernelTun\": $kernel, \"secretKey\": \"$secret\", \"address\": [\"$v4\", \"$v6\"], \"mtu\": 1420, \"peers\": [{\"publicKey\": \"$server\", \"endpoint\": \"127.0.0.1:$port\", \"allowedIPs\": [\"0.0.0.0/0\", \"::/0\"]}]}"
 }
 
 wireguard_kernel_client() {
-  wireguard_client "$1" false
+  wireguard_client "$1" "${2:-ferrox}" false
 }
 
 vless_server_vision() {

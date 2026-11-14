@@ -327,6 +327,9 @@ impl Listener {
                         if terminates {
                             continue;
                         }
+                        if inner.sessions.lock().unwrap().len() >= inner.config.max_sessions {
+                            continue;
+                        }
                         let Ok(sock_w) = sock_r.try_clone() else {
                             continue;
                         };
@@ -431,6 +434,41 @@ mod tests {
         assert_eq!(counts.zeroed, 0, "the room is not zeroed");
         assert_eq!(counts.allocs, 1, "the room is one buffer");
         assert_eq!(room.len(), DATAGRAM_MAX, "and it is the whole datagram");
+    }
+
+    #[cfg_attr(miri, ignore = "binds loopback UDP sockets and waits")]
+    #[test]
+    fn the_listener_caps_sessions_before_accept() {
+        let config = Config {
+            max_sessions: 4,
+            ..Config::default()
+        };
+        let listener = Listener::bind(([127, 0, 0, 1], 0).into(), config.clone()).expect("bind");
+        let addr = listener.local_addr();
+        let mut dials = Vec::new();
+        for _ in 0..8 {
+            let conn = dial(addr, config.clone(), fresh_conversation()).expect("dial");
+            conn.write(b"x").expect("write");
+            dials.push(conn);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while listener.inner.sessions.lock().unwrap().len() < 4 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            listener.inner.sessions.lock().unwrap().len(),
+            4,
+            "the listener admits no session past its cap"
+        );
+        assert_eq!(
+            listener.inner.ready.lock().unwrap().len(),
+            4,
+            "no handler is queued for a session past the cap"
+        );
+        listener.close();
+        for conn in dials {
+            conn.terminate();
+        }
     }
 
     #[cfg_attr(miri, ignore = "binds a loopback UDP socket")]

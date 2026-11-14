@@ -305,21 +305,11 @@ fn tactics_from_json(payload: &Json) -> Tactics {
         .unwrap_or("")
         .to_owned();
     let parameters = tactics.get("Parameters");
-    let brokers = parameters
-        .and_then(|parameters| parameters.get("InproxyBrokerSpecs"))
-        .and_then(Json::as_arr)
-        .map(|specs| specs.iter().filter_map(broker).collect())
-        .unwrap_or_default();
-    let compartments = parameters
-        .and_then(|parameters| parameters.get("InproxyCommonCompartmentIDs"))
-        .and_then(Json::as_arr)
-        .map(|ids| {
-            ids.iter()
-                .filter_map(Json::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+    let brokers =
+        brokers_from(parameters.and_then(|parameters| parameters.get("InproxyBrokerSpecs")));
+    let compartments = compartments_from(
+        parameters.and_then(|parameters| parameters.get("InproxyCommonCompartmentIDs")),
+    );
     let stun_servers = StunServers {
         basic: stun_list(
             parameters,
@@ -363,6 +353,26 @@ fn stun_list(parameters: Option<&Json>, client: &str, generic: &str) -> Vec<Stri
     Vec::new()
 }
 
+/// Parse a configured `InproxyBrokerSpecs` value, with the same validation as tactics.
+pub(crate) fn brokers_from(specs: Option<&Json>) -> Vec<Broker> {
+    specs
+        .and_then(Json::as_arr)
+        .map(|specs| specs.iter().filter_map(broker).collect())
+        .unwrap_or_default()
+}
+
+/// Parse a configured `InproxyCommonCompartmentIDs` value, with the same validation as tactics.
+pub(crate) fn compartments_from(ids: Option<&Json>) -> Vec<String> {
+    ids.and_then(Json::as_arr)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Json::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn broker(spec: &Json) -> Option<Broker> {
     let public_key = spec
         .get("BrokerPublicKey")
@@ -374,11 +384,14 @@ fn broker(spec: &Json) -> Option<Broker> {
         .and_then(Json::as_str)
         .filter(|secret| !secret.is_empty())?
         .to_owned();
-    let fronts = spec
+    let fronts: Vec<Fronting> = spec
         .get("BrokerFrontingSpecs")
         .and_then(Json::as_arr)
         .map(|specs| specs.iter().filter_map(fronting).collect())
         .unwrap_or_default();
+    if fronts.is_empty() {
+        return None;
+    }
     Some(Broker {
         public_key,
         root_secret,
@@ -568,6 +581,14 @@ mod tests {
                 rfc5780: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn a_broker_without_a_fronting_entry_is_skipped() {
+        let text = br#"{"Tag":"tag","Tactics":{"Parameters":{"InproxyBrokerSpecs":[{"BrokerPublicKey":"pk","BrokerRootObfuscationSecret":"rs","BrokerFrontingSpecs":[]},{"BrokerPublicKey":"ok","BrokerRootObfuscationSecret":"rs2","BrokerFrontingSpecs":[{"Host":"broker.example"}]}]}}}"#;
+        let tactics = parse_payload(text).expect("payload");
+        assert_eq!(tactics.brokers.len(), 1);
+        assert_eq!(tactics.brokers[0].public_key, "ok");
     }
 
     #[test]

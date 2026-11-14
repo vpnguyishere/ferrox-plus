@@ -18,6 +18,8 @@ const CONN_WINDOW_TOP_UP: u32 = 16 * 1024 * 1024 - 65_535;
 const MAX_STREAMS: u32 = 100;
 /// The default `SETTINGS_MAX_FRAME_SIZE` (RFC 7540 6.5.2): the largest inbound frame we accept because we never advertise a larger one.
 const MAX_RECV_FRAME: usize = 16_384;
+/// The queued body one stream may hold before it is reset: the stream window plus one in-flight frame. A peer that keeps sending past its window is refused here rather than growing the queue.
+const BODY_CAP: usize = WINDOW as usize + MAX_RECV_FRAME;
 /// The two `WINDOW_UPDATE` frames one credit grants differ only by stream id, so twenty of their twenty-six bytes are constant; the connection frame keeps the first slot because that is the order it was written in.
 const CREDIT_TEMPLATE: [u8; 26] = {
     let mut out = [0u8; 26];
@@ -212,6 +214,8 @@ pub(crate) struct H2Stream {
 #[allow(clippy::struct_excessive_bools)]
 struct StreamState {
     body: VecDeque<Vec<u8>>,
+    /// The wire length of each queued body chunk, so credit is returned when the reader takes it.
+    credit: VecDeque<u32>,
     ended: bool,
     /// The response `END_STREAM` has gone out: a stream retires once both halves are done.
     finished: bool,
@@ -460,6 +464,8 @@ pub(crate) struct H2StreamReader {
     /// The frame the reader owns: the queue hands it over, so a window is a span of the loop's own
     /// allocation and a short read leaves the tail at the offset it already had.
     cur: Vec<u8>,
+    /// The wire length of `cur`, granted when the reader takes the chunk.
+    cur_wire: u32,
     at: usize,
     /// The start of the current idle stretch, so a lane's polls still end a body at the stall.
     idle_since: Option<std::time::Instant>,
@@ -509,6 +515,10 @@ impl H2StreamReader {
         if self.at == self.cur.len() {
             self.cur.clear();
             self.at = 0;
+            let wire = std::mem::take(&mut self.cur_wire);
+            if wire != 0 {
+                self.conn.credit_read(self.id, wire);
+            }
         }
         self.idle_since = None;
         filled + n
@@ -552,14 +562,17 @@ impl Read for H2StreamReader {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             if let Some(front) = st.body.pop_front() {
+                let wire = st.credit.pop_front().unwrap_or(front.len() as u32);
                 drop(st);
                 self.cur = front;
+                self.cur_wire = wire;
                 self.at = 0;
                 continue;
             }
             if st.read_ended() {
                 st.abandoned = !st.ended;
                 drop(st);
+                self.conn.flush_read_credit(self.id);
                 self.conn.forget_upload(self.id);
                 return Ok(filled);
             }
@@ -650,6 +663,10 @@ impl crate::proxy::WindowRead for H2StreamReader {
                 let start = self.at;
                 self.at = self.cur.len();
                 self.idle_since = None;
+                let wire = std::mem::take(&mut self.cur_wire);
+                if wire != 0 {
+                    self.conn.credit_read(self.id, wire);
+                }
                 return Ok(crate::proxy::Window::one(&self.cur[start..]));
             }
             let mut st = self
@@ -658,14 +675,17 @@ impl crate::proxy::WindowRead for H2StreamReader {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             if let Some(front) = st.body.pop_front() {
+                let wire = st.credit.pop_front().unwrap_or(front.len() as u32);
                 drop(st);
                 self.cur = front;
+                self.cur_wire = wire;
                 self.at = 0;
                 continue;
             }
             if st.read_ended() {
                 st.abandoned = !st.ended;
                 drop(st);
+                self.conn.flush_read_credit(self.id);
                 self.conn.forget_upload(self.id);
                 return Ok(crate::proxy::Window::empty());
             }
@@ -1228,6 +1248,54 @@ impl H2Conn {
         }
     }
 
+    /// Credit for a body chunk the reader has taken: batched until the stream ends, the connection is inline, or the batch reaches `CREDIT_BATCH_BYTES`.
+    fn credit_read(&self, stream: u32, wire: u32) {
+        if wire == 0 {
+            return;
+        }
+        let pending = {
+            let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(state) = streams.get(&stream).cloned() else {
+                drop(streams);
+                self.replenish_connection(wire as usize);
+                return;
+            };
+            drop(streams);
+            let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let pending = st.pending_credit.saturating_add(wire);
+            let flush = (st.read_ended() && st.body.is_empty())
+                || st.dead
+                || matches!(self.control, Control::Inline)
+                || pending as usize >= CREDIT_BATCH_BYTES;
+            if flush {
+                st.pending_credit = 0;
+                pending
+            } else {
+                st.pending_credit = pending;
+                0
+            }
+        };
+        if pending > 0 {
+            self.replenish(stream, pending as usize);
+        }
+    }
+
+    /// Returns the consumed credit held below the batch threshold when the reader has no more body.
+    fn flush_read_credit(&self, stream: u32) {
+        let pending = {
+            let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(state) = streams.get(&stream).cloned() else {
+                return;
+            };
+            drop(streams);
+            let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            std::mem::take(&mut st.pending_credit)
+        };
+        if pending > 0 {
+            self.replenish(stream, pending as usize);
+        }
+    }
+
     fn replenish(&self, stream: u32, n: usize) {
         if n == 0 || n > u32::MAX as usize {
             return;
@@ -1357,7 +1425,9 @@ impl H2Conn {
         let pending = if let Some(state) = state {
             let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
             st.dead = true;
-            let pending = std::mem::take(&mut st.pending_credit);
+            let pending = take_unread_credit(&mut st);
+            st.body.clear();
+            st.credit.clear();
             state.cv.notify_all();
             pending
         } else {
@@ -1404,7 +1474,7 @@ impl H2Conn {
         if let Some(state) = removed {
             let pending = {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
-                std::mem::take(&mut st.pending_credit)
+                take_unread_credit(&mut st)
             };
             if pending > 0 {
                 self.replenish_connection(pending as usize);
@@ -1426,7 +1496,9 @@ impl H2Conn {
             if let Some(state) = streams.remove(&stream) {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                 st.dead = true;
-                let pending = std::mem::take(&mut st.pending_credit);
+                let pending = take_unread_credit(&mut st);
+                st.body.clear();
+                st.credit.clear();
                 state.cv.notify_all();
                 pending
             } else {
@@ -1615,6 +1687,7 @@ impl H2Conn {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: end_stream,
                 finished: false,
                 request_ended: false,
@@ -2041,6 +2114,7 @@ impl H2Client {
             id: sid,
             at: 0,
             cur: Vec::new(),
+            cur_wire: 0,
             idle_since: None,
         };
         let out = H2StreamOut {
@@ -2246,6 +2320,7 @@ impl H2Conn {
                 id: sid,
                 at: 0,
                 cur: Vec::new(),
+                cur_wire: 0,
                 idle_since: None,
             },
             H2StreamWriter {
@@ -2554,6 +2629,7 @@ fn open_stream(
         id: sid,
         at: 0,
         cur: Vec::new(),
+        cur_wire: 0,
         idle_since: None,
     };
     let h2out = H2StreamOut {
@@ -2995,6 +3071,16 @@ fn cut_padded_data(body: &mut Vec<u8>, pad: usize) -> usize {
     inner
 }
 
+/// Returns the connection credit for a body the stream will not deliver: consumed credit held below the batch plus every queued chunk's wire length. The chunk lengths are zeroed so a reader that still holds the stream cannot grant them twice.
+fn take_unread_credit(st: &mut StreamState) -> u32 {
+    let queued = st
+        .credit
+        .iter_mut()
+        .map(std::mem::take)
+        .fold(0u32, u32::saturating_add);
+    queued.saturating_add(std::mem::take(&mut st.pending_credit))
+}
+
 /// The frames both roles answer the same way: settings, pings and flow-control credit. `None`
 /// leaves the frame to the role that owns the stream lifecycle.
 fn control_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: &[u8]) -> Option<bool> {
@@ -3065,34 +3151,47 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
         return true;
     };
     drop(streams);
-    let (done, flush, credit) = {
+    let mut overflow = false;
+    let mut queued = false;
+    let mut credit_now = false;
+    let done = {
         let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
         if !st.dead {
-            st.body.push_back(body);
-            if flags & F_END != 0 {
-                st.ended = true;
+            if body.is_empty() {
+                credit_now = true;
+                if flags & F_END != 0 {
+                    st.ended = true;
+                }
+            } else {
+                let held: usize = st.body.iter().map(Vec::len).sum();
+                if held.saturating_add(body.len()) > BODY_CAP {
+                    overflow = true;
+                } else {
+                    st.body.push_back(body);
+                    st.credit
+                        .push_back(u32::try_from(wire_len).unwrap_or(u32::MAX));
+                    queued = true;
+                    if flags & F_END != 0 {
+                        st.ended = true;
+                    }
+                }
             }
         }
         let done = st.both_ended();
-        let pending = st
-            .pending_credit
-            .saturating_add(u32::try_from(wire_len).unwrap_or(u32::MAX));
-        let flush = st.dead
-            || done
-            || flags & F_END != 0
-            || pending as usize >= CREDIT_BATCH_BYTES
-            || matches!(conn.control, Control::Inline);
-        if flush {
-            st.pending_credit = 0;
-        } else {
-            st.pending_credit = pending;
-        }
         state.cv.notify_all();
-        (done, flush, pending)
+        done
     };
-    // The frame grants its credit once, when it is queued; the reader hands the bytes out without a second grant.
-    if flush {
-        conn.replenish(sid, credit as usize);
+    if overflow {
+        conn.reset_stream(sid);
+        conn.replenish_connection(wire_len);
+        return true;
+    }
+    if !queued {
+        if credit_now {
+            conn.replenish(sid, wire_len);
+        } else {
+            conn.replenish_connection(wire_len);
+        }
     }
     if done {
         conn.retire(sid);
@@ -3204,20 +3303,43 @@ fn pump_frame(
                 return true;
             };
             drop(streams);
+            let mut overflow = false;
+            let mut queued = false;
+            let mut credit_now = false;
             let (finished, abandoned, stopped) = {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                 let finished = st.finished || st.request_ended;
                 let abandoned = st.abandoned;
                 let stopped = st.stopped;
                 if !abandoned && !st.dead && !stopped {
-                    st.body.push_back(body);
-                    if flags & F_END != 0 {
-                        st.ended = true;
+                    if body.is_empty() {
+                        credit_now = true;
+                        if flags & F_END != 0 {
+                            st.ended = true;
+                        }
+                    } else {
+                        let held: usize = st.body.iter().map(Vec::len).sum();
+                        if held.saturating_add(body.len()) > BODY_CAP {
+                            overflow = true;
+                        } else {
+                            st.body.push_back(body);
+                            st.credit
+                                .push_back(u32::try_from(wire_len).unwrap_or(u32::MAX));
+                            queued = true;
+                            if flags & F_END != 0 {
+                                st.ended = true;
+                            }
+                        }
                     }
                 }
                 state.cv.notify_all();
                 (finished, abandoned, stopped)
             };
+            if overflow {
+                conn.reset_stream(sid);
+                conn.replenish_connection(wire_len);
+                return true;
+            }
             if abandoned || stopped {
                 if !conn.replenish_connection(wire_len) {
                     return false;
@@ -3230,7 +3352,13 @@ fn pump_frame(
             if finished && flags & F_END != 0 {
                 conn.retire(sid);
             }
-            conn.replenish(sid, wire_len);
+            if !queued {
+                if credit_now {
+                    conn.replenish(sid, wire_len);
+                } else {
+                    conn.replenish_connection(wire_len);
+                }
+            }
             true
         }
         T_RST => {
@@ -3718,6 +3846,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -3810,6 +3939,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -3841,6 +3971,7 @@ mod tests {
             id: 1,
             at: 0,
             cur: Vec::new(),
+            cur_wire: 0,
             idle_since: None,
         };
         let mut first = [0u8; 16];
@@ -3874,6 +4005,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -3905,6 +4037,7 @@ mod tests {
             id: 1,
             at: 0,
             cur: Vec::new(),
+            cur_wire: 0,
             idle_since: None,
         };
         let window = crate::proxy::WindowRead::read_window(&mut reader).unwrap();
@@ -3930,6 +4063,7 @@ mod tests {
             id: 1,
             at: 0,
             cur: Vec::new(),
+            cur_wire: 0,
             idle_since: None,
         };
         let window = crate::proxy::WindowRead::read_window(&mut reader)
@@ -4564,6 +4698,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -4614,6 +4749,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -4651,6 +4787,7 @@ mod tests {
             id: 2,
             at: 0,
             cur: Vec::new(),
+            cur_wire: 0,
             idle_since: None,
         };
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -4689,6 +4826,7 @@ mod tests {
         let upload_state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -4848,6 +4986,7 @@ mod tests {
             id: 1,
             at: 0,
             cur: Vec::new(),
+            cur_wire: 0,
             idle_since: None,
         };
         let _step = crate::proxy::RelayStep::enter();
@@ -4892,6 +5031,7 @@ mod tests {
             id: 1,
             at: 0,
             cur: Vec::new(),
+            cur_wire: 0,
             idle_since: None,
         };
         let _step = crate::proxy::RelayStep::enter();
@@ -4985,6 +5125,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -5072,6 +5213,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -5095,6 +5237,7 @@ mod tests {
             id: 1,
             at: 0,
             cur: Vec::new(),
+            cur_wire: 0,
             idle_since: None,
         };
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -5124,6 +5267,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: true,
                 request_ended: false,
@@ -5147,6 +5291,7 @@ mod tests {
             id: 1,
             at: 0,
             cur: Vec::new(),
+            cur_wire: 0,
             idle_since: None,
         };
         assert_eq!(reader.read(&mut [0u8; 8]).expect("eof"), 0);
@@ -5739,18 +5884,18 @@ mod tests {
         }
     }
 
-    /// A DATA frame grants its windows when it is queued, and reading the queued bytes grants them no
-    /// second time: the peer's credit is returned once per frame, not twice.
+    /// A DATA frame returns its windows when the reader takes it, not when it is queued: an
+    /// unread body keeps the peer's window spent, and the same bytes are not credited twice.
     #[test]
-    fn a_queued_frame_grants_its_credit_once() {
+    fn a_queued_frame_grants_its_credit_when_read() {
         let (conn, _written, slices) = bare_conn();
         let (mut reader, _writer, _out) = conn.open(1, false).expect("stream opens");
         let payload = vec![0x5Au8; 32];
         assert!(queue_data(&conn, 0, 1, payload.clone()));
         assert_eq!(
             slices.load(Ordering::SeqCst),
-            1,
-            "the queue returns the frame's credit"
+            0,
+            "the queue holds the frame's credit"
         );
         let mut got = [0u8; 32];
         assert_eq!(reader.read(&mut got).expect("reads"), payload.len());
@@ -5758,7 +5903,7 @@ mod tests {
         assert_eq!(
             slices.load(Ordering::SeqCst),
             1,
-            "the reader does not return the same bytes again"
+            "the reader returns the frame's credit once"
         );
     }
 
@@ -5784,7 +5929,7 @@ mod tests {
         assert_eq!(&short[..8], &[0x33u8; 8]);
     }
 
-    /// A threaded connection spends one control write for four queued frames, and the end of the
+    /// A threaded connection spends one control write for four read frames, and the end of the
     /// stream flushes the credit still held: the peer's window never waits on a batch that no
     /// further DATA will complete.
     #[test]
@@ -5798,16 +5943,17 @@ mod tests {
             }),
             true,
         );
-        let (_reader, _writer, _out) = conn.open(1, false).expect("stream opens");
-        for _ in 0..3 {
+        let (mut reader, _writer, _out) = conn.open(1, false).expect("stream opens");
+        for _ in 0..4 {
             assert!(queue_data(&conn, 0, 1, vec![0x5Au8; 16_384]));
         }
         assert_eq!(
             slices.load(Ordering::SeqCst),
             0,
-            "three frames are below the batch and grant nothing yet"
+            "queued frames grant nothing before they are read"
         );
-        assert!(queue_data(&conn, F_END, 1, vec![0x5Au8; 16_384]));
+        let mut got = vec![0u8; 4 * 16_384];
+        reader.read_exact(&mut got).expect("reads every frame");
         for _ in 0..100 {
             if slices.load(Ordering::SeqCst) > 0 {
                 break;
@@ -5817,7 +5963,7 @@ mod tests {
         assert_eq!(
             slices.load(Ordering::SeqCst),
             1,
-            "four frames and the end go out as one credit"
+            "four read frames go out as one credit"
         );
         assert!(
             conn.control.drained(Duration::from_secs(1)),
@@ -5828,7 +5974,7 @@ mod tests {
         assert_eq!(
             u32::from_be_bytes(bytes[9..13].try_into().unwrap()),
             CREDIT_BATCH_BYTES as u32,
-            "the batch carries every queued byte"
+            "the batch carries every read byte"
         );
     }
 
@@ -6245,6 +6391,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: true,
                 request_ended: false,
@@ -6309,6 +6456,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -6410,6 +6558,7 @@ mod tests {
             id: 1,
             at: 0,
             cur: Vec::new(),
+            cur_wire: 0,
             idle_since: None,
         };
         let mut buf = [0u8; 8];
@@ -6446,6 +6595,7 @@ mod tests {
             id: 1,
             at: 0,
             cur: Vec::new(),
+            cur_wire: 0,
             idle_since: None,
         };
         let mut buf = [0u8; 8];
@@ -6482,6 +6632,7 @@ mod tests {
             id: 1,
             at: 0,
             cur: Vec::new(),
+            cur_wire: 0,
             idle_since: None,
         };
         let mut buf = [0u8; 8];
@@ -6509,6 +6660,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -6555,6 +6707,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: true,
                 finished: false,
                 request_ended: false,
@@ -6616,6 +6769,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -6652,6 +6806,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -6790,6 +6945,7 @@ mod tests {
 
     /// A DATA frame's credit is what the frame cost the peer's window — the whole wire payload, Pad Length octet and Padding counted (RFC 7540 6.9, where the reference takes `f.Length`) — so both `WINDOW_UPDATE` halves carry `1 + payload + pad`. Crediting the post-cut payload under-credits every padded frame by `1 + pad`; crediting a swallowed payload nothing starves the peer outright.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn a_padded_data_credit_counts_the_whole_wire_payload() {
         let (conn, written, slices) = bare_conn();
         let settings = XhttpSettings::stream_one();
@@ -6797,6 +6953,7 @@ mod tests {
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
+                credit: VecDeque::new(),
                 ended: false,
                 finished: false,
                 request_ended: false,
@@ -6825,6 +6982,15 @@ mod tests {
             vec![2u8, b'a', b'b', b'c', b'd', b'e', b'f', 2, 2],
             &mut frag
         ));
+        let mut reader = H2StreamReader {
+            conn: Arc::clone(&conn),
+            stream: Arc::clone(&state),
+            id: 1,
+            at: 0,
+            cur: Vec::new(),
+            cur_wire: 0,
+            idle_since: None,
+        };
         {
             let st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
             assert_eq!(
@@ -6833,8 +6999,10 @@ mod tests {
                 "the queued chunk is still the cut payload"
             );
         }
+        let mut got = [0u8; 6];
+        reader.read_exact(&mut got).expect("reads the padded body");
+        assert_eq!(&got, b"abcdef");
         expect_one_credit(&written, &slices, 1, 9);
-
         // A pad that swallows the payload: the cut returns nothing, the frame still cost the peer its wire length.
         written
             .lock()
@@ -6884,7 +7052,108 @@ mod tests {
             vec![7u8; 5],
             &mut frag
         ));
+        let mut got = [0u8; 5];
+        reader.read_exact(&mut got).expect("reads the plain body");
         expect_one_credit(&written, &slices, 1, 5);
+    }
+
+    /// An unread body keeps the peer's window spent, and a peer that ignores it is reset at the
+    /// queue cap instead of growing the body without bound.
+    #[test]
+    fn an_unread_body_holds_its_window_and_the_queue_is_capped() {
+        let (conn, written, slices) = bare_conn();
+        let settings = XhttpSettings::stream_one();
+        let mut frag: Option<(u32, Vec<u8>, bool)> = None;
+        let (mut reader, _writer, _out) = conn.open(1, false).expect("stream opens");
+        written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        assert!(pump_frame(
+            &conn,
+            &test_service(&settings),
+            T_DATA,
+            0,
+            1,
+            vec![0x5Au8; 16_384],
+            &mut frag
+        ));
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            0,
+            "an unread frame returns no window"
+        );
+        assert!(
+            written
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "no WINDOW_UPDATE leaves the queue"
+        );
+        let mut body = vec![0u8; 16_384];
+        reader.read_exact(&mut body).expect("reads the frame");
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            1,
+            "reading the frame returns its window"
+        );
+
+        written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        for _ in 0..256 {
+            assert!(queue_data(&conn, 0, 1, vec![0x5Au8; 16_384]));
+        }
+        assert!(queue_data(&conn, 0, 1, vec![0x5Au8; 16_383]));
+        assert!(
+            conn.streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&1),
+            "a body one byte under the cap is still queued"
+        );
+        assert!(queue_data(&conn, 0, 1, vec![0x5Au8]));
+        assert!(
+            conn.streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&1),
+            "a body exactly at the cap is still queued"
+        );
+        assert!(queue_data(&conn, 0, 1, vec![0x5Au8]));
+        assert!(
+            !conn
+                .streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&1),
+            "the stream past the body cap is reset"
+        );
+        assert!(
+            body_is_empty(&reader),
+            "the capped stream drops its queued body"
+        );
+        let out = written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert!(
+            out.windows(9).any(|head| {
+                head[3] == T_RST && u32::from_be_bytes([head[5], head[6], head[7], head[8]]) == 1
+            }),
+            "the capped stream is reset on the wire"
+        );
+    }
+
+    fn body_is_empty(reader: &H2StreamReader) -> bool {
+        reader
+            .stream
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .body
+            .is_empty()
     }
 
     #[test]

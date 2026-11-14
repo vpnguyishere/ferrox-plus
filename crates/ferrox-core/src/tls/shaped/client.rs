@@ -3,7 +3,7 @@ use super::hello::{Hello, TLS12};
 use super::kdf::{self, Hash};
 use super::record::{self, Direction, Suite};
 use super::{Fingerprint, Profile};
-use crate::tls::{RecordAlignment, Stream, TlsConfig, TlsError, TlsProvider};
+use crate::tls::{ktls, RawFd, RecordAlignment, Stream, TlsConfig, TlsError, TlsProvider};
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::io::{Read, Write};
@@ -50,6 +50,7 @@ enum Version {
 
 /// One shaped client session: the same stream shape as every other TLS provider,
 /// with the record keys and transcript in this type rather than a rustls connection.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Session<S: Stream> {
     io: S,
     verifier: Arc<dyn ServerCertVerifier>,
@@ -80,6 +81,9 @@ pub struct Session<S: Stream> {
     out: Vec<u8>,
     key_log: Option<Arc<dyn rustls::KeyLog>>,
     client_cert: Option<ClientIdentity>,
+    ktls: Option<ktls::Layer>,
+    kernel_tx: bool,
+    kernel_rx: bool,
 }
 
 /// The identity a shaped dial presents when a server asks: the chain in presentation order and the
@@ -222,6 +226,8 @@ impl<S: Stream> Session<S> {
         }
         let verifier = crate::tls::rustls_backend::verifier(cfg)?;
         let mut session = Self::with_hello(profile, cfg.server_name.clone(), verifier, hello, io)?;
+        session.kernel_tx = cfg.kernel_tx;
+        session.kernel_rx = cfg.kernel_rx;
         session.set_key_log(cfg.master_key_log.clone());
         session.client_cert = cfg
             .client_cert
@@ -279,6 +285,9 @@ impl<S: Stream> Session<S> {
             out: Vec::new(),
             key_log: None,
             client_cert: None,
+            ktls: None,
+            kernel_tx: false,
+            kernel_rx: false,
         })
     }
 
@@ -1420,9 +1429,68 @@ impl<S: Stream> TlsProvider for Session<S> {
         self.leaf.as_deref()
     }
 
+    fn wants_ktls(&self) -> bool {
+        self.kernel_tx || self.kernel_rx
+    }
+
+    fn kernel_rx(&self) -> bool {
+        self.ktls.as_ref().is_some_and(ktls::Layer::rx_offloaded)
+    }
+
+    fn enable_ktls(&mut self, fd: RawFd) -> std::io::Result<()> {
+        if self.ktls.is_some() || !self.wants_ktls() {
+            return Ok(());
+        }
+        if !self.done || self.version != Some(Version::Tls13) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "ktls: the shaped session did not negotiate TLS 1.3",
+            ));
+        }
+        let tx = self
+            .write_key
+            .as_ref()
+            .and_then(Direction::ktls_material)
+            .map(|(cipher, hash, secret, seq)| ktls::Material {
+                cipher,
+                hash,
+                secret,
+                seq,
+            })
+            .ok_or_else(|| std::io::Error::other("ktls: no TX traffic secret"))?;
+        let rx = self
+            .read_key
+            .as_ref()
+            .and_then(Direction::ktls_material)
+            .map(|(cipher, hash, secret, seq)| ktls::Material {
+                cipher,
+                hash,
+                secret,
+                seq,
+            })
+            .ok_or_else(|| std::io::Error::other("ktls: no RX traffic secret"))?;
+        self.ktls = Some(ktls::Layer::new(
+            fd,
+            self.kernel_tx,
+            self.kernel_rx,
+            tx,
+            rx,
+        )?);
+        Ok(())
+    }
+
+    fn account_ktls_reads(&mut self, reads: std::sync::Arc<dyn Fn(usize) + Send + Sync>) {
+        if let Some(layer) = &mut self.ktls {
+            layer.account_reads(reads);
+        }
+    }
+
     fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
         if !self.done {
             return Err(std::io::Error::other("shaped: handshake incomplete"));
+        }
+        if let Some(layer) = &mut self.ktls {
+            return layer.open(ciphertext, buf);
         }
         if self.plain_at < self.plain_end {
             return Ok((self.deliver(buf), 0));
@@ -1445,6 +1513,9 @@ impl<S: Stream> TlsProvider for Session<S> {
         if !self.done {
             return Err(std::io::Error::other("shaped: handshake incomplete"));
         }
+        if let Some(layer) = &mut self.ktls {
+            return layer.seal_into(&[plaintext], out);
+        }
         self.seal_parts(&[plaintext], out)
             .map_err(std::io::Error::other)?;
         Ok(plaintext.len())
@@ -1453,6 +1524,10 @@ impl<S: Stream> TlsProvider for Session<S> {
     fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
         if !self.done {
             return Err(std::io::Error::other("shaped: handshake incomplete"));
+        }
+        if let Some(layer) = &mut self.ktls {
+            layer.seal_into(parts, out)?;
+            return Ok(());
         }
         self.seal_parts(parts, out).map_err(std::io::Error::other)
     }
@@ -1471,6 +1546,9 @@ impl<S: Stream + RecordAlignment> RecordAlignment for Session<S> {
         if !self.done {
             self.run().map_err(std::io::Error::other)?;
         }
+        if let Some(layer) = &mut self.ktls {
+            return layer.write_all(&mut self.io, parts);
+        }
         self.flush_reply()?;
         self.seal_out(parts)
     }
@@ -1483,6 +1561,9 @@ impl<S: Stream> Read for Session<S> {
         }
         if !self.done {
             self.run().map_err(std::io::Error::other)?;
+        }
+        if let Some(layer) = &mut self.ktls {
+            return layer.read(&mut self.io, buf);
         }
         self.flush_reply()?;
         self.pump(buf).map_err(std::io::Error::other)
@@ -1497,11 +1578,17 @@ impl<S: Stream> Write for Session<S> {
         if !self.done {
             self.run().map_err(std::io::Error::other)?;
         }
+        if let Some(layer) = &mut self.ktls {
+            return layer.write(&mut self.io, buf);
+        }
         self.seal_out(&[buf])?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(layer) = &mut self.ktls {
+            return layer.flush(&mut self.io);
+        }
         self.io.flush()
     }
 }
@@ -2273,6 +2360,9 @@ mod tests {
             out: Vec::new(),
             key_log: None,
             client_cert: None,
+            ktls: None,
+            kernel_tx: false,
+            kernel_rx: false,
         }
     }
 

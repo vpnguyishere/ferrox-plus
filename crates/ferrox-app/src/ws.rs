@@ -250,18 +250,15 @@ pub(crate) struct WsReader<R: Read = Connection> {
     have: Vec<u8>,
     /// Cursor into `have`; `have[at..]` is what is left.
     at: usize,
-    /// End of the message being delivered, so a small `read` returns part and the rest stays.
+    /// End of the frame being delivered, so a small `read` returns part and the rest stays.
     msg_end: usize,
     early: Vec<u8>,
     eat: usize,
     eof: bool,
     /// A relay window is filling: its spans are offsets into `have`, so nothing may compact it under them.
     coalesce: bool,
-    /// A fragmented message is mid-assembly: the buffer must not compact under its offsets.
+    /// A fragmented message is open: the next data frame must be its continuation.
     assembling: bool,
-    /// Start of the message being assembled, and the offset its fragments are packed to.
-    whole: usize,
-    filled: usize,
     /// Wall-clock end of the opening handshake: past it an idle socket is death, not a round to retry.
     handshake: Option<std::time::Instant>,
     #[cfg_attr(not(test), allow(dead_code, reason = "read by the syscall gate"))]
@@ -302,7 +299,8 @@ impl<R: Read> WsReader<R> {
 
     /// Drops the consumed prefix, so a window that must not compact can still start small.
     fn compact(&mut self) {
-        if self.at > 0 && !self.assembling {
+        // Delivery is frame by frame, so bytes behind the cursor are dead even while a message remains open.
+        if self.at > 0 {
             self.have.copy_within(self.at.., 0);
             self.have.truncate(self.have.len() - self.at);
             self.msg_end = self.msg_end.saturating_sub(self.at);
@@ -430,19 +428,14 @@ impl<R: Read> WsReader<R> {
         }
     }
 
-    /// Parse frames until a message ends: control frames answered on the spot, data unmasked where they lie.
+    /// Parse the next data frame and expose its payload where it landed: control frames answered on the spot, a fragment delivered before its message ends. The bytes are unmasked in place and never packed, so an endless fragmented message costs one frame, not the sum of its fragments.
     fn message(&mut self, fill: bool) -> std::io::Result<bool> {
-        if !self.assembling {
-            self.whole = 0;
-            self.filled = 0;
-        }
-        let mut open = self.assembling;
+        let open = self.assembling;
         loop {
             let Some(frame) = self.frame(fill)? else {
                 return Ok(false);
             };
             let start = frame.payload.start;
-            let len = frame.payload.len();
             let end = frame.payload.end;
             // Ready data returns first: a reply can block on the shared write lock or a peer that stopped reading.
             if !fill && matches!(frame.opcode, OP_CLOSE | OP_PING | OP_PONG) {
@@ -474,30 +467,12 @@ impl<R: Read> WsReader<R> {
                         return Ok(false);
                     }
                     if let Some(mask) = frame.mask {
-                        apply_mask(&mut self.have[frame.payload.clone()], mask);
+                        apply_mask(&mut self.have[frame.payload], mask);
                     }
-                    if !open {
-                        self.whole = start;
-                        self.filled = start;
-                    } else if self.filled != start {
-                        self.have.copy_within(frame.payload.clone(), self.filled);
-                    }
-                    self.at = end;
-                    if frame.fin {
-                        let gap = start.saturating_sub(self.filled);
-                        if gap > 0 {
-                            let tail = end;
-                            self.have.copy_within(tail.., self.filled + len);
-                            self.have.truncate(self.have.len() - gap);
-                        }
-                        self.msg_end = self.filled + len;
-                        self.at = self.whole;
-                        self.assembling = false;
-                        return Ok(true);
-                    }
-                    self.assembling = true;
-                    self.filled += len;
-                    open = true;
+                    self.msg_end = end;
+                    self.at = start;
+                    self.assembling = !frame.fin;
+                    return Ok(true);
                 }
                 _ => return Ok(false),
             }
@@ -1122,8 +1097,6 @@ pub(crate) fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
         eof: false,
         coalesce: false,
         assembling: false,
-        whole: 0,
-        filled: 0,
         handshake: None,
         reads: 0,
     };
@@ -1359,8 +1332,6 @@ mod tests {
                     eof: false,
                     coalesce: false,
                     assembling: false,
-                    whole: 0,
-                    filled: 0,
                     handshake: None,
                     reads: 0,
                 };
@@ -1517,8 +1488,6 @@ mod tests {
             eof: false,
             coalesce: false,
             assembling: false,
-            whole: 0,
-            filled: 0,
             handshake: None,
             reads: 0,
         };
@@ -1554,8 +1523,6 @@ mod tests {
             eof: false,
             coalesce: false,
             assembling: false,
-            whole: 0,
-            filled: 0,
             handshake: None,
             reads: 0,
         };
@@ -1624,23 +1591,25 @@ mod tests {
             eof: false,
             coalesce: false,
             assembling: false,
-            whole: 0,
-            filled: 0,
             handshake: None,
             reads: 0,
         };
         let mut buf = [0u8; 4096];
         let n = reader.read(&mut buf).expect("reads");
-        assert_eq!(&buf[..n], b"READY", "the ready message leaves first");
+        assert!(
+            buf[..n].starts_with(b"READY"),
+            "the ready message leaves before the control reply"
+        );
         assert!(
             kept.lock().expect("kept").is_empty(),
             "no control reply holds the ready data"
         );
+        let mut whole = buf[..n].to_vec();
         let n = reader.read(&mut buf).expect("reads");
+        whole.extend_from_slice(&buf[..n]);
         assert_eq!(
-            &buf[..n],
-            b"AAAABBBB",
-            "the resumed fragments reassemble exactly"
+            whole, b"READYAAAABBBB",
+            "the resumed fragments arrive in order"
         );
         let replies = kept.lock().expect("kept");
         let (mut at, mut pongs) = (0, 0);
@@ -1686,8 +1655,6 @@ mod tests {
             eof: false,
             coalesce: false,
             assembling: false,
-            whole: 0,
-            filled: 0,
             handshake: None,
             reads: 0,
         };
@@ -1736,6 +1703,25 @@ mod tests {
             whole.extend_from_slice(&buf[..n]);
         }
         assert_eq!(whole, payload, "text-then-continuation");
+    }
+
+    #[test]
+    fn a_fragment_reaches_the_reader_before_the_message_fin() {
+        // A peer that never sends FIN must not make the tunnel buffer fragments forever: the first non-FIN frame is readable as it stands.
+        let payload = [0x5Au8; 64];
+        let mut wire = vec![OP_DATA, payload.len() as u8];
+        wire.extend_from_slice(&payload);
+        let mut reader = window_reader(std::io::Cursor::new(wire), Vec::new());
+        let mut got = [0u8; 16];
+        let n = reader.read(&mut got).expect("reads");
+        assert_eq!(&got[..n], &payload[..n], "the fragment arrived before FIN");
+        assert!(reader.assembling, "the message is still open");
+        let n = reader.read(&mut got).expect("reads");
+        assert_eq!(
+            &got[..n],
+            &payload[16..32],
+            "the frame continues without a FIN"
+        );
     }
 
     struct Dribble {
@@ -1789,8 +1775,6 @@ mod tests {
             eof: false,
             coalesce: false,
             assembling: false,
-            whole: 0,
-            filled: 0,
             handshake: None,
             reads: 0,
         };
@@ -1839,8 +1823,6 @@ mod tests {
             eof: false,
             coalesce: false,
             assembling: false,
-            whole: 0,
-            filled: 0,
             handshake: None,
             reads: 0,
         };
@@ -1896,8 +1878,6 @@ mod tests {
             eof: false,
             coalesce: false,
             assembling: false,
-            whole: 0,
-            filled: 0,
             handshake: None,
             reads: 0,
         };
@@ -2132,8 +2112,6 @@ mod tests {
             eof: false,
             coalesce: false,
             assembling: false,
-            whole: 0,
-            filled: 0,
             handshake: None,
             reads: 0,
         }
@@ -2168,9 +2146,9 @@ mod tests {
         );
     }
 
-    /// A fragmented message whose second fragment is not in hand joins across calls, and the first fragment is not delivered twice.
+    /// A fragmented message whose later fragments are not in hand is delivered fragment by fragment across calls, and the first one is not delivered twice.
     #[test]
-    fn a_fragmented_window_joins_across_calls() {
+    fn a_fragmented_window_carries_each_fragment_across_calls() {
         struct Chunks(std::vec::IntoIter<Vec<u8>>);
 
         impl Read for Chunks {
@@ -2197,15 +2175,11 @@ mod tests {
         let mut reader = window_reader(Chunks(vec![first, second].into_iter()), Vec::new());
         {
             let one = crate::proxy::WindowRead::read_window(&mut reader).expect("reads A");
-            assert_eq!(one.parts().len(), 2, "the window pulls the fragment in");
-            assert_eq!(
-                &one.bytes()[one.parts()[0].0..][..one.parts()[0].1],
-                &b"A"[..]
-            );
-            assert_eq!(
-                &one.bytes()[one.parts()[1].0..][..one.parts()[1].1],
-                b"hello world"
-            );
+            assert_eq!(one.parts().len(), 3, "each frame keeps its own span");
+            let want = [&b"A"[..], &b"hello"[..], &b" world"[..]];
+            for (&(start, len), want) in one.parts().iter().zip(want) {
+                assert_eq!(&one.bytes()[start..start + len], want);
+            }
         }
         assert!(
             crate::proxy::WindowRead::read_window(&mut reader)

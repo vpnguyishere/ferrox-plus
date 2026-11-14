@@ -194,6 +194,10 @@ finalmask  finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather  fer
 # in the encoder/decoder probes rather than in the test that drives them.
 finalmask  finalmask::sudoku::tests::the_sudoku_wire_costs_the_bytes_and_nothing_else  ferrox_core::finalmask::sudoku::tests::encode_probe
 finalmask  finalmask::sudoku::tests::the_sudoku_wire_costs_the_bytes_and_nothing_else  ferrox_core::finalmask::sudoku::tests::decode_probe
+# The block-batched CFB8 decrypt and the byte walk it replaced, both under one 64 KiB probe: one
+# ops job reports both frames, and only their difference is a claim about the batch.
+finalmask  finalmask::xmc::cfb8::tests::the_block_decrypt_costs_the_blocks_and_nothing_else  ferrox_core::finalmask::xmc::cfb8::tests::block_decrypt_probe
+finalmask  finalmask::xmc::cfb8::tests::the_block_decrypt_costs_the_blocks_and_nothing_else  ferrox_core::finalmask::xmc::cfb8::tests::serial_decrypt_probe
 reverse  proxy::reverse_tests::a_sixteen_kib_downlink_is_echoed_whole  reverse::Session::read_loop
 http-proxy  proxy::tests::the_connect_request_builds_in_one_buffer  proxy::http_connect_request
 http-proxy  proxy::tests::http_request_parses_connect_and_both_get_forms  proxy::http_proxy_request

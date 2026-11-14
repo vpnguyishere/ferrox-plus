@@ -1,4 +1,4 @@
-use super::{Stream, TlsConfig, TlsError, TlsProvider};
+use super::{RawFd, Stream, TlsConfig, TlsError, TlsProvider};
 use sha2::Digest;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -60,6 +60,11 @@ pub struct RustlsProvider<S: Stream> {
     conn: rustls::ClientConnection,
     io: S,
     eof: bool,
+    ktls_tx: bool,
+    ktls_rx: bool,
+    captured: Option<Arc<Mutex<Captured>>>,
+    ktls: Option<crate::tls::ktls::Layer>,
+    hsbuf: Vec<u8>,
 }
 
 impl<S: Stream> std::fmt::Debug for RustlsProvider<S> {
@@ -760,16 +765,235 @@ fn client_config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError>
     Ok(built)
 }
 
+/// The TLS 1.3 traffic secrets a kTLS install needs, captured from rustls's key log.
+#[derive(Default)]
+struct Captured {
+    client: Option<Vec<u8>>,
+    server: Option<Vec<u8>>,
+}
+
+/// Forwards to the configured key log and keeps the two traffic secrets; a buffered connection
+/// exposes only key and IV, and a `KeyUpdate` needs the secret the next generation expands from.
+struct CaptureKeyLog {
+    inner: Arc<dyn rustls::KeyLog>,
+    captured: Arc<Mutex<Captured>>,
+}
+
+impl std::fmt::Debug for CaptureKeyLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaptureKeyLog").finish_non_exhaustive()
+    }
+}
+
+impl rustls::KeyLog for CaptureKeyLog {
+    fn will_log(&self, label: &str) -> bool {
+        matches!(label, "CLIENT_TRAFFIC_SECRET_0" | "SERVER_TRAFFIC_SECRET_0")
+            || self.inner.will_log(label)
+    }
+
+    fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
+        if let Ok(mut captured) = self.captured.lock() {
+            match label {
+                "CLIENT_TRAFFIC_SECRET_0" => captured.client = Some(secret.to_vec()),
+                "SERVER_TRAFFIC_SECRET_0" => captured.server = Some(secret.to_vec()),
+                _ => {}
+            }
+        }
+        if self.inner.will_log(label) {
+            self.inner.log(label, client_random, secret);
+        }
+    }
+}
+
+fn captured_client_config(
+    cfg: &TlsConfig,
+) -> Result<(Arc<rustls::ClientConfig>, Arc<Mutex<Captured>>), TlsError> {
+    let base = client_config(cfg)?;
+    let captured = Arc::new(Mutex::new(Captured::default()));
+    let mut config = (*base).clone();
+    config.key_log = Arc::new(CaptureKeyLog {
+        inner: config.key_log.clone(),
+        captured: Arc::clone(&captured),
+    });
+    Ok((Arc::new(config), captured))
+}
+
+fn captured_server_config(
+    cfg: &super::TlsServerConfig,
+) -> Result<(Arc<rustls::ServerConfig>, Arc<Mutex<Captured>>), TlsError> {
+    let base = cfg.server_config()?;
+    let captured = Arc::new(Mutex::new(Captured::default()));
+    let mut config = (*base).clone();
+    config.key_log = Arc::new(CaptureKeyLog {
+        inner: config.key_log.clone(),
+        captured: Arc::clone(&captured),
+    });
+    Ok((Arc::new(config), captured))
+}
+
+fn ktls_material(
+    suite: rustls::CipherSuite,
+    secret: Vec<u8>,
+) -> std::io::Result<crate::tls::ktls::Material> {
+    use crate::tls::ktls::{Cipher, Material};
+    use crate::tls::shaped::kdf::Hash;
+    let (cipher, hash) = match suite {
+        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256 => (Cipher::Aes128Gcm, Hash::Sha256),
+        rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => (Cipher::Aes256Gcm, Hash::Sha384),
+        rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => {
+            (Cipher::ChaCha20Poly1305, Hash::Sha256)
+        }
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("ktls: suite {other:?} is not TLS 1.3"),
+            ))
+        }
+    };
+    Ok(Material {
+        cipher,
+        hash,
+        secret,
+        seq: 0,
+    })
+}
+
+/// The subset of a rustls connection a handshake driver needs.
+trait RecordDriver {
+    fn is_handshaking(&self) -> bool;
+    fn wants_write(&self) -> bool;
+    fn write_tls(&mut self, wr: &mut dyn Write) -> std::io::Result<usize>;
+    fn read_tls(&mut self, rd: &mut dyn Read) -> std::io::Result<usize>;
+    fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error>;
+}
+
+impl RecordDriver for rustls::ClientConnection {
+    fn is_handshaking(&self) -> bool {
+        rustls::CommonState::is_handshaking(self)
+    }
+    fn wants_write(&self) -> bool {
+        rustls::CommonState::wants_write(self)
+    }
+    fn write_tls(&mut self, wr: &mut dyn Write) -> std::io::Result<usize> {
+        rustls::ConnectionCommon::write_tls(self, wr)
+    }
+    fn read_tls(&mut self, rd: &mut dyn Read) -> std::io::Result<usize> {
+        rustls::ConnectionCommon::read_tls(self, rd)
+    }
+    fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
+        rustls::ConnectionCommon::process_new_packets(self)
+    }
+}
+
+impl RecordDriver for rustls::ServerConnection {
+    fn is_handshaking(&self) -> bool {
+        rustls::CommonState::is_handshaking(self)
+    }
+    fn wants_write(&self) -> bool {
+        rustls::CommonState::wants_write(self)
+    }
+    fn write_tls(&mut self, wr: &mut dyn Write) -> std::io::Result<usize> {
+        rustls::ConnectionCommon::write_tls(self, wr)
+    }
+    fn read_tls(&mut self, rd: &mut dyn Read) -> std::io::Result<usize> {
+        rustls::ConnectionCommon::read_tls(self, rd)
+    }
+    fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
+        rustls::ConnectionCommon::process_new_packets(self)
+    }
+}
+
+/// Reads one whole TLS record into `buf`, keeping a partial record across a timeout.
+fn read_record<R: Read + ?Sized>(io: &mut R, buf: &mut Vec<u8>) -> Result<(), TlsError> {
+    let mut chunk = [0u8; 4096];
+    while buf.len() < 5 {
+        let want = 5 - buf.len();
+        match io.read(&mut chunk[..want]) {
+            Ok(0) => return Err(TlsError::Closed),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(error) => return Err(recover(error)),
+        }
+    }
+    let len = usize::from(u16::from_be_bytes([buf[3], buf[4]]));
+    let total = 5 + len;
+    while buf.len() < total {
+        let want = (total - buf.len()).min(chunk.len());
+        match io.read(&mut chunk[..want]) {
+            Ok(0) => return Err(TlsError::Closed),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(error) => return Err(recover(error)),
+        }
+    }
+    Ok(())
+}
+
+/// Feeds every byte to rustls, whose `read_tls` may accept only one buffer at a time.
+fn feed_tls<C: RecordDriver>(conn: &mut C, ciphertext: &[u8]) -> Result<usize, TlsError> {
+    let mut cursor = std::io::Cursor::new(ciphertext);
+    while (cursor.position() as usize) < ciphertext.len() {
+        let before = cursor.position();
+        conn.read_tls(&mut cursor).map_err(recover)?;
+        if cursor.position() == before {
+            break;
+        }
+    }
+    Ok(cursor.position() as usize)
+}
+
+/// Drives a handshake one TLS record at a time, so no post-handshake record is consumed from the
+/// socket: the kernel must decrypt it after `setsockopt`.
+fn drive_records<C: RecordDriver, S: Stream>(
+    conn: &mut C,
+    io: &mut S,
+    buf: &mut Vec<u8>,
+) -> Result<(), TlsError> {
+    while conn.is_handshaking() {
+        while conn.wants_write() {
+            if conn.write_tls(io).map_err(recover)? == 0 {
+                break;
+            }
+        }
+        if !conn.is_handshaking() {
+            break;
+        }
+        read_record(io, buf)?;
+        if feed_tls(conn, &buf[..])? != buf.len() {
+            return Err(TlsError::Other(
+                "rustls left a handshake record unread".to_owned(),
+            ));
+        }
+        conn.process_new_packets()
+            .map_err(|error| map_error(&error))?;
+        buf.clear();
+    }
+    while conn.wants_write() {
+        if conn.write_tls(io).map_err(recover)? == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
 impl<S: Stream> RustlsProvider<S> {
     pub fn connect(cfg: &TlsConfig, io: S) -> Result<Self, TlsError> {
         let name = rustls::pki_types::ServerName::try_from(cfg.server_name.clone())
             .map_err(|e| TlsError::Other(format!("rustls server name: {e}")))?;
-        let conn =
-            rustls::ClientConnection::new(client_config(cfg)?, name).map_err(|e| map_error(&e))?;
+        let (config, captured) = if cfg.kernel_tx || cfg.kernel_rx {
+            let (config, captured) = captured_client_config(cfg)?;
+            (config, Some(captured))
+        } else {
+            (client_config(cfg)?, None)
+        };
+        let conn = rustls::ClientConnection::new(config, name).map_err(|e| map_error(&e))?;
         Ok(Self {
             conn,
             io,
             eof: false,
+            ktls_tx: cfg.kernel_tx,
+            ktls_rx: cfg.kernel_rx,
+            captured,
+            ktls: None,
+            hsbuf: Vec::new(),
         })
     }
 
@@ -780,6 +1004,11 @@ impl<S: Stream> RustlsProvider<S> {
             conn,
             io,
             eof: false,
+            ktls_tx: false,
+            ktls_rx: false,
+            captured: None,
+            ktls: None,
+            hsbuf: Vec::new(),
         }
     }
 
@@ -795,6 +1024,12 @@ impl<S: Stream> RustlsProvider<S> {
     }
 
     fn drive(&mut self) -> Result<(), TlsError> {
+        if self.ktls.is_some() {
+            return Ok(());
+        }
+        if self.ktls_tx || self.ktls_rx {
+            return drive_records(&mut self.conn, &mut self.io, &mut self.hsbuf);
+        }
         while self.conn.is_handshaking() {
             if let Err(e) = self.conn.complete_io(&mut self.io) {
                 return Err(recover(e));
@@ -815,7 +1050,50 @@ impl<S: Stream> RustlsProvider<S> {
 
     /// Whether the peer's close has already been read.
     pub fn closed(&self) -> bool {
-        self.eof
+        self.eof || self.ktls.as_ref().is_some_and(crate::tls::ktls::Layer::eof)
+    }
+
+    fn install_ktls(&mut self, fd: RawFd) -> std::io::Result<()> {
+        if self.ktls.is_some() || (!self.ktls_tx && !self.ktls_rx) {
+            return Ok(());
+        }
+        if self.conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ktls: the handshake did not settle on TLS 1.3",
+            ));
+        }
+        let suite = self
+            .conn
+            .negotiated_cipher_suite()
+            .ok_or_else(|| std::io::Error::other("ktls: no negotiated suite"))?
+            .suite();
+        let captured = self
+            .captured
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("ktls: no captured traffic secrets"))?;
+        let (client, server) = {
+            let captured = captured
+                .lock()
+                .map_err(|_| std::io::Error::other("ktls: captured secrets were poisoned"))?;
+            (captured.client.clone(), captured.server.clone())
+        };
+        let tx = ktls_material(
+            suite,
+            client.ok_or_else(|| std::io::Error::other("ktls: no client traffic secret"))?,
+        )?;
+        let rx = ktls_material(
+            suite,
+            server.ok_or_else(|| std::io::Error::other("ktls: no server traffic secret"))?,
+        )?;
+        self.ktls = Some(crate::tls::ktls::Layer::new(
+            fd,
+            self.ktls_tx,
+            self.ktls_rx,
+            tx,
+            rx,
+        )?);
+        Ok(())
     }
 
     /// Writes two slices as one TLS record: the fragmenter sees `head` and `tail`
@@ -824,6 +1102,9 @@ impl<S: Stream> RustlsProvider<S> {
     /// record being split in two.
     pub fn write_parts(&mut self, head: &[u8], mut tail: &[u8]) -> std::io::Result<()> {
         self.drive()?;
+        if let Some(layer) = &mut self.ktls {
+            return layer.write_all(&mut self.io, &[head, tail]);
+        }
         let mut head = head;
         let want = head.len() + tail.len();
         let mut written = 0usize;
@@ -856,6 +1137,9 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsProvid
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         const CHUNK: usize = 32 * 1024;
         self.drive()?;
+        if let Some(layer) = &mut self.ktls {
+            return layer.write_all(&mut self.io, parts);
+        }
         if parts.iter().map(|part| part.len()).sum::<usize>() <= CHUNK {
             coalesce(&mut self.conn.writer(), parts)?;
             return self.send_pending();
@@ -913,6 +1197,9 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
 
     fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
         self.drive()?;
+        if let Some(layer) = &mut self.ktls {
+            return layer.seal_into(&[plaintext], out);
+        }
         let len = self.conn.writer().write(plaintext)?;
         self.drain_into(out)?;
         Ok(len)
@@ -920,11 +1207,18 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
 
     fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
         self.drive()?;
+        if let Some(layer) = &mut self.ktls {
+            layer.seal_into(parts, out)?;
+            return Ok(());
+        }
         coalesce(&mut self.conn.writer(), parts)?;
         self.drain_into(out)
     }
 
     fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+        if let Some(layer) = &mut self.ktls {
+            return layer.open(ciphertext, buf);
+        }
         // The plaintext the layer holds comes out first: its room is finite, and the ciphertext that follows waits for it.
         let plain = match self.conn.reader().read(buf) {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
@@ -963,13 +1257,36 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
         Ok((plain, taken))
     }
 
+    fn wants_ktls(&self) -> bool {
+        self.ktls_tx || self.ktls_rx
+    }
+
+    fn kernel_rx(&self) -> bool {
+        self.ktls
+            .as_ref()
+            .is_some_and(crate::tls::ktls::Layer::rx_offloaded)
+    }
+
+    fn enable_ktls(&mut self, fd: RawFd) -> std::io::Result<()> {
+        self.install_ktls(fd)
+    }
+
+    fn account_ktls_reads(&mut self, reads: std::sync::Arc<dyn Fn(usize) + Send + Sync>) {
+        if let Some(layer) = &mut self.ktls {
+            layer.account_reads(reads);
+        }
+    }
+
     fn closed(&self) -> bool {
-        self.eof
+        self.eof || self.ktls.as_ref().is_some_and(crate::tls::ktls::Layer::eof)
     }
 }
 
 impl<S: Stream> Read for RustlsProvider<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(layer) = &mut self.ktls {
+            return layer.read(&mut self.io, buf);
+        }
         loop {
             self.drive()?;
             match self.conn.reader().read(buf) {
@@ -1032,6 +1349,9 @@ impl<S: Stream> RustlsProvider<S> {
 impl<S: Stream> Write for RustlsProvider<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.drive()?;
+        if let Some(layer) = &mut self.ktls {
+            return layer.write(&mut self.io, buf);
+        }
         let len = self.conn.writer().write(buf)?;
         self.send_pending()?;
         Ok(len)
@@ -1039,6 +1359,9 @@ impl<S: Stream> Write for RustlsProvider<S> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.drive()?;
+        if let Some(layer) = &mut self.ktls {
+            return layer.flush(&mut self.io);
+        }
         self.conn.writer().flush()?;
         self.send_pending()?;
         Ok(())
@@ -1062,6 +1385,11 @@ enum ServerInner<S: Stream> {
 pub struct RustlsServerProvider<S: Stream> {
     inner: ServerInner<S>,
     eof: bool,
+    ktls_tx: bool,
+    ktls_rx: bool,
+    captured: Option<Arc<Mutex<Captured>>>,
+    ktls: Option<crate::tls::ktls::Layer>,
+    hsbuf: Vec<u8>,
 }
 
 impl<S: Stream> std::fmt::Debug for RustlsServerProvider<S> {
@@ -1111,6 +1439,7 @@ impl<S: Stream> RustlsServerProvider<S> {
         io: S,
         shaped: bool,
     ) -> Result<Self, TlsError> {
+        let (ktls_tx, ktls_rx) = (cfg.kernel_tx, cfg.kernel_rx);
         if cfg.ech_server_keys.is_some() {
             let ctx = cached_ech_server_context(&cfg)?;
             let mut ssl = boring::ssl::Ssl::new(&ctx).map_err(|error| boring_error(&error))?;
@@ -1123,23 +1452,17 @@ impl<S: Stream> RustlsServerProvider<S> {
             {
                 ssl.set_ocsp_status(&response).ok();
             }
-            return Ok(Self {
-                inner: ServerInner::Boring {
-                    handshake: Some(ssl.setup_accept(io)),
-                    stream: None,
-                    failure: None,
-                    ech: true,
-                },
-                eof: false,
-            });
+            return Ok(Self::plain(ServerInner::Boring {
+                handshake: Some(ssl.setup_accept(io)),
+                stream: None,
+                failure: None,
+                ech: true,
+            }));
         }
         if shaped {
-            return Ok(Self {
-                inner: ServerInner::Shaped(Box::new(crate::tls::shaped::server::Server::new(
-                    cfg, io,
-                ))),
-                eof: false,
-            });
+            return Ok(Self::plain(ServerInner::Shaped(Box::new(
+                crate::tls::shaped::server::Server::new(cfg, io),
+            ))));
         }
         if crate::tls::legacy::needed(&cfg.cipher_suites) {
             let ctx = crate::tls::legacy::server_context(&cfg)?;
@@ -1153,23 +1476,41 @@ impl<S: Stream> RustlsServerProvider<S> {
             {
                 ssl.set_ocsp_status(&response).ok();
             }
-            return Ok(Self {
-                inner: ServerInner::Boring {
-                    handshake: Some(ssl.setup_accept(io)),
-                    stream: None,
-                    failure: None,
-                    ech: false,
-                },
-                eof: false,
-            });
+            return Ok(Self::plain(ServerInner::Boring {
+                handshake: Some(ssl.setup_accept(io)),
+                stream: None,
+                failure: None,
+                ech: false,
+            }));
         }
-        let conn = Box::new(
-            rustls::ServerConnection::new(cfg.server_config()?).map_err(|e| map_error(&e))?,
-        );
+        let (config, captured) = if ktls_tx || ktls_rx {
+            let (config, captured) = captured_server_config(&cfg)?;
+            (config, Some(captured))
+        } else {
+            (cfg.server_config()?, None)
+        };
+        let conn = Box::new(rustls::ServerConnection::new(config).map_err(|e| map_error(&e))?);
         Ok(Self {
             inner: ServerInner::Rustls { conn, io },
             eof: false,
+            ktls_tx,
+            ktls_rx,
+            captured,
+            ktls: None,
+            hsbuf: Vec::new(),
         })
+    }
+
+    fn plain(inner: ServerInner<S>) -> Self {
+        Self {
+            inner,
+            eof: false,
+            ktls_tx: false,
+            ktls_rx: false,
+            captured: None,
+            ktls: None,
+            hsbuf: Vec::new(),
+        }
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -1178,14 +1519,26 @@ impl<S: Stream> RustlsServerProvider<S> {
             rustls::ServerConnection::new(cfg.reality_server_config()?)
                 .map_err(|e| map_error(&e))?,
         );
-        Ok(Self {
-            inner: ServerInner::Rustls { conn, io },
-            eof: false,
-        })
+        Ok(Self::plain(ServerInner::Rustls { conn, io }))
     }
 
     fn handshake(&mut self) -> Result<(), TlsError> {
-        match &mut self.inner {
+        if self.ktls.is_some() {
+            return Ok(());
+        }
+        let Self {
+            inner,
+            ktls_tx,
+            ktls_rx,
+            hsbuf,
+            ..
+        } = self;
+        if *ktls_tx || *ktls_rx {
+            if let ServerInner::Rustls { conn, io } = inner {
+                return drive_records(&mut **conn, io, hsbuf);
+            }
+        }
+        match inner {
             ServerInner::Rustls { conn, io } => {
                 while conn.is_handshaking() {
                     if let Err(e) = conn.complete_io(io) {
@@ -1241,6 +1594,54 @@ impl<S: Stream> RustlsServerProvider<S> {
             self.inner,
             ServerInner::Boring { .. } | ServerInner::Shaped(_)
         )
+    }
+
+    fn install_ktls(&mut self, fd: RawFd) -> std::io::Result<()> {
+        if self.ktls.is_some() || (!self.ktls_tx && !self.ktls_rx) {
+            return Ok(());
+        }
+        let ServerInner::Rustls { conn, .. } = &self.inner else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "ktls: this listener's backend cannot hand its records to the kernel",
+            ));
+        };
+        if conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ktls: the handshake did not settle on TLS 1.3",
+            ));
+        }
+        let suite = conn
+            .negotiated_cipher_suite()
+            .ok_or_else(|| std::io::Error::other("ktls: no negotiated suite"))?
+            .suite();
+        let captured = self
+            .captured
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("ktls: no captured traffic secrets"))?;
+        let (client, server) = {
+            let captured = captured
+                .lock()
+                .map_err(|_| std::io::Error::other("ktls: captured secrets were poisoned"))?;
+            (captured.client.clone(), captured.server.clone())
+        };
+        let tx = ktls_material(
+            suite,
+            server.ok_or_else(|| std::io::Error::other("ktls: no server traffic secret"))?,
+        )?;
+        let rx = ktls_material(
+            suite,
+            client.ok_or_else(|| std::io::Error::other("ktls: no client traffic secret"))?,
+        )?;
+        self.ktls = Some(crate::tls::ktls::Layer::new(
+            fd,
+            self.ktls_tx,
+            self.ktls_rx,
+            tx,
+            rx,
+        )?);
+        Ok(())
     }
 
     /// The suite the shaped listener negotiated, for a test that pins the reference's pick.
@@ -1305,6 +1706,11 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServer
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         self.handshake()?;
+        if let Some(layer) = &mut self.ktls {
+            if let ServerInner::Rustls { io, .. } = &mut self.inner {
+                return layer.write_all(io, parts);
+            }
+        }
         match &mut self.inner {
             ServerInner::Rustls { conn, io } => {
                 coalesce(&mut conn.writer(), parts)?;
@@ -1567,9 +1973,13 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
     };
     config.alpn_protocols.clear();
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
-    // rustls sends two tickets by default; REALITY arrivals carry none.
-    config.send_tls13_tickets = if cfg.send_tickets { 2 } else { 0 };
-    if cfg.send_tickets {
+    // A userspace TX starts at sequence zero whatever is offloaded, so a pre-install ticket must not consume it.
+    config.send_tls13_tickets = if cfg.send_tickets && !cfg.kernel_tx && !cfg.kernel_rx {
+        2
+    } else {
+        0
+    };
+    if config.send_tls13_tickets > 0 {
         if let Some(key) = ticket_key() {
             config.ticketer = key;
         }
@@ -1758,6 +2168,9 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
 
     fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
         self.handshake()?;
+        if let Some(layer) = &mut self.ktls {
+            return layer.seal_into(&[plaintext], out);
+        }
         match &mut self.inner {
             ServerInner::Rustls { conn, .. } => {
                 let len = conn.writer().write(plaintext)?;
@@ -1786,6 +2199,10 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
 
     fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
         self.handshake()?;
+        if let Some(layer) = &mut self.ktls {
+            layer.seal_into(parts, out)?;
+            return Ok(());
+        }
         match &mut self.inner {
             ServerInner::Rustls { conn, .. } => {
                 coalesce(&mut conn.writer(), parts)?;
@@ -1814,6 +2231,9 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
     }
 
     fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+        if let Some(layer) = &mut self.ktls {
+            return layer.open(ciphertext, buf);
+        }
         match &mut self.inner {
             ServerInner::Rustls { conn, .. } => {
                 let plain = match conn.reader().read(buf) {
@@ -1857,8 +2277,29 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
         }
     }
 
+    fn wants_ktls(&self) -> bool {
+        self.ktls_tx || self.ktls_rx
+    }
+
+    fn kernel_rx(&self) -> bool {
+        self.ktls
+            .as_ref()
+            .is_some_and(crate::tls::ktls::Layer::rx_offloaded)
+    }
+
+    fn enable_ktls(&mut self, fd: RawFd) -> std::io::Result<()> {
+        self.install_ktls(fd)
+    }
+
+    fn account_ktls_reads(&mut self, reads: std::sync::Arc<dyn Fn(usize) + Send + Sync>) {
+        if let Some(layer) = &mut self.ktls {
+            layer.account_reads(reads);
+        }
+    }
+
     fn closed(&self) -> bool {
         self.eof
+            || self.ktls.as_ref().is_some_and(crate::tls::ktls::Layer::eof)
             || match &self.inner {
                 ServerInner::Shaped(server) => server.closed(),
                 _ => false,
@@ -1869,6 +2310,11 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
 impl<S: Stream> Read for RustlsServerProvider<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.handshake()?;
+        if let Some(layer) = &mut self.ktls {
+            if let ServerInner::Rustls { io, .. } = &mut self.inner {
+                return layer.read(io, buf);
+            }
+        }
         match &mut self.inner {
             ServerInner::Rustls { conn, io } => loop {
                 match conn.reader().read(buf) {
@@ -1932,6 +2378,11 @@ impl<S: Stream> RustlsServerProvider<S> {
 impl<S: Stream> Write for RustlsServerProvider<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.handshake()?;
+        if let Some(layer) = &mut self.ktls {
+            if let ServerInner::Rustls { io, .. } = &mut self.inner {
+                return layer.write(io, buf);
+            }
+        }
         match &mut self.inner {
             ServerInner::Rustls { conn, io } => {
                 let len = conn.writer().write(buf)?;
@@ -1959,6 +2410,11 @@ impl<S: Stream> Write for RustlsServerProvider<S> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.handshake()?;
+        if let Some(layer) = &mut self.ktls {
+            if let ServerInner::Rustls { io, .. } = &mut self.inner {
+                return layer.flush(io);
+            }
+        }
         match &mut self.inner {
             ServerInner::Rustls { conn, io } => {
                 conn.writer().flush()?;
@@ -3564,6 +4020,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         }
     }
 
@@ -4059,6 +4517,59 @@ mod tests {
         assert!(sni_matches(&names, "a.wild.test"));
         assert!(!sni_matches(&names, "a.b.wild.test"));
         assert!(!sni_matches(&names, "other.test"));
+    }
+
+    /// The kernel path is the only place a kTLS claim can be observed: both directions
+    /// leave userspace, and the bytes still reach the peer and come back.
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "needs the Linux kernel TLS interface")]
+    #[test]
+    fn a_ktls_loopback_carries_both_directions() {
+        use std::os::fd::AsRawFd as _;
+
+        let mut identity = plain_identity();
+        identity.kernel_tx = true;
+        identity.kernel_rx = true;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accepts");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .expect("timeout");
+                let mut server = RustlsServerProvider::accept(identity, stream).expect("accepts");
+                server.handshake().expect("handshakes");
+                server
+                    .enable_ktls(server.get_ref().as_raw_fd())
+                    .expect("the server hands both directions to the kernel");
+                let mut ping = [0u8; 4];
+                server
+                    .read_exact(&mut ping)
+                    .expect("reads the kernel plaintext");
+                server.write_all(&ping).expect("writes through the kernel");
+            });
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .expect("timeout");
+            let mut cfg = client("tls.test", &[]);
+            cfg.kernel_tx = true;
+            cfg.kernel_rx = true;
+            let mut client = RustlsProvider::connect(&cfg, stream).expect("connects");
+            client.handshake().expect("handshakes");
+            client
+                .enable_ktls(client.get_ref().as_raw_fd())
+                .expect("the client hands both directions to the kernel");
+            client
+                .write_all(b"ping")
+                .expect("writes through the kernel");
+            let mut back = [0u8; 4];
+            client
+                .read_exact(&mut back)
+                .expect("reads the kernel plaintext");
+            assert_eq!(&back, b"ping");
+        });
     }
 
     fn plain_identity() -> crate::tls::TlsServerConfig {
@@ -4845,6 +5356,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         };
         for id in [0x003c, 0xc012, 0x0005, 0xc007, 0xc011] {
             let mut bound = identity.clone();
@@ -4906,6 +5419,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         };
         let serve = |bound: &crate::tls::TlsServerConfig, offer: Vec<u16>| {
             let bound = bound.clone();
@@ -4964,6 +5479,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         };
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();

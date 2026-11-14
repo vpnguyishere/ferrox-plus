@@ -955,11 +955,27 @@ pub fn is_hysteria_flow(bytes: &[u8]) -> bool {
 /// The fields of a QPACK request block, split into the pseudo-headers a masquerade answer and an origin request both need and the ordinary headers copied onward. A block naming no `:method` is not a request; the body stays empty for the caller to fill from the `DATA` frame.
 pub fn parse_h3_request(block: &[u8]) -> Option<H3Request> {
     let fields = hpack::qpack_fields(block)?;
+    // A browser request becomes a hand-written HTTP/1.1 exchange on the cover path, so every field must be free of the bytes that would end a line there; a pseudo-header's value additionally cannot carry the space that separates request-line parts.
+    if !fields
+        .iter()
+        .all(|(name, value)| field_name_ok(name) && field_value_ok(value))
+    {
+        return None;
+    }
     let text =
         |name: &str| -> Option<String> { String::from_utf8(find(&fields, name)?.to_vec()).ok() };
     let method = text(":method")?;
+    if method.is_empty() || !method.bytes().all(is_tchar) {
+        return None;
+    }
     let path = text(":path")?;
+    if !target_ok(path.as_bytes()) {
+        return None;
+    }
     let authority = text(":authority").unwrap_or_default();
+    if !authority.is_empty() && !target_ok(authority.as_bytes()) {
+        return None;
+    }
     let headers = fields
         .iter()
         .filter(|(name, _)| !name.starts_with(b":"))
@@ -977,6 +993,45 @@ pub fn parse_h3_request(block: &[u8]) -> Option<H3Request> {
         headers,
         body: Vec::new(),
     })
+}
+
+/// The RFC 9110 `tchar` set, which names a method or a header.
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn field_name_ok(name: &[u8]) -> bool {
+    let name = name.strip_prefix(b":").unwrap_or(name);
+    !name.is_empty() && name.iter().copied().all(is_tchar)
+}
+
+/// Header values may carry HTAB and obs-text, but never a C0 control, DEL, NUL, CR or LF.
+fn field_value_ok(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|&byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+}
+
+/// A request-line part or authority is one token on the HTTP/1.1 wire, so a space or control would split or end it.
+fn target_ok(value: &[u8]) -> bool {
+    value.iter().all(|&byte| byte > 0x20 && byte != 0x7f)
 }
 
 /// An HTTP/3 response on a request stream: a `HEADERS` frame carrying `:status` ahead of the caller's fields, then a `DATA` frame only when the body is not empty, each length-prefixed the way the auth answer frames its headers. The caller sends the stream FIN.
@@ -2054,6 +2109,39 @@ mod tests {
         assert!(
             parse_h3_request(&not_a_request).is_none(),
             "a response block names no :method"
+        );
+    }
+
+    #[test]
+    fn a_browser_request_with_control_bytes_is_refused() {
+        let request = |fields: &[(&str, &str)]| {
+            let mut block = Vec::new();
+            hpack::qpack_literal_many(fields, &mut block);
+            parse_h3_request(&block)
+        };
+        assert!(
+            request(&[(":method", "GET"), (":path", "/\r\nX-Injected: 1")]).is_none(),
+            "a path cannot end the request line"
+        );
+        assert!(
+            request(&[(":method", "GE T"), (":path", "/")]).is_none(),
+            "a method is one token"
+        );
+        assert!(
+            request(&[(":method", "GET"), (":path", "/"), ("x", "a\rb")]).is_none(),
+            "a field value cannot end its line"
+        );
+        assert!(
+            request(&[(":method", "GET"), (":path", "/"), ("x y", "z")]).is_none(),
+            "a field name is one token"
+        );
+        assert!(
+            request(&[(":method", "GET"), (":path", "/\0")]).is_none(),
+            "NUL is a control"
+        );
+        assert!(
+            request(&[(":method", "GET"), (":path", "/"), ("x", "a\tb")]).is_some(),
+            "HTAB stays legal inside a field value"
         );
     }
 

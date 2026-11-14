@@ -79,7 +79,6 @@ impl Wire {
 pub(crate) struct H3Reader {
     wire: Wire,
     buf: Vec<u8>,
-    room: Vec<u8>,
     buf_at: usize,
     head: Option<Vec<u8>>,
     status: Option<u16>,
@@ -90,6 +89,8 @@ pub(crate) struct H3Reader {
     idle_since: Option<Instant>,
     activity: Arc<Activity>,
     deadline: Option<Instant>,
+    #[cfg(test)]
+    read_target: usize,
 }
 
 impl H3Reader {
@@ -99,7 +100,6 @@ impl H3Reader {
         Self {
             wire,
             buf: Vec::new(),
-            room: Vec::new(),
             buf_at: 0,
             head: None,
             status: None,
@@ -110,6 +110,8 @@ impl H3Reader {
             idle_since: None,
             activity,
             deadline: None,
+            #[cfg(test)]
+            read_target: 0,
         }
     }
 
@@ -160,13 +162,6 @@ impl H3Reader {
         Ok(self.head.take())
     }
 
-    /// Reserve the one read buffer only when a stream first needs it, so an idle stream carries no scratch room.
-    fn reserve_room(&mut self) {
-        if self.room.is_empty() {
-            self.room.resize(READ_ROOM, 0);
-        }
-    }
-
     /// The buffered bytes an open DATA frame can hand out without a copy.
     fn data_available(&self) -> bool {
         self.frame_left > 0 && self.buf_at < self.buf.len()
@@ -188,14 +183,23 @@ impl H3Reader {
     /// Take one transport read into the framing buffer.
     fn fill_room(&mut self) -> std::io::Result<()> {
         self.compact();
-        self.reserve_room();
-        match self.wire.read(&mut self.room) {
-            Ok(0) => self.ended = true,
+        let base = self.buf.len();
+        crate::proxy::grow_scratch(&mut self.buf, base + READ_ROOM);
+        #[cfg(test)]
+        {
+            self.read_target = self.buf[base..].as_ptr() as usize;
+        }
+        match self.wire.read(&mut self.buf[base..]) {
+            Ok(0) => {
+                self.buf.truncate(base);
+                self.ended = true;
+            }
             Ok(n) => {
-                self.buf.extend_from_slice(&self.room[..n]);
+                self.buf.truncate(base + n);
                 self.idle_since = None;
             }
             Err(error) if crate::proxy::is_timeout(&error) => {
+                self.buf.truncate(base);
                 if crate::proxy::body_deadline().is_some_and(|until| Instant::now() >= until) {
                     return Err(error);
                 }
@@ -210,7 +214,10 @@ impl H3Reader {
                 }
                 std::thread::sleep(POLL);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                self.buf.truncate(base);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -1219,6 +1226,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         };
         (identity, roots)
     }
@@ -1326,34 +1335,35 @@ mod tests {
     }
 
     #[test]
-    fn a_read_reuses_one_scratch_buffer() {
+    fn a_read_targets_the_framing_buffer() {
         let (identity, roots) = minted_identity("localhost");
         let settings = dual_settings(XhttpMode::StreamUp);
         let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
             .expect("the h3 listener binds");
         let (mut reader, writer) = dial(port, &settings, roots);
-        assert!(
-            reader.room.is_empty(),
-            "a fresh stream reserves no scratch room"
-        );
         let payload: Vec<u8> = (0..96 * 1024).map(|byte| (byte % 251) as u8).collect();
         assert!(writer.send(&payload));
         writer.finish();
         let mut got = Vec::new();
         let mut first = [0u8; 1];
         let n = reader.read(&mut first).expect("the first read");
-        got.extend_from_slice(&first[..n]);
-        assert_eq!(
-            reader.room.len(),
-            READ_ROOM,
-            "the first wire read allocates the scratch room"
+        assert!(
+            reader.read_target >= reader.buf.as_ptr() as usize
+                && reader.read_target + READ_ROOM
+                    <= reader.buf.as_ptr() as usize + reader.buf.capacity(),
+            "the wire read targets the framing buffer"
         );
-        let base = reader.room.as_ptr();
-        let capacity = reader.room.capacity();
+        got.extend_from_slice(&first[..n]);
+        let base = reader.buf.as_ptr();
+        let capacity = reader.buf.capacity();
         reader.read_to_end(&mut got).expect("the answer reads");
         assert_eq!(got, payload);
-        assert_eq!(reader.room.as_ptr(), base, "the same room is reused");
-        assert_eq!(reader.room.capacity(), capacity, "no reallocation");
+        assert_eq!(
+            reader.buf.as_ptr(),
+            base,
+            "the framing buffer does not move"
+        );
+        assert_eq!(reader.buf.capacity(), capacity, "no reallocation");
     }
 
     #[test]

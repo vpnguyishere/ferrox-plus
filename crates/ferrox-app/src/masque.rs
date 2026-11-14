@@ -67,6 +67,10 @@ const CAPSULE_CAP: usize = 1 << 20;
 /// delivers above its own receive queue, which the inner TCP then backs off
 /// from for seconds.
 const DGRAM_INFLIGHT: usize = 32;
+/// The client queues a whole stack batch, not the acknowledgement's grain; the server keeps `DGRAM_INFLIGHT`.
+const DGRAM_SEND_QUEUE: usize = QUEUE;
+/// A burst the reader has not drained is a lost DATAGRAM and a second of inner TCP RTO; aether asks up to 7 MiB of its lanes.
+const MASQUE_BUFFER: i32 = 4 << 20;
 /// The server's own connection ID: a short header carries no length, so the demultiplexer reads exactly this many bytes.
 const CID_LEN: usize = 16;
 pub(crate) const AUTH_REALM: &str = "Basic realm=\"masque\", charset=\"UTF-8\"";
@@ -385,6 +389,8 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
     let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port)
         .ok_or_else(|| format!("cannot resolve masque `{}:{}`", spec.address, spec.port))?;
     let net = quic::network_generation();
+    quic::set_receive_buffer(&sock, MASQUE_BUFFER);
+    quic::set_send_buffer(&sock, MASQUE_BUFFER);
     let sock = Datagram::plain(sock);
     let mut lane = establish(spec, &sock, peer, local)?;
     let addresses = lane.addresses.clone();
@@ -1230,7 +1236,7 @@ fn client_config(spec: &ClientSpec) -> Result<quiche::Config, String> {
         quic::quiche_config(&tls.roots, None)
             .ok_or("masque: no certificate authorities for the edge")?
     };
-    config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
+    config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
     Ok(config)
 }
 
@@ -1281,7 +1287,7 @@ fn warp_config(warp: &Warp) -> Result<quiche::Config, String> {
     let _ = std::fs::remove_file(&certificate);
     let _ = std::fs::remove_file(&key);
     loaded?;
-    config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
+    config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
     Ok(config)
 }
 
@@ -2118,6 +2124,8 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         };
         (sock, local, h2_listener)
     };
+    quic::set_receive_buffer(&sock, MASQUE_BUFFER);
+    quic::set_send_buffer(&sock, MASQUE_BUFFER);
     let sock = Arc::new(Datagram::plain(sock));
     let (packets, packets_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
@@ -5164,7 +5172,7 @@ mod tests {
         packet[20..22].copy_from_slice(&1234u16.to_be_bytes());
         packet[22..24].copy_from_slice(&4321u16.to_be_bytes());
         packet[24..26].copy_from_slice(&44u16.to_be_bytes());
-        for _ in 0..DGRAM_INFLIGHT {
+        for _ in 0..DGRAM_SEND_QUEUE {
             assert!(
                 matches!(
                     send_datagram(&mut lane.conn, lane.stream, &packet),
@@ -5908,6 +5916,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         };
         let mut server_config = quic::serve_config(&identity).expect("serves");
         server_config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);

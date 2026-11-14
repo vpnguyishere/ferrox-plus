@@ -1312,12 +1312,19 @@ pub(crate) fn server_config(
 
 pub(crate) type Serve = Arc<dyn Fn(Flow) + Send + Sync>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    Pending,
+    Authed,
+    Cover,
+}
+
 struct Inbound {
     conn: Arc<Mutex<quiche::Connection>>,
     client_cid: Vec<u8>,
     initial_dcid: Vec<u8>,
     source_ids: Vec<Vec<u8>>,
-    authed: bool,
+    standing: Standing,
     settings_sent: bool,
     settings_done: bool,
     auth_buf: Vec<u8>,
@@ -1367,7 +1374,7 @@ fn serve_stream(
     sock: &Arc<crate::quic::Datagram>,
     local: SocketAddr,
     stream: u64,
-    serve: &Serve,
+    serve: Option<&Serve>,
     peer: SocketAddr,
     masq: &Masquerade,
     wake: Arc<StreamWake>,
@@ -1425,6 +1432,9 @@ fn serve_stream(
             };
             break consumed;
         }
+    };
+    let Some(serve) = serve else {
+        return;
     };
     let mut flow = Flow::from_parts(
         Arc::clone(shared),
@@ -2175,7 +2185,7 @@ fn relay_datagrams(
     shared: &Arc<Mutex<quiche::Connection>>,
     conn: &mut quiche::Connection,
 ) {
-    if !inbound.authed {
+    if !matches!(inbound.standing, Standing::Authed) {
         return;
     }
     while let Ok(data) = conn.dgram_recv_buf() {
@@ -2242,6 +2252,12 @@ fn mint_reset_token(template: &mut quiche::Config, enabled: bool) -> bool {
     true
 }
 
+enum Auth {
+    Ok,
+    Cover,
+    Refused,
+}
+
 fn auth_exchange(
     sock: &crate::quic::Datagram,
     conn: &mut quiche::Connection,
@@ -2249,7 +2265,7 @@ fn auth_exchange(
     inbound: &mut Inbound,
     peer: SocketAddr,
     masq: &Masquerade,
-) -> Option<bool> {
+) -> Option<Auth> {
     let mut room = Unfilled::<4096>::new();
     loop {
         match conn.stream_recv(AUTH_STREAM, room.as_mut()) {
@@ -2258,7 +2274,7 @@ fn auth_exchange(
         }
     }
     if inbound.auth_buf.len() >= HEAD_CAP {
-        return Some(false);
+        return Some(Auth::Refused);
     }
     let mut at = 0usize;
     let body = frames::h3_frame(&inbound.auth_buf, &mut at)
@@ -2268,7 +2284,6 @@ fn auth_exchange(
     if !hysteria::is_hysteria_auth_shape(body) {
         let request = hysteria::parse_h3_request(body).unwrap_or_default();
         inbound.auth_buf.clear();
-        inbound.authed = true;
         let peer = peer.to_string();
         let mut reply = Vec::new();
         masq_bytes(masq, &request, Some(&peer), &mut reply);
@@ -2276,7 +2291,7 @@ fn auth_exchange(
             return None;
         }
         crate::quic::flush_egress(conn, sock);
-        return Some(true);
+        return Some(Auth::Cover);
     }
     let ok = auths
         .iter()
@@ -2286,8 +2301,12 @@ fn auth_exchange(
     }
     crate::quic::flush_egress(conn, sock);
     inbound.auth_buf.clear();
-    inbound.authed = true;
-    Some(ok)
+    if ok {
+        inbound.standing = Standing::Authed;
+        Some(Auth::Ok)
+    } else {
+        Some(Auth::Refused)
+    }
 }
 
 impl Router<'_> {
@@ -2324,7 +2343,7 @@ impl Router<'_> {
             client_cid: client_cid.to_vec(),
             initial_dcid: initial_dcid.to_vec(),
             source_ids: Vec::new(),
-            authed: false,
+            standing: Standing::Pending,
             settings_sent: false,
             settings_done: false,
             auth_buf: Vec::new(),
@@ -2421,14 +2440,16 @@ impl Router<'_> {
                 crate::quic::flush_egress(&mut conn, sock);
                 inbound.settings_sent = true;
             }
-            if !inbound.authed {
-                let Some(ok) = auth_exchange(sock, &mut conn, auths, inbound, from, masq) else {
-                    return;
-                };
-                if !ok {
-                    let _ = conn.close(false, 0, b"refused");
-                    crate::quic::flush_egress(&mut conn, sock);
-                    return;
+            if inbound.standing == Standing::Pending {
+                match auth_exchange(sock, &mut conn, auths, inbound, from, masq) {
+                    None => return,
+                    Some(Auth::Refused) => {
+                        let _ = conn.close(false, 0, b"refused");
+                        crate::quic::flush_egress(&mut conn, sock);
+                        return;
+                    }
+                    Some(Auth::Cover) => inbound.standing = Standing::Cover,
+                    Some(Auth::Ok) => {}
                 }
             }
             for id in conn.readable() {
@@ -2440,7 +2461,7 @@ impl Router<'_> {
                 };
                 let thread_shared = Arc::clone(&shared);
                 let thread_sock = Arc::clone(sock);
-                let thread_serve = Arc::clone(serve);
+                let thread_serve = (inbound.standing != Standing::Cover).then(|| Arc::clone(serve));
                 let thread_masq = Arc::clone(masq);
                 let local = *local;
                 let peer = from;
@@ -2450,7 +2471,7 @@ impl Router<'_> {
                         &thread_sock,
                         local,
                         id,
-                        &thread_serve,
+                        thread_serve.as_ref(),
                         peer,
                         &thread_masq,
                         wake,
@@ -3037,6 +3058,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         }
     }
 
@@ -3106,6 +3129,138 @@ mod tests {
             .peer_transport_params()
             .cloned()
             .expect("the server's shape arrived")
+    }
+
+    /// A live QUIC handshake between a tuned client and the server template.
+    fn cover_pair() -> (
+        quiche::Connection,
+        quiche::Connection,
+        SocketAddr,
+        SocketAddr,
+    ) {
+        let mut server_config = server_template(&hysteria::Config::default());
+        let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+        crate::quic::tune_transport(&mut client_config);
+        client_config.verify_peer(false);
+        client_config
+            .set_application_protos(&[crate::quic::ALPN])
+            .expect("negotiates");
+        let client_addr = "127.0.0.1:50001".parse().expect("addr");
+        let server_addr = "127.0.0.1:443".parse().expect("addr");
+        let client_cid = [1u8; SCID_LEN];
+        let server_cid = [2u8; SCID_LEN];
+        let mut client = quiche::connect(
+            None,
+            &quiche::ConnectionId::from_ref(&client_cid),
+            client_addr,
+            server_addr,
+            &mut client_config,
+        )
+        .expect("connects");
+        let mut server = quiche::accept(
+            &quiche::ConnectionId::from_ref(&server_cid),
+            None,
+            server_addr,
+            client_addr,
+            &mut server_config,
+        )
+        .expect("accepts");
+        let mut up = Unfilled::<MAX_DATAGRAM>::new();
+        let mut down = Unfilled::<MAX_DATAGRAM>::new();
+        for _ in 0..8 {
+            while let Ok((n, _)) = client.send(up.as_mut()) {
+                server
+                    .recv(
+                        &mut up.as_mut()[..n],
+                        quiche::RecvInfo {
+                            from: client_addr,
+                            to: server_addr,
+                        },
+                    )
+                    .expect("drives the server");
+            }
+            while let Ok((n, _)) = server.send(down.as_mut()) {
+                client
+                    .recv(
+                        &mut down.as_mut()[..n],
+                        quiche::RecvInfo {
+                            from: server_addr,
+                            to: client_addr,
+                        },
+                    )
+                    .expect("drives the client");
+            }
+            if client.is_established() && server.is_established() {
+                break;
+            }
+        }
+        assert!(client.is_established() && server.is_established());
+        (client, server, client_addr, server_addr)
+    }
+
+    #[test]
+    fn a_cover_request_never_authenticates_the_connection() {
+        // A browser request is answered on stream 0 without touching `auths`; the flow gate must stay shut even though the cover exchange succeeded.
+        let (mut client, mut server, client_addr, server_addr) = cover_pair();
+        let mut up = Unfilled::<MAX_DATAGRAM>::new();
+
+        let mut block = Vec::new();
+        ferrox_core::foxy::hpack::qpack_literal_many(
+            &[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", "cover.test"),
+                (":path", "/"),
+            ],
+            &mut block,
+        );
+        let mut request = Vec::new();
+        frames::quic_varint(&mut request, frames::H3_HEADERS);
+        frames::quic_varint(&mut request, block.len() as u64);
+        request.extend_from_slice(&block);
+        client
+            .stream_send(AUTH_STREAM, &request, true)
+            .expect("sends the cover request");
+        while let Ok((n, _)) = client.send(up.as_mut()) {
+            server
+                .recv(
+                    &mut up.as_mut()[..n],
+                    quiche::RecvInfo {
+                        from: client_addr,
+                        to: server_addr,
+                    },
+                )
+                .expect("drives the server");
+        }
+
+        let shared = Arc::new(Mutex::new(server));
+        let sock = Arc::new(crate::quic::Datagram::plain(
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("binds"),
+        ));
+        let mut inbound = Inbound {
+            conn: Arc::clone(&shared),
+            client_cid: vec![3u8; 8],
+            initial_dcid: vec![4u8; 8],
+            source_ids: Vec::new(),
+            standing: Standing::Pending,
+            settings_sent: true,
+            settings_done: true,
+            auth_buf: Vec::new(),
+            wakes: Driver::new(),
+            udp: HashMap::new(),
+            cc_rx: 0,
+        };
+        let auths: Vec<String> = Vec::new();
+        let masq = Masquerade::NotFound;
+        let outcome = {
+            let mut conn = shared.lock().expect("locks");
+            auth_exchange(&sock, &mut conn, &auths, &mut inbound, client_addr, &masq)
+        };
+        assert!(matches!(outcome, Some(Auth::Cover)));
+        assert!(
+            matches!(inbound.standing, Standing::Pending),
+            "the cover exchange grants no flow access and leaves the drive to mark it"
+        );
     }
 
     #[test]
@@ -3217,7 +3372,7 @@ mod tests {
                     client_cid: vec![2u8; 8],
                     initial_dcid: vec![3u8; 8],
                     source_ids: Vec::new(),
-                    authed: true,
+                    standing: Standing::Authed,
                     settings_sent: true,
                     settings_done: true,
                     auth_buf: Vec::new(),
@@ -3399,7 +3554,7 @@ mod tests {
                     client_cid: client.clone(),
                     initial_dcid: initial.clone(),
                     source_ids: Vec::new(),
-                    authed: false,
+                    standing: Standing::Pending,
                     settings_sent: false,
                     settings_done: false,
                     auth_buf: Vec::new(),

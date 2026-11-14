@@ -2765,6 +2765,23 @@ fn content_length(text: &str) -> Option<usize> {
     crate::proxy::header_value_in(text, "content-length").and_then(|v| v.trim().parse().ok())
 }
 
+/// Two length fields leave the framing ambiguous even when both agree; one exchange must never guess.
+fn repeated_content_length(text: &str) -> bool {
+    let mut seen = false;
+    for line in text.split("\r\n").skip(1) {
+        let Some((name, _)) = line.split_once(':') else {
+            break;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            if seen {
+                return true;
+            }
+            seen = true;
+        }
+    }
+    false
+}
+
 // --- Server ------------------------------------------------------------------
 
 #[cfg(test)]
@@ -3220,6 +3237,19 @@ pub(crate) fn accept_core<
         }
         (Some(sid), Some(seq)) => {
             if settings.mode != XhttpMode::PacketUp {
+                emit_400(&mut write);
+                return Served::Closed;
+            }
+            // A fixed length and a transfer coding are two framings of one body; picking either lets a front proxy pick the other and turns the leftover chunk bytes into a second request. The same ambiguity exists between two length fields. The h2 and h3 lanes synthesise an HTTP/1.1-shaped head and add the chunked line themselves for a body they still carry, so only a head off the wire is checked.
+            let synthetic = text
+                .split("\r\n")
+                .next()
+                .is_some_and(|line| line.ends_with(" HTTP/2") || line.ends_with(" HTTP/3"));
+            let length = crate::proxy::header_value_in(text, "content-length");
+            let encoding = crate::proxy::header_value_in(text, "transfer-encoding");
+            if !synthetic
+                && (repeated_content_length(text) || (length.is_some() && encoding.is_some()))
+            {
                 emit_400(&mut write);
                 return Served::Closed;
             }
@@ -6639,6 +6669,51 @@ mod tests {
         assert!(
             !session_is_carried("overflowed"),
             "the overflowed session stayed alive with its parked reader"
+        );
+    }
+
+    #[test]
+    fn a_packet_up_post_with_two_framings_is_refused() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up", "mode": "packet-up"}}}"#,
+        );
+        let referer = "http://127.0.0.1/up?x_padding=".to_owned() + &"X".repeat(500);
+        let refused = |head: String, body: &[u8]| {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let served = accept_core(
+                head.as_bytes(),
+                Vec::new(),
+                Upload::Read(std::io::Cursor::new(body.to_vec())),
+                Sink(Arc::clone(&seen)),
+                &settings,
+                None,
+                None,
+            );
+            let text = String::from_utf8(seen.lock().expect("sink").clone()).unwrap_or_default();
+            assert!(
+                matches!(served, Served::Closed),
+                "an ambiguous body must end the connection"
+            );
+            assert!(
+                text.starts_with("HTTP/1.1 400"),
+                "the ambiguous framing answered no 400: {text:?}"
+            );
+            assert!(
+                !text.contains("HTTP/1.1 200"),
+                "a second request was served: {text:?}"
+            );
+        };
+        refused(
+            format!(
+                "POST /up/sess/0 HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ),
+            b"0\r\n\r\nGET /admin HTTP/1.1\r\nHost: h\r\n\r\n",
+        );
+        refused(
+            format!(
+                "POST /up/sess/0 HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n"
+            ),
+            b"x",
         );
     }
 

@@ -507,6 +507,7 @@ struct Settings {
     split_tunnel_own_region: bool,
     split_tunnel_regions: Vec<String>,
     compartment: String,
+    personal_pairing: bool,
     conduit: bool,
     conduit_mode: ConduitMode,
     conduit_timeout: Duration,
@@ -515,8 +516,14 @@ struct Settings {
     inproxy_disable_stun: bool,
     inproxy_offer_timeout: Duration,
     inproxy_offer_personal_timeout: Duration,
+    inproxy_offer_retry_delay: Duration,
+    inproxy_offer_retry_jitter: f64,
     inproxy_relay_timeout: Duration,
     inproxy_await_ready_timeout: Duration,
+    inproxy_no_match_failover: f64,
+    inproxy_no_match_failover_personal: f64,
+    inproxy_prefer_probability: f64,
+    inproxy_force_selection_count: usize,
     reject_countries: Vec<String>,
     reject_cidrs: Vec<String>,
     geoip_path: Option<String>,
@@ -1047,6 +1054,9 @@ impl Inner {
         let mut last = String::new();
         let mut offset = 0;
         let mut first_batch = true;
+        let inproxy_force_remaining = Arc::new(AtomicUsize::new(
+            self.settings.inproxy_force_selection_count,
+        ));
         while offset < limit {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1128,31 +1138,57 @@ impl Inner {
             let dsl_placeholders = Arc::clone(&self.dsl_placeholders);
             let dsl_retain_failed = self.settings.dsl_retain_failed;
             let dsl_placeholder_ttl = self.settings.dsl_placeholder_ttl;
-            let conduit =
-                if self.settings.conduit && batch.iter().any(|server| server.inproxy.is_some()) {
-                    match self.conduit() {
-                        Ok(conduit) => Some(conduit),
-                        Err(error) => {
-                            eprintln!("psiphon: conduit unavailable: {error}");
-                            None
-                        }
+            let conduit = if self.settings.conduit
+                && batch
+                    .iter()
+                    .any(|server| server.inproxy.is_some() || server.tls_inproxy.is_some())
+            {
+                match self.conduit() {
+                    Ok(conduit) => Some(conduit),
+                    Err(error) => {
+                        eprintln!("psiphon: conduit unavailable: {error}");
+                        None
                     }
-                } else {
-                    None
-                };
+                }
+            } else {
+                None
+            };
+            let inproxy_prefer = self.settings.inproxy_prefer_probability;
+            let inproxy_only = !self.settings.protocols.is_empty()
+                && self
+                    .settings
+                    .protocols
+                    .iter()
+                    .all(|protocol| protocol.starts_with("INPROXY-"));
+            let force_remaining = Arc::clone(&inproxy_force_remaining);
             let requests =
                 Arc::clone(&self.requests) as Arc<dyn crate::psiphon_ssh::ServerRequests>;
             let attempt = move |server: &Server| {
                 let lease = replay.begin(server, config_state);
                 let _scope = crate::psiphon_ssh::dial_seed_scope(lease.seed());
-                let selected = lease.server();
+                let mut selected = lease.server().clone();
+                let use_inproxy = select_inproxy(
+                    selected.inproxy.is_some() || selected.tls_inproxy.is_some(),
+                    selected.direct && !inproxy_only,
+                    conduit.is_some(),
+                    inproxy_prefer,
+                    &force_remaining,
+                );
+                if use_inproxy {
+                    if selected.inproxy.is_none() {
+                        selected.inproxy = selected.tls_inproxy.take();
+                    }
+                } else {
+                    selected.inproxy = None;
+                    selected.tls_inproxy = None;
+                }
                 expire_dsl_placeholder(
                     &dsl_placeholders,
                     &server.host,
                     server.port,
                     dsl_placeholder_ttl,
                 );
-                let timeout = if conduit.is_some() && selected.inproxy.is_some() {
+                let timeout = if use_inproxy {
                     conduit_timeout
                 } else {
                     dial_timeout
@@ -1176,7 +1212,7 @@ impl Inner {
                     ssh_algorithms: ssh_algorithms.as_ref(),
                 };
                 match Session::connect(
-                    selected,
+                    &selected,
                     &identity,
                     timeout,
                     proxy.as_ref(),
@@ -1585,27 +1621,53 @@ impl Inner {
         let servers = load_tactics_entries(&self.settings)?;
         let session_id = hex(&random::<16>());
         let tactics = fetch_tactics_from(&self.settings, &servers, &session_id)?;
-        let broker = tactics
-            .brokers
-            .first()
-            .ok_or_else(|| "psiphon conduit: tactics names no broker".to_owned())?;
-        let fronts = broker_fronts(broker);
-        let common = decode_compartments(&tactics.compartments)?;
         let personal = decode_compartment(&self.settings.compartment)?;
+        let configured = configured_inproxy_brokers(&self.settings, self.settings.personal_pairing);
+        let mut brokers = if configured.is_empty() {
+            tactics.brokers.clone()
+        } else {
+            configured
+        };
+        if self.settings.personal_pairing {
+            let max = count_field(
+                self.settings.raw.as_ref(),
+                "InproxyPersonalPairingMaxBrokerSpecCount",
+                3,
+            );
+            brokers = order_personal_brokers(brokers, &personal, max);
+        } else {
+            shuffle_brokers(&mut brokers);
+        }
+        if brokers.is_empty() {
+            return Err("psiphon conduit: no broker".to_owned());
+        }
+        let routes = brokers
+            .iter()
+            .map(|broker| crate::psiphon_webrtc::BrokerRoute {
+                broker: crate::psiphon_broker::Broker {
+                    public_key: broker.public_key.clone(),
+                    root_secret: broker.root_secret.clone(),
+                },
+                fronts: broker_fronts(broker),
+            })
+            .collect();
+        let configured_compartments = configured_inproxy_compartments(&self.settings);
+        let common = if configured_compartments.is_empty() {
+            decode_compartments(&tactics.compartments)?
+        } else {
+            decode_compartments(&configured_compartments)?
+        };
         let (common, personal) = match self.settings.conduit_mode {
             ConduitMode::Public => (common, Vec::new()),
             ConduitMode::Shirokhorshid => (Vec::new(), vec![personal]),
+            ConduitMode::Auto if self.settings.personal_pairing => (Vec::new(), vec![personal]),
             ConduitMode::Auto => (common, vec![personal]),
         };
         if common.is_empty() && personal.is_empty() {
             return Err("psiphon conduit: no compartments".to_owned());
         }
         let conduit = Arc::new(crate::psiphon_webrtc::Conduit::new(
-            crate::psiphon_broker::Broker {
-                public_key: broker.public_key.clone(),
-                root_secret: broker.root_secret.clone(),
-            },
-            fronts,
+            routes,
             common,
             personal,
             inproxy_stun_servers(&self.settings, &tactics),
@@ -1614,8 +1676,12 @@ impl Inner {
             self.settings.conduit_timeout,
             self.settings.inproxy_offer_timeout,
             self.settings.inproxy_offer_personal_timeout,
+            self.settings.inproxy_offer_retry_delay,
+            self.settings.inproxy_offer_retry_jitter,
             self.settings.inproxy_relay_timeout,
             self.settings.inproxy_await_ready_timeout,
+            self.settings.inproxy_no_match_failover,
+            self.settings.inproxy_no_match_failover_personal,
             self.settings.meek_headers.clone(),
             self.settings.dns.clone(),
             &self.settings.reject_cidrs,
@@ -2856,7 +2922,7 @@ impl Settings {
             .or_else(|| {
                 text(settings, "protocol_selection").map(|value| value.to_ascii_lowercase())
             });
-        let conduit = selection.as_deref() == Some("conduit");
+        let mut conduit = selection.as_deref() == Some("conduit");
         let fronted = match selection.as_deref() {
             None => matches!(cdn_profile.as_deref(), Some("fronted")),
             Some("cdn_fronting" | "fronted" | "fronted-meek" | "cdn") => true,
@@ -2866,7 +2932,7 @@ impl Settings {
                 false
             }
         };
-        let fronted_fallback = !conduit && !fronted;
+        let mut fronted_fallback = !conduit && !fronted;
         let selection_cdn = selection_enables_cdn(selection.as_deref());
         let selection_tactics_disabled = selection_disables_tactics(selection.as_deref());
         // Explicit LimitTunnelProtocols wins; otherwise derive from protocolSelection.
@@ -2874,6 +2940,24 @@ impl Settings {
         if protocols.is_empty() {
             protocols = selection_protocols(selection.as_deref());
         }
+        let inproxy_named = protocols
+            .iter()
+            .any(|protocol| protocol.starts_with("INPROXY-"));
+        if inproxy_named {
+            conduit = true;
+            fronted_fallback = false;
+        }
+        let inproxy_prefer_probability = probability_field(
+            settings,
+            "InproxyTunnelProtocolPreferProbability",
+            if selection.as_deref() == Some("conduit") {
+                1.0
+            } else {
+                0.0
+            },
+        );
+        let inproxy_force_selection_count =
+            count_field(settings, "InproxyTunnelProtocolForceSelectionCount", 0);
         let conduit_mode = match text(settings, "conduitMode")
             .or_else(|| text(settings, "conduit_mode"))
             .map(|mode| mode.to_ascii_lowercase())
@@ -2919,6 +3003,14 @@ impl Settings {
             15_000,
             10_000,
         );
+        let inproxy_offer_retry_delay = Duration::from_millis(
+            number(settings, "InproxyClientOfferRetryDelayMilliseconds")
+                .unwrap_or(100)
+                .min(60_000),
+        );
+        let inproxy_offer_retry_jitter = decimal(settings, "InproxyClientOfferRetryJitter")
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
         let inproxy_relay_timeout = millis_setting(
             settings,
             "InproxyClientRelayedPacketRequestTimeoutMilliseconds",
@@ -2931,6 +3023,14 @@ impl Settings {
             20_000,
             0,
         );
+        let inproxy_no_match_failover =
+            decimal(settings, "InproxyClientNoMatchFailoverProbability")
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0);
+        let inproxy_no_match_failover_personal =
+            decimal(settings, "InproxyClientNoMatchFailoverPersonalProbability")
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
         let mut conduit_protocols = string_list(settings, "ConduitTunnelProtocols");
         if conduit_protocols.is_empty() {
             conduit_protocols = string_list(settings, "conduitTunnelProtocols");
@@ -3457,11 +3557,14 @@ impl Settings {
             "AETHER_PSIPHON_SPLIT_TUNNEL_OWN_REGION",
         );
         let split_tunnel_regions = split_tunnel_regions(settings);
-        let compartment = text(settings, "InproxyClientPersonalCompartmentID")
+        let explicit_compartment = text(settings, "InproxyClientPersonalCompartmentID")
             .or_else(|| text(settings, "inproxyClientPersonalCompartmentID"))
             .or_else(|| text(settings, "inproxyCompartment"))
             .or_else(|| env("AETHER_PSIPHON_COMPARTMENT"))
-            .unwrap_or_else(|| PRIVATE_COMPARTMENT_ID.to_owned());
+            .filter(|compartment| !compartment.is_empty());
+        let personal_pairing =
+            explicit_compartment.is_some() || conduit_mode == ConduitMode::Shirokhorshid;
+        let compartment = explicit_compartment.unwrap_or_else(|| PRIVATE_COMPARTMENT_ID.to_owned());
         let limit_meek_buffers = flag(
             settings,
             "LimitMeekBufferSizes",
@@ -3624,6 +3727,7 @@ impl Settings {
             split_tunnel_own_region,
             split_tunnel_regions,
             compartment,
+            personal_pairing,
             conduit,
             conduit_mode,
             conduit_timeout,
@@ -3632,8 +3736,14 @@ impl Settings {
             inproxy_disable_stun,
             inproxy_offer_timeout,
             inproxy_offer_personal_timeout,
+            inproxy_offer_retry_delay,
+            inproxy_offer_retry_jitter,
             inproxy_relay_timeout,
             inproxy_await_ready_timeout,
+            inproxy_no_match_failover,
+            inproxy_no_match_failover_personal,
+            inproxy_prefer_probability,
+            inproxy_force_selection_count,
             reject_countries,
             reject_cidrs,
             geoip_path,
@@ -3873,8 +3983,22 @@ impl Settings {
             .to_bits()
             .hash(&mut hasher);
         self.region.hash(&mut hasher);
+        self.compartment.hash(&mut hasher);
+        self.personal_pairing.hash(&mut hasher);
         self.conduit.hash(&mut hasher);
         self.conduit_protocols.hash(&mut hasher);
+        self.inproxy_prefer_probability.to_bits().hash(&mut hasher);
+        self.inproxy_force_selection_count.hash(&mut hasher);
+        for key in [
+            "InproxyBrokerSpecs",
+            "InproxyClientBrokerSpecs",
+            "InproxyPersonalPairingBrokerSpecs",
+            "InproxyClientPersonalPairingBrokerSpecs",
+            "InproxyPersonalPairingMaxBrokerSpecCount",
+            "InproxyCommonCompartmentIDs",
+        ] {
+            format!("{:?}", self.raw.as_ref().and_then(|raw| raw.get(key))).hash(&mut hasher);
+        }
         self.limit_quic_versions.hash(&mut hasher);
         self.quic_noise.hash(&mut hasher);
         self.meek_headers.hash(&mut hasher);
@@ -5474,8 +5598,22 @@ const KNOWN_SETTINGS: &[&str] = &[
     "InproxyClientDisableSTUN",
     "InproxyClientOfferRequestTimeoutMilliseconds",
     "InproxyClientOfferRequestPersonalTimeoutMilliseconds",
+    "InproxyClientOfferRetryDelayMilliseconds",
+    "InproxyClientOfferRetryJitter",
     "InproxyClientRelayedPacketRequestTimeoutMilliseconds",
     "InproxyClientWebRTCAwaitReadyToProxyTimeoutMilliseconds",
+    "InproxyClientNoMatchFailoverProbability",
+    "InproxyClientNoMatchFailoverPersonalProbability",
+    "InproxyBrokerSpecs",
+    "InproxyClientBrokerSpecs",
+    "InproxyPersonalPairingBrokerSpecs",
+    "InproxyClientPersonalPairingBrokerSpecs",
+    "InproxyPersonalPairingMaxBrokerSpecCount",
+    "InproxyCommonCompartmentIDs",
+    "InproxyAllowClient",
+    "InproxyTunnelProtocolPreferProbability",
+    "InproxyTunnelProtocolForceSelectionCount",
+    "InproxyTunnelProtocolSelectionProbability",
     "inproxyCompartment",
     "protocol_selection",
     "conduitMode",
@@ -6119,10 +6257,26 @@ pub(crate) fn broker_offer(
     let servers = load_tactics_entries(&settings)?;
     let session_id = hex(&random::<16>());
     let tactics = fetch_tactics_from(&settings, &servers, &session_id)?;
-    let broker = tactics
-        .brokers
+    let personal: [u8; 32] = compartment32(&settings.compartment, "personal compartment")?;
+    let configured = configured_inproxy_brokers(&settings, settings.personal_pairing);
+    let mut brokers = if configured.is_empty() {
+        tactics.brokers.clone()
+    } else {
+        configured
+    };
+    if settings.personal_pairing {
+        let max = count_field(
+            settings.raw.as_ref(),
+            "InproxyPersonalPairingMaxBrokerSpecCount",
+            3,
+        );
+        brokers = order_personal_brokers(brokers, &personal, max);
+    } else {
+        shuffle_brokers(&mut brokers);
+    }
+    let broker = brokers
         .first()
-        .ok_or_else(|| "psiphon broker: tactics names no broker".to_owned())?;
+        .ok_or_else(|| "psiphon broker: no broker".to_owned())?;
     let server = servers
         .iter()
         .find(|server| server.inproxy.is_some())
@@ -6131,12 +6285,25 @@ pub(crate) fn broker_offer(
         .inproxy
         .as_ref()
         .ok_or_else(|| "psiphon broker: no in-proxy destination".to_owned())?;
-    let compartments: Vec<[u8; 32]> = tactics
-        .compartments
-        .iter()
-        .map(|compartment| compartment32(compartment, "tactics compartment"))
-        .collect::<Result<_, _>>()?;
-    let personal: [u8; 32] = compartment32(&settings.compartment, "personal compartment")?;
+    let configured_compartments = configured_inproxy_compartments(&settings);
+    let compartments: Vec<[u8; 32]> = if configured_compartments.is_empty() {
+        tactics
+            .compartments
+            .iter()
+            .map(|compartment| compartment32(compartment, "tactics compartment"))
+            .collect::<Result<_, _>>()?
+    } else {
+        configured_compartments
+            .iter()
+            .map(|compartment| compartment32(compartment, "configured compartment"))
+            .collect::<Result<_, _>>()?
+    };
+    let (compartments, personal) = match settings.conduit_mode {
+        ConduitMode::Public => (compartments, Vec::new()),
+        ConduitMode::Shirokhorshid => (Vec::new(), vec![personal]),
+        ConduitMode::Auto if settings.personal_pairing => (Vec::new(), vec![personal]),
+        ConduitMode::Auto => (compartments, vec![personal]),
+    };
     let identity = Identity {
         session_id: &session_id,
         authorizations: &settings.authorizations,
@@ -6194,7 +6361,7 @@ pub(crate) fn broker_offer(
         match client.client_offer(
             destination,
             &compartments,
-            &[personal],
+            &personal,
             &generated,
             &crate::psiphon_broker::Metrics::from_identity(&identity),
         ) {
@@ -6231,6 +6398,70 @@ fn inproxy_stun_servers(
         stun.basic = stun.rfc5780;
     }
     stun.basic
+}
+
+/// Configured broker specs win over tactics; the personal-pairing list wins in that mode.
+fn configured_inproxy_brokers(
+    settings: &Settings,
+    personal_pairing: bool,
+) -> Vec<crate::psiphon_tactics::Broker> {
+    let raw = settings.raw.as_ref();
+    let keys: &[&str] = if personal_pairing {
+        &[
+            "InproxyClientPersonalPairingBrokerSpecs",
+            "InproxyPersonalPairingBrokerSpecs",
+            "InproxyClientBrokerSpecs",
+            "InproxyBrokerSpecs",
+        ]
+    } else {
+        &["InproxyClientBrokerSpecs", "InproxyBrokerSpecs"]
+    };
+    keys.iter()
+        .find_map(|key| {
+            let brokers = crate::psiphon_tactics::brokers_from(raw.and_then(|raw| raw.get(key)));
+            (!brokers.is_empty()).then_some(brokers)
+        })
+        .unwrap_or_default()
+}
+
+/// The configured common compartment IDs win over tactics.
+fn configured_inproxy_compartments(settings: &Settings) -> Vec<String> {
+    crate::psiphon_tactics::compartments_from(
+        settings
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("InproxyCommonCompartmentIDs")),
+    )
+}
+
+/// Personal pairing maps one compartment to a reduced broker set, in a stable order.
+fn order_personal_brokers(
+    brokers: Vec<crate::psiphon_tactics::Broker>,
+    compartment: &[u8; 32],
+    max: usize,
+) -> Vec<crate::psiphon_tactics::Broker> {
+    let mut brokers = brokers;
+    let mut state = u64::from_be_bytes(compartment[..8].try_into().unwrap_or([0u8; 8])) | 1;
+    for index in (1..brokers.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let pick = usize::try_from(state % (index as u64 + 1)).unwrap_or(0);
+        brokers.swap(index, pick);
+    }
+    if max > 0 && brokers.len() > max {
+        brokers.truncate(max);
+    }
+    brokers
+}
+
+/// Non-personal pairing tries the configured brokers in a fresh random order.
+fn shuffle_brokers(brokers: &mut [crate::psiphon_tactics::Broker]) {
+    for index in (1..brokers.len()).rev() {
+        let draw = u64::from_be_bytes(crate::psiphon_ssh::dial_random::<8>());
+        let pick = usize::try_from(draw % (index as u64 + 1)).unwrap_or(0);
+        brokers.swap(index, pick);
+    }
 }
 
 fn fetch_tactics(settings: &Settings) -> Result<crate::psiphon_tactics::Tactics, String> {
@@ -6796,6 +7027,28 @@ fn protocol_base(protocol: &str) -> String {
 /// Whether a protocol names a meek transport.
 fn is_meek_protocol(protocol: &str) -> bool {
     protocol.starts_with("FRONTED-MEEK") || protocol.starts_with("UNFRONTED-MEEK")
+}
+
+/// Whether this attempt takes the in-proxy transport rather than a direct one.
+fn select_inproxy(
+    has_inproxy: bool,
+    has_direct: bool,
+    enabled: bool,
+    prefer: f64,
+    force_remaining: &AtomicUsize,
+) -> bool {
+    if !enabled || !has_inproxy {
+        return false;
+    }
+    if force_remaining
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            count.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return true;
+    }
+    !has_direct || coin(prefer)
 }
 
 /// The protocol shape an in-proxy name asks for, without its WebRTC and OSSH markers.
@@ -14808,6 +15061,147 @@ mod tests {
         );
         assert_eq!(settings.inproxy_relay_timeout, Duration::from_secs(10));
         assert_eq!(settings.inproxy_await_ready_timeout, Duration::ZERO);
+    }
+
+    #[test]
+    fn client_inproxy_retry_and_failover_default_to_the_reference() {
+        let settings = Settings::from_json(None).expect("settings");
+        assert_eq!(
+            settings.inproxy_offer_retry_delay,
+            Duration::from_millis(100)
+        );
+        assert_eq!(settings.inproxy_offer_retry_jitter, 0.5);
+        assert_eq!(settings.inproxy_no_match_failover, 0.5);
+        assert_eq!(settings.inproxy_no_match_failover_personal, 1.0);
+
+        let explicit = Settings::from_json(Some(
+            &json::parse(
+                r#"{"InproxyClientOfferRetryDelayMilliseconds":250,"InproxyClientOfferRetryJitter":0.25,"InproxyClientNoMatchFailoverProbability":0.4,"InproxyClientNoMatchFailoverPersonalProbability":0.9}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(
+            explicit.inproxy_offer_retry_delay,
+            Duration::from_millis(250)
+        );
+        assert_eq!(explicit.inproxy_offer_retry_jitter, 0.25);
+        assert_eq!(explicit.inproxy_no_match_failover, 0.4);
+        assert_eq!(explicit.inproxy_no_match_failover_personal, 0.9);
+    }
+
+    #[test]
+    fn client_inproxy_prefer_and_force_reach_the_settings() {
+        let default = Settings::from_json(None).expect("settings");
+        assert_eq!(default.inproxy_prefer_probability, 0.0);
+        assert_eq!(default.inproxy_force_selection_count, 0);
+
+        let conduit = Settings::from_json(Some(
+            &json::parse(r#"{"protocolSelection":"conduit"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert!(conduit.conduit);
+        assert_eq!(conduit.inproxy_prefer_probability, 1.0);
+
+        let explicit = Settings::from_json(Some(
+            &json::parse(
+                r#"{"InproxyTunnelProtocolPreferProbability":0.25,"InproxyTunnelProtocolForceSelectionCount":3}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(explicit.inproxy_prefer_probability, 0.25);
+        assert_eq!(explicit.inproxy_force_selection_count, 3);
+
+        let named = Settings::from_json(Some(
+            &json::parse(
+                r#"{"InproxyAllowClient":false,"LimitTunnelProtocols":["INPROXY-WEBRTC-OSSH"]}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(named.conduit);
+        assert_eq!(named.inproxy_prefer_probability, 0.0);
+
+        let mixed = Settings::from_json(Some(
+            &json::parse(r#"{"LimitTunnelProtocols":["OSSH","INPROXY-WEBRTC-OSSH"]}"#)
+                .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(mixed.conduit);
+        assert_eq!(mixed.inproxy_prefer_probability, 0.0);
+    }
+
+    #[test]
+    fn client_inproxy_broker_and_compartment_overrides_follow_reference_order() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "InproxyBrokerSpecs":[{"BrokerPublicKey":"generic","BrokerRootObfuscationSecret":"g","BrokerFrontingSpecs":[{"Host":"generic.example"}]}],
+                    "InproxyClientBrokerSpecs":[{"BrokerPublicKey":"client","BrokerRootObfuscationSecret":"c","BrokerFrontingSpecs":[{"Host":"client.example"}]}],
+                    "InproxyPersonalPairingBrokerSpecs":[{"BrokerPublicKey":"personal","BrokerRootObfuscationSecret":"p","BrokerFrontingSpecs":[{"Host":"personal.example"}]}],
+                    "InproxyClientPersonalPairingBrokerSpecs":[{"BrokerPublicKey":"personal-client","BrokerRootObfuscationSecret":"pc","BrokerFrontingSpecs":[{"Host":"personal-client.example"}]}],
+                    "InproxyCommonCompartmentIDs":["common-1"]
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let client = configured_inproxy_brokers(&settings, false);
+        assert_eq!(client[0].public_key, "client");
+        let personal = configured_inproxy_brokers(&settings, true);
+        assert_eq!(personal[0].public_key, "personal-client");
+        let ordered = order_personal_brokers(personal.clone(), &[9u8; 32], 1);
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(
+            ordered[0],
+            order_personal_brokers(personal, &[9u8; 32], 1)[0]
+        );
+        assert_eq!(
+            configured_inproxy_compartments(&settings),
+            vec!["common-1".to_owned()]
+        );
+
+        let frontless = Settings::from_json(Some(
+            &json::parse(
+                r#"{"InproxyBrokerSpecs":[{"BrokerPublicKey":"generic","BrokerRootObfuscationSecret":"g","BrokerFrontingSpecs":[]}]}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(
+            configured_inproxy_brokers(&frontless, false),
+            Vec::<crate::psiphon_tactics::Broker>::new()
+        );
+
+        let explicit = Settings::from_json(Some(
+            &json::parse(r#"{"InproxyClientPersonalCompartmentID":"personal"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert!(explicit.personal_pairing);
+        assert!(
+            !Settings::from_json(None)
+                .expect("settings")
+                .personal_pairing
+        );
+    }
+
+    #[test]
+    fn an_inproxy_force_count_wins_once_then_prefer_decides() {
+        let force = AtomicUsize::new(2);
+        assert!(select_inproxy(true, true, true, 0.0, &force));
+        assert!(select_inproxy(true, true, true, 0.0, &force));
+        assert!(!select_inproxy(true, true, true, 0.0, &force));
+        assert_eq!(force.load(Ordering::Acquire), 0);
+        assert!(select_inproxy(true, true, true, 1.0, &force));
+    }
+
+    #[test]
+    fn an_inproxy_only_server_stays_inproxy_and_no_conduit_does_not() {
+        let force = AtomicUsize::new(0);
+        assert!(select_inproxy(true, false, true, 0.0, &force));
+        assert!(!select_inproxy(false, true, true, 1.0, &force));
+        assert!(!select_inproxy(true, true, false, 1.0, &force));
     }
 
     #[test]

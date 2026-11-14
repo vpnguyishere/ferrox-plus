@@ -192,6 +192,32 @@ impl Direction {
         }
     }
 
+    /// The traffic secret a kernel offload installs, when this is a TLS 1.3 direction.
+    pub(crate) fn ktls_material(&self) -> Option<(crate::tls::ktls::Cipher, Hash, Vec<u8>, u64)> {
+        let Self::Aead(keys) = self else {
+            return None;
+        };
+        if !keys.tls13 {
+            return None;
+        }
+        let cipher = match keys.suite {
+            Suite::Aes128GcmSha256 => crate::tls::ktls::Cipher::Aes128Gcm,
+            Suite::Aes256GcmSha384 => crate::tls::ktls::Cipher::Aes256Gcm,
+            Suite::ChaCha20Sha256 => crate::tls::ktls::Cipher::ChaCha20Poly1305,
+            _ => return None,
+        };
+        Some((cipher, keys.hash, keys.secret.clone(), keys.seq))
+    }
+
+    /// Rebuilds a direction at a counter a caller already reached, for a layer taking over mid-stream.
+    pub(crate) fn tls13_at(suite: Suite, secret: &[u8], seq: u64) -> Self {
+        let mut direction = Self::tls13(suite, secret);
+        if let Self::Aead(keys) = &mut direction {
+            keys.seq = seq;
+        }
+        direction
+    }
+
     /// The next traffic secret of a TLS 1.3 direction; TLS 1.2 has no key update.
     pub(crate) fn update(&mut self) {
         if let Self::Aead(keys) = self {
@@ -205,7 +231,7 @@ pub(crate) struct Aead {
     key: LessSafeKey,
     iv: [u8; 12],
     seq: u64,
-    gcm: bool,
+    suite: Suite,
     tls13: bool,
     hash: Hash,
     secret: Vec<u8>,
@@ -222,7 +248,7 @@ impl Aead {
             key: keyed(suite, &key),
             iv,
             seq: 0,
-            gcm: true,
+            suite,
             tls13: true,
             hash,
             secret: secret.to_vec(),
@@ -236,7 +262,7 @@ impl Aead {
             key: keyed(suite, key),
             iv: fixed,
             seq: 0,
-            gcm: suite.gcm(),
+            suite,
             tls13: false,
             hash: suite.hash(),
             secret: Vec::new(),
@@ -246,11 +272,7 @@ impl Aead {
     fn update(&mut self) {
         let mut next = vec![0u8; self.secret.len()];
         kdf::expand_label(self.hash, &self.secret, b"traffic upd", b"", &mut next);
-        let suite = if next.len() == 48 {
-            Suite::Aes256GcmSha384
-        } else {
-            Suite::Aes128GcmSha256
-        };
+        let suite = self.suite;
         let mut key = vec![0u8; suite.key_len()];
         kdf::expand_label(self.hash, &next, b"key", b"", &mut key);
         let mut iv = [0u8; 12];
@@ -263,7 +285,7 @@ impl Aead {
 
     fn nonce(&self, seq: u64) -> [u8; 12] {
         let mut nonce = self.iv;
-        if self.tls13 || !self.gcm {
+        if self.tls13 || !self.suite.gcm() {
             // One big-endian XOR is the same bytes as eight, and a TLS 1.3 nonce is the IV under the counter.
             let iv = u64::from_be_bytes(nonce[4..].try_into().expect("eight-byte IV tail"));
             nonce[4..].copy_from_slice(&(iv ^ seq).to_be_bytes());
@@ -316,7 +338,7 @@ impl Aead {
         out: &mut Vec<u8>,
     ) -> Result<(), TlsError> {
         let len: usize = parts.iter().map(|part| part.len()).sum();
-        let explicit = if self.gcm { 8 } else { 0 };
+        let explicit = if self.suite.gcm() { 8 } else { 0 };
         let aad = self.aad12(kind, len);
         let seq = self.seq.to_be_bytes();
         let at = out.len();
@@ -333,12 +355,12 @@ impl Aead {
     }
 
     fn open12(&mut self, kind: u8, body: &mut [u8]) -> Result<(usize, usize), TlsError> {
-        let explicit = if self.gcm { 8 } else { 0 };
+        let explicit = if self.suite.gcm() { 8 } else { 0 };
         if body.len() < explicit + 16 {
             return Err(TlsError::Other("short TLS 1.2 record".to_owned()));
         }
         let aad = self.aad12(kind, body.len() - explicit - 16);
-        let (start, len) = if self.gcm {
+        let (start, len) = if self.suite.gcm() {
             let nonce: [u8; 8] = body[..8].try_into().expect("eight-byte explicit nonce");
             (8, self.open_explicit(&aad, nonce, &mut body[8..])?.len())
         } else {
@@ -349,7 +371,7 @@ impl Aead {
 
     /// The same record opened into the caller's buffer, its explicit nonce left behind on the wire.
     fn open12_into(&mut self, kind: u8, body: &[u8], out: &mut [u8]) -> Result<usize, TlsError> {
-        let explicit = if self.gcm { 8 } else { 0 };
+        let explicit = if self.suite.gcm() { 8 } else { 0 };
         if body.len() < explicit + 16 {
             return Err(TlsError::Other("short TLS 1.2 record".to_owned()));
         }
@@ -1137,5 +1159,16 @@ mod tests {
             open12(&mut once, kind, body).is_err(),
             "the tail is the MAC, so a flip there fails it"
         );
+    }
+
+    #[test]
+    fn a_chacha_secret_exports_and_rekeys_as_chacha() {
+        let secret = [3u8; 32];
+        let mut direction = Direction::tls13(Suite::ChaCha20Sha256, &secret);
+        let (cipher, ..) = direction.ktls_material().expect("a TLS 1.3 secret");
+        assert_eq!(cipher, crate::tls::ktls::Cipher::ChaCha20Poly1305);
+        direction.update();
+        let (cipher, ..) = direction.ktls_material().expect("the next TLS 1.3 secret");
+        assert_eq!(cipher, crate::tls::ktls::Cipher::ChaCha20Poly1305);
     }
 }

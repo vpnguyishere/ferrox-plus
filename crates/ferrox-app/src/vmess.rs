@@ -1753,6 +1753,7 @@ impl Users {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn single(id: [u8; 16]) -> UsersRef {
         Self::with(vec![User {
             level: 0,

@@ -290,6 +290,29 @@ fn bind_socket(destination: IpAddr) -> Result<UdpSocket, String> {
 }
 
 /// The reference tries one STUN server per dial, drawn from the configured list.
+fn random_unit() -> f64 {
+    f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0
+}
+
+fn weighted(probability: f64, roll: f64) -> bool {
+    if probability >= 1.0 {
+        return true;
+    }
+    if probability <= 0.0 {
+        return false;
+    }
+    roll < probability
+}
+
+/// The reference's `SleepWithJitter`: `base` plus up to `base * jitter`.
+fn retry_delay(base: Duration, jitter: f64, roll: f64) -> Duration {
+    if base.is_zero() {
+        return Duration::ZERO;
+    }
+    let jitter = jitter.clamp(0.0, 1.0);
+    base.saturating_add(base.mul_f64(jitter * roll))
+}
+
 fn choose_stun(servers: &[String]) -> Option<&str> {
     if servers.is_empty() {
         return None;
@@ -730,10 +753,15 @@ fn mask(value: u128, prefix: u8, width: u32) -> u128 {
     }
 }
 
-/// Everything one in-proxy dial needs: a broker, its fronts, and the compartments.
+/// One broker and the fronts it answers on.
+pub(crate) struct BrokerRoute {
+    pub(crate) broker: Broker,
+    pub(crate) fronts: Vec<Front>,
+}
+
+/// Everything one in-proxy dial needs: brokers, their fronts, and the compartments.
 pub(crate) struct Conduit {
-    broker: Broker,
-    fronts: Vec<Front>,
+    routes: Vec<BrokerRoute>,
     common: Vec<[u8; 32]>,
     personal: Vec<[u8; 32]>,
     stun_servers: Vec<String>,
@@ -742,8 +770,12 @@ pub(crate) struct Conduit {
     timeout: Duration,
     offer_timeout: Duration,
     offer_personal_timeout: Duration,
+    offer_retry_delay: Duration,
+    offer_retry_jitter: f64,
     relay_timeout: Duration,
     await_ready_timeout: Duration,
+    no_match_failover: f64,
+    no_match_failover_personal: f64,
     headers: Vec<(String, String)>,
     dns_config: crate::psiphon_dns::Config,
     reject: Vec<Cidr>,
@@ -754,8 +786,7 @@ impl Conduit {
     /// Build a conduit from a tactics payload and the selected compartments.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        broker: Broker,
-        fronts: Vec<Front>,
+        routes: Vec<BrokerRoute>,
         common: Vec<[u8; 32]>,
         personal: Vec<[u8; 32]>,
         stun_servers: Vec<String>,
@@ -764,8 +795,12 @@ impl Conduit {
         timeout: Duration,
         offer_timeout: Duration,
         offer_personal_timeout: Duration,
+        offer_retry_delay: Duration,
+        offer_retry_jitter: f64,
         relay_timeout: Duration,
         await_ready_timeout: Duration,
+        no_match_failover: f64,
+        no_match_failover_personal: f64,
         headers: Vec<(String, String)>,
         dns_config: crate::psiphon_dns::Config,
         reject_cidrs: &[String],
@@ -782,8 +817,7 @@ impl Conduit {
             })
             .collect();
         Self {
-            broker,
-            fronts,
+            routes,
             common,
             personal,
             stun_servers,
@@ -792,8 +826,12 @@ impl Conduit {
             timeout,
             offer_timeout,
             offer_personal_timeout,
+            offer_retry_delay,
+            offer_retry_jitter,
             relay_timeout,
             await_ready_timeout,
+            no_match_failover,
+            no_match_failover_personal,
             headers,
             dns_config,
             reject,
@@ -809,7 +847,7 @@ impl Conduit {
         destination: &Destination,
         identity: &Identity<'_>,
     ) -> Result<(WebRtcStream, Relay), String> {
-        if self.fronts.is_empty() {
+        if !self.routes.iter().any(|route| !route.fronts.is_empty()) {
             return Err("psiphon conduit: no broker front".to_owned());
         }
         if !matches!(
@@ -843,101 +881,175 @@ impl Conduit {
             ));
         }
         let metrics = Metrics::from_identity(identity);
+        let deadline = Instant::now()
+            + self
+                .timeout
+                .min(self.offer_timeout.saturating_add(self.await_ready_timeout));
+        let personal = !self.personal.is_empty();
+        let failover = if personal {
+            self.no_match_failover_personal
+        } else {
+            self.no_match_failover
+        };
+        let front_total: usize = self.routes.iter().map(|route| route.fronts.len()).sum();
+        let mut failed = 0;
+        let mut route_index = 0;
+        let mut front_index = 0;
         let mut why = String::new();
-        for front in &self.fronts {
-            let unreliable = matches!(
-                destination.base_protocol(),
-                "QUIC-OSSH" | "FRONTED-MEEK-QUIC-OSSH"
-            );
-            let (mut webrtc, sdp) = match WebRtc::offer(
+        loop {
+            let route = &self.routes[route_index];
+            if route.fronts.is_empty() {
+                route_index = (route_index + 1) % self.routes.len();
+                if route_index == 0 && front_index == 0 {
+                    return Err(why);
+                }
+                continue;
+            }
+            let front = &route.fronts[front_index % route.fronts.len()];
+            let (result, no_match) = match self.dial_front(
                 address,
-                &self.stun_servers,
-                self.disable_stun,
-                self.timeout,
-                &self.dns_config,
-                unreliable,
-            ) {
-                Ok(offer) => offer,
-                Err(error) => {
-                    why = error;
-                    continue;
-                }
-            };
-            let mut client = match Client::connect(
-                self.broker.clone(),
-                front,
-                self.timeout,
-                None,
-                &self.headers,
-                &self.dns_config,
-                self.offer_timeout,
-                self.offer_personal_timeout,
-                self.relay_timeout,
-            ) {
-                Ok(client) => client,
-                Err(error) => {
-                    why = error;
-                    continue;
-                }
-            };
-            let offer = match client.client_offer(
                 destination,
-                &self.common,
-                &self.personal,
-                &sdp,
+                front,
+                &route.broker,
                 &metrics,
+                deadline,
             ) {
-                Ok(offer) => offer,
-                Err(error) => {
-                    why = error;
-                    continue;
-                }
+                Ok(pair) => return Ok(pair),
+                Err((error, no_match)) => (error, no_match),
             };
-            if offer.answer_sdp.is_empty() {
-                why = format!(
-                    "psiphon conduit: broker returned no answer (limited {}, no match {}, upgrade {})",
-                    offer.limited, offer.no_match, offer.must_upgrade
+            why = result;
+            if !no_match {
+                failed += 1;
+                if failed >= front_total {
+                    return Err(why);
+                }
+            }
+            let rotate_broker = no_match && weighted(failover, random_unit());
+            if no_match {
+                let delay = retry_delay(
+                    self.offer_retry_delay,
+                    self.offer_retry_jitter,
+                    random_unit(),
                 );
-                continue;
+                if delay >= deadline.saturating_duration_since(Instant::now()) {
+                    return Err(why);
+                }
+                thread::sleep(delay);
             }
-            if let Err(error) = webrtc.answer(&offer.answer_sdp) {
-                why = error;
-                continue;
-            }
-            if let Err(error) = webrtc.await_channel(self.await_ready_timeout) {
-                why = error;
-                continue;
-            }
-            if !self.reject.is_empty() || self.geoip.is_some() {
-                let Some(peer) = webrtc.peer_ip() else {
-                    why = String::from("psiphon conduit: peer address was not observed");
-                    continue;
-                };
-                if self.reject.iter().any(|cidr| cidr.contains(peer))
-                    || self.geoip.as_ref().is_some_and(|geoip| geoip.rejects(peer))
-                {
-                    why = format!("psiphon conduit: rejected in-proxy {peer}");
-                    continue;
+            if rotate_broker {
+                route_index = (route_index + 1) % self.routes.len();
+                front_index = 0;
+            } else {
+                front_index += 1;
+                if front_index >= route.fronts.len() {
+                    front_index = 0;
+                    route_index = (route_index + 1) % self.routes.len();
                 }
             }
-            let stream = if matches!(
-                destination.base_protocol(),
-                "QUIC-OSSH" | "FRONTED-MEEK-QUIC-OSSH"
-            ) {
-                webrtc.into_datagram_stream(self.timeout)?
-            } else {
-                webrtc.into_stream(self.timeout)?
-            };
-            return Ok((
-                stream,
-                Relay {
-                    client,
-                    connection_id: offer.connection_id,
-                    initial: offer.relay_packet_to_server,
-                },
+            if Instant::now() >= deadline {
+                return Err(why);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn dial_front(
+        &self,
+        address: IpAddr,
+        destination: &Destination,
+        front: &Front,
+        broker: &Broker,
+        metrics: &Metrics,
+        deadline: Instant,
+    ) -> Result<(WebRtcStream, Relay), (String, bool)> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err((
+                "psiphon conduit: offer retry window expired".to_owned(),
+                false,
             ));
         }
-        Err(why)
+        let unreliable = matches!(
+            destination.base_protocol(),
+            "QUIC-OSSH" | "FRONTED-MEEK-QUIC-OSSH"
+        );
+        let budget = self.timeout.min(remaining);
+        let (mut webrtc, sdp) = WebRtc::offer(
+            address,
+            &self.stun_servers,
+            self.disable_stun,
+            budget,
+            &self.dns_config,
+            unreliable,
+        )
+        .map_err(|error| (error, false))?;
+        let mut client = Client::connect(
+            broker.clone(),
+            front,
+            budget,
+            None,
+            &self.headers,
+            &self.dns_config,
+            self.offer_timeout.min(remaining),
+            self.offer_personal_timeout.min(remaining),
+            self.relay_timeout,
+        )
+        .map_err(|error| (error, false))?;
+        let offer = client
+            .client_offer(destination, &self.common, &self.personal, &sdp, metrics)
+            .map_err(|error| (error, false))?;
+        if offer.answer_sdp.is_empty() {
+            return Err((
+                format!(
+                    "psiphon conduit: broker returned no answer (limited {}, no match {}, upgrade {})",
+                    offer.limited, offer.no_match, offer.must_upgrade
+                ),
+                offer.no_match,
+            ));
+        }
+        webrtc
+            .answer(&offer.answer_sdp)
+            .map_err(|error| (error, false))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err((
+                "psiphon conduit: offer retry window expired".to_owned(),
+                false,
+            ));
+        }
+        webrtc
+            .await_channel(self.await_ready_timeout.min(remaining))
+            .map_err(|error| (error, false))?;
+        if !self.reject.is_empty() || self.geoip.is_some() {
+            let Some(peer) = webrtc.peer_ip() else {
+                return Err((
+                    String::from("psiphon conduit: peer address was not observed"),
+                    false,
+                ));
+            };
+            if self.reject.iter().any(|cidr| cidr.contains(peer))
+                || self.geoip.as_ref().is_some_and(|geoip| geoip.rejects(peer))
+            {
+                return Err((format!("psiphon conduit: rejected in-proxy {peer}"), false));
+            }
+        }
+        let stream = if unreliable {
+            webrtc
+                .into_datagram_stream(self.timeout)
+                .map_err(|error| (error, false))?
+        } else {
+            webrtc
+                .into_stream(self.timeout)
+                .map_err(|error| (error, false))?
+        };
+        Ok((
+            stream,
+            Relay {
+                client,
+                connection_id: offer.connection_id,
+                initial: offer.relay_packet_to_server,
+            },
+        ))
     }
 }
 
@@ -968,6 +1080,27 @@ impl Relay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_weighted_coin_keeps_the_inclusive_endpoints() {
+        assert!(weighted(1.0, 0.99));
+        assert!(!weighted(0.0, 0.0));
+        assert!(weighted(0.5, 0.49));
+        assert!(!weighted(0.5, 0.5));
+    }
+
+    #[test]
+    fn an_offer_retry_delay_adds_only_its_jitter_share() {
+        assert_eq!(
+            retry_delay(Duration::from_millis(100), 0.5, 0.0),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            retry_delay(Duration::from_millis(100), 0.5, 1.0),
+            Duration::from_millis(150)
+        );
+        assert_eq!(retry_delay(Duration::ZERO, 0.5, 1.0), Duration::ZERO);
+    }
 
     #[test]
     fn a_cidr_matches_only_its_own_family_and_prefix() {

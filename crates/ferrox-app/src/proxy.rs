@@ -9546,12 +9546,12 @@ fn serve_vless_kcp_tls(
 }
 
 /// An idle handshake is retried until the deadline; anything but silence refuses at once.
-fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
+fn shake_tls<S: ferrox_core::tls::TlsProvider + Drivable>(session: &mut S) -> bool {
     let _quantum = KcpHandshakeRead::enter();
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     loop {
         match session.handshake() {
-            Ok(()) => return true,
+            Ok(()) => return settle_ktls(session),
             Err(ferrox_core::tls::TlsError::Timeout) if Instant::now() < deadline => {}
             Err(_) => return false,
         }
@@ -9623,7 +9623,7 @@ where
             };
             if !handshaken {
                 match current.handshake() {
-                    Ok(()) => {
+                    Ok(()) if settle_ktls(&mut current) => {
                         handshaken = true;
                         request_until = Some(Instant::now() + budgets::handshake());
                     }
@@ -9631,7 +9631,7 @@ where
                         session = Some(current);
                         return Next::Idle;
                     }
-                    Err(_) => return Next::Done,
+                    Ok(()) | Err(_) => return Next::Done,
                 }
             }
             if request_until.is_some_and(|until| Instant::now() >= until) {
@@ -18703,10 +18703,11 @@ fn dial_tls_session(
             return None;
         };
         match session.handshake() {
-            Ok(()) => {
+            Ok(()) if settle_ktls(&mut session) => {
                 ready = Some(session);
                 break;
             }
+            Ok(()) => return None,
             Err(ferrox_core::tls::TlsError::EchRetry(list)) if attempt == 0 && !list.is_empty() => {
                 let mut next = current.clone();
                 next.ech_config_list = Some(list);
@@ -19485,18 +19486,71 @@ fn is_driven_yield(error: &std::io::Error) -> bool {
 trait Drivable {
     fn transport(&self) -> Option<Connection>;
 
+    /// The socket a finished kTLS session hands to the kernel, when the transport is one.
+    fn ktls_fd(&self) -> Option<ferrox_core::tls::RawFd> {
+        None
+    }
+
+    /// The meter a kernel receive path must keep counting.
+    fn ktls_read_account(&self) -> Option<crate::stats::Meter> {
+        None
+    }
+
     /// Arms the read a session performs on its own transport, under its own lock.
     fn arm_own_transport(&self, _grain: Duration) {}
+}
+
+/// Hands the record layer to the kernel when the config asked and the transport has a socket.
+fn settle_ktls<S: ferrox_core::tls::TlsProvider + Drivable>(session: &mut S) -> bool {
+    if !session.wants_ktls() {
+        return true;
+    }
+    let Some(fd) = session.ktls_fd() else {
+        return false;
+    };
+    let account = session.ktls_read_account();
+    if session.enable_ktls(fd).is_err() {
+        return false;
+    }
+    if let Some(meter) = account {
+        session.account_ktls_reads(std::sync::Arc::new(move |bytes| meter.read(bytes)));
+    }
+    true
+}
+
+fn transport_ktls_fd(conn: &Connection) -> Option<ferrox_core::tls::RawFd> {
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd as _;
+    #[cfg(target_os = "linux")]
+    {
+        if conn.has_mask() || matches!(conn, Connection::Unix(_)) {
+            return None;
+        }
+        Some(conn.as_raw_fd())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = conn;
+        None
+    }
 }
 
 impl Drivable
     for ferrox_core::tls::RustlsServerProvider<ferrox_core::tls::reality::RecordLimiter<Connection>>
 {
     fn transport(&self) -> Option<Connection> {
-        if self.owns_transport() {
+        if self.owns_transport() || self.kernel_rx() {
             return None;
         }
         self.get_ref().get_ref().try_clone().ok()
+    }
+
+    fn ktls_fd(&self) -> Option<ferrox_core::tls::RawFd> {
+        transport_ktls_fd(self.get_ref().get_ref())
+    }
+
+    fn ktls_read_account(&self) -> Option<crate::stats::Meter> {
+        self.get_ref().get_ref().ktls_read_account()
     }
 }
 
@@ -19510,7 +19564,18 @@ impl Drivable
 
 impl Drivable for ferrox_core::tls::RustlsProvider<Connection> {
     fn transport(&self) -> Option<Connection> {
+        if self.kernel_rx() {
+            return None;
+        }
         self.get_ref().try_clone().ok()
+    }
+
+    fn ktls_fd(&self) -> Option<ferrox_core::tls::RawFd> {
+        transport_ktls_fd(self.get_ref())
+    }
+
+    fn ktls_read_account(&self) -> Option<crate::stats::Meter> {
+        self.get_ref().ktls_read_account()
     }
 }
 
@@ -19526,6 +19591,14 @@ impl Drivable for ferrox_core::tls::ClientSession<Connection> {
             return None;
         }
         self.get_ref().try_clone().ok()
+    }
+
+    fn ktls_fd(&self) -> Option<ferrox_core::tls::RawFd> {
+        transport_ktls_fd(self.get_ref())
+    }
+
+    fn ktls_read_account(&self) -> Option<crate::stats::Meter> {
+        self.get_ref().ktls_read_account()
     }
 
     fn arm_own_transport(&self, grain: Duration) {
@@ -21708,6 +21781,9 @@ fn tls_session_on(
 ) -> Option<ferrox_core::tls::ClientSession<Connection>> {
     let mut session = ferrox_core::tls::connect(cfg, uplink).ok()?;
     session.handshake().ok()?;
+    if !settle_ktls(&mut session) {
+        return None;
+    }
     session
         .get_ref()
         .set_read_timeout(Some(SESSION_POLL))
@@ -35870,11 +35946,7 @@ fn inbound_vmess_users(inbound: &Json) -> crate::vmess::UsersRef {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if entries.is_empty() {
-        crate::vmess::Users::single(inbound_id(inbound))
-    } else {
-        crate::vmess::Users::with(entries)
-    }
+    crate::vmess::Users::with(entries)
 }
 
 /// One client a vless inbound serves: the id the wire names and the flow its account is bound to.
@@ -35969,15 +36041,6 @@ fn inbound_users(inbound: &Json, portals: &crate::reverse::Portals) -> VlessUser
             Some(seen) => *seen = user,
             None => users.push(user),
         }
-    }
-    if users.is_empty() {
-        users.push(VlessUser {
-            id: inbound_id(inbound),
-            flow: Flow::None,
-            email: String::new(),
-            level: 0,
-            reverse: None,
-        });
     }
     Arc::from(users)
 }
@@ -36245,6 +36308,9 @@ fn inbound_ss_users(
         .and_then(|settings| settings.get("clients").or_else(|| settings.get("users")))
         .and_then(Json::as_arr);
     let Some(listed) = listed else {
+        if password.is_empty() {
+            return crate::shadowsocks::SsUsers::default();
+        }
         return crate::shadowsocks::account(password, method);
     };
     let mut users = Vec::with_capacity(listed.len());
@@ -36412,12 +36478,17 @@ fn inbound_trojan_keys(inbound: &Json) -> std::sync::Arc<[[u8; 56]]> {
             clients
                 .iter()
                 .filter_map(|client| client.get("password").and_then(Json::as_str))
+                .filter(|password| !password.is_empty())
                 .map(trojan_key)
                 .collect()
         })
         .unwrap_or_default();
     if keys.is_empty() {
-        return std::sync::Arc::from([trojan_key(&inbound_password(inbound))]);
+        let password = inbound_password(inbound);
+        if password.is_empty() {
+            return std::sync::Arc::from([]);
+        }
+        return std::sync::Arc::from([trojan_key(&password)]);
     }
     std::sync::Arc::from(keys)
 }
@@ -48023,6 +48094,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         });
         let client = ferrox_core::tls::TlsConfig {
             server_name: "carrier.test".to_owned(),
@@ -57322,6 +57395,55 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_credentials_table_serves_nobody() {
+        let empty = crate::json::parse(r#"{"protocol":"vless","settings":{}}"#).expect("parses");
+        assert!(
+            inbound_users(&empty, &crate::reverse::Portals::default()).is_empty(),
+            "an empty vless table has no nil-uuid account"
+        );
+        let empty = crate::json::parse(r#"{"protocol":"vmess","settings":{}}"#).expect("parses");
+        assert!(
+            inbound_vmess_users(&empty).list().is_empty(),
+            "an empty vmess table has no nil-uuid account"
+        );
+        let malformed = crate::json::parse(
+            r#"{"protocol":"vless","settings":{"clients":[{"id":"not-a-uuid"}]}}"#,
+        )
+        .expect("parses");
+        assert!(
+            inbound_users(&malformed, &crate::reverse::Portals::default()).is_empty(),
+            "an unparseable vless id is not replaced with the nil uuid"
+        );
+        let malformed = crate::json::parse(
+            r#"{"protocol":"vmess","settings":{"clients":[{"id":"not-a-uuid"}]}}"#,
+        )
+        .expect("parses");
+        assert!(
+            inbound_vmess_users(&malformed).list().is_empty(),
+            "an unparseable vmess id is not replaced with the nil uuid"
+        );
+        let trojan = crate::json::parse(r#"{"protocol":"trojan","settings":{}}"#).expect("parses");
+        assert!(
+            inbound_trojan_keys(&trojan).is_empty(),
+            "an empty trojan table has no empty-password key"
+        );
+        let empty_trojan_password =
+            crate::json::parse(r#"{"protocol":"trojan","settings":{"clients":[{"password":""}]}}"#)
+                .expect("parses");
+        assert!(
+            inbound_trojan_keys(&empty_trojan_password).is_empty(),
+            "a trojan client with an empty password is not served"
+        );
+        let shadowsocks =
+            crate::json::parse(r#"{"protocol":"shadowsocks","settings":{"method":"aes-256-gcm"}}"#)
+                .expect("parses");
+        assert!(
+            inbound_ss_users(&shadowsocks, "", "aes-256-gcm", "test").is_empty(),
+            "a shadowsocks table without a password has no account"
+        );
+    }
+
+    #[test]
     fn every_client_entry_is_served_and_keyed_like_the_validator() {
         let inbound = crate::json::parse(
             r#"{"settings":{"clients":[
@@ -65344,6 +65466,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         });
         (identity, roots)
     }

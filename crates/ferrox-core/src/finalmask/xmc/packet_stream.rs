@@ -35,8 +35,9 @@ struct ReadState<R> {
     reader: R,
     buffer: Vec<u8>,
     buffer_at: usize,
-    pending: Vec<u8>,
-    pending_at: usize,
+    pending_start: usize,
+    pending_end: usize,
+    pending_total: usize,
     chunk: [u8; 8192],
 }
 
@@ -98,9 +99,13 @@ impl<R: Read> ReadState<R> {
                 let taken = output.len().min(payload.len());
                 output[..taken].copy_from_slice(&payload[..taken]);
                 if taken < payload.len() {
-                    self.pending.extend_from_slice(&payload[taken..]);
+                    let start = payload.as_ptr() as usize - self.buffer.as_ptr() as usize;
+                    self.pending_start = start + taken;
+                    self.pending_end = start + payload.len();
+                    self.pending_total = total;
+                } else {
+                    self.advance(total);
                 }
-                self.advance(total);
                 return Ok(Event::Payload(taken));
             }
             if id == KEEPALIVE_PACKET {
@@ -165,8 +170,9 @@ where
                 reader,
                 buffer: Vec::new(),
                 buffer_at: 0,
-                pending: Vec::new(),
-                pending_at: 0,
+                pending_start: 0,
+                pending_end: 0,
+                pending_total: 0,
                 chunk: [0; 8192],
             }),
             writer,
@@ -230,14 +236,17 @@ impl<R: Read, W: Write> Read for &PacketStream<R, W> {
             .reader
             .lock()
             .map_err(|_| io::Error::other("packet stream reader poisoned"))?;
-        if reader.pending_at < reader.pending.len() {
-            let taken = output.len().min(reader.pending.len() - reader.pending_at);
-            output[..taken]
-                .copy_from_slice(&reader.pending[reader.pending_at..reader.pending_at + taken]);
-            reader.pending_at += taken;
-            if reader.pending_at == reader.pending.len() {
-                reader.pending.clear();
-                reader.pending_at = 0;
+        if reader.pending_end > reader.pending_start {
+            let taken = output.len().min(reader.pending_end - reader.pending_start);
+            output[..taken].copy_from_slice(
+                &reader.buffer[reader.pending_start..reader.pending_start + taken],
+            );
+            reader.pending_start += taken;
+            if reader.pending_start == reader.pending_end {
+                reader.pending_start = 0;
+                reader.pending_end = 0;
+                let total = std::mem::take(&mut reader.pending_total);
+                reader.advance(total);
             }
             return Ok(taken);
         }
@@ -341,7 +350,7 @@ impl<R, W> std::fmt::Debug for PacketStream<R, W> {
                 &self
                     .reader
                     .try_lock()
-                    .map(|reader| reader.pending.len())
+                    .map(|reader| reader.pending_end.saturating_sub(reader.pending_start))
                     .ok(),
             )
             .finish_non_exhaustive()
@@ -559,6 +568,65 @@ mod tests {
             "the payload is the frame's own bytes"
         );
         assert_eq!(counts.allocs, 0, "reading the channel takes no heap");
+    }
+
+    #[test]
+    fn a_payload_tail_is_the_frames_own_bytes() {
+        let out = Pipe::new();
+        let payload: Vec<u8> = (0..MAX_PACKET_DATA)
+            .map(|index| (index % 241) as u8)
+            .collect();
+        let mut body = Vec::new();
+        write_string(&mut body, CHANNEL).expect("channel");
+        body.extend_from_slice(&payload);
+        let wire = frame(CLIENTBOUND_CUSTOM_PAYLOAD, &body);
+
+        let mut client = PacketStream::new(Pipe::new(), out, true);
+        client
+            .reader
+            .lock()
+            .expect("reader")
+            .buffer
+            .extend_from_slice(&wire);
+        let mut got = vec![0; payload.len()];
+        let mut first = [0u8; 4096];
+        let (read, counts) = crate::alloc_count::measure(|| client.read(&mut first));
+        assert_eq!(read.expect("the first read"), first.len());
+        assert_eq!(counts.allocs, 0, "the tail is not staged in a fresh buffer");
+        got[..first.len()].copy_from_slice(&first);
+        let base = client.reader.lock().expect("reader").buffer.as_ptr();
+        let capacity = client.reader.lock().expect("reader").buffer.capacity();
+        {
+            let state = client.reader.lock().expect("reader");
+            assert!(
+                state.pending_start < state.pending_end && state.pending_end <= state.buffer.len(),
+                "the tail is a span of the frame buffer"
+            );
+        }
+        let mut at = first.len();
+        while at < got.len() {
+            let take = (got.len() - at).min(4096);
+            client.read_exact(&mut got[at..at + take]).expect("reads");
+            at += take;
+            let state = client.reader.lock().expect("reader");
+            assert_eq!(
+                state.buffer.as_ptr(),
+                base,
+                "the frame buffer does not move"
+            );
+            assert_eq!(
+                state.buffer.capacity(),
+                capacity,
+                "the tail pays no reallocation"
+            );
+        }
+        assert_eq!(got, payload);
+        assert_eq!(
+            client.reader.lock().expect("reader").pending_end,
+            0,
+            "the tail drains before another event is parsed"
+        );
+        client.shutdown();
     }
 
     #[test]

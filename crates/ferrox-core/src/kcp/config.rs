@@ -1,6 +1,9 @@
 use super::mask::Mask;
 use super::segment::DATA_SEGMENT_OVERHEAD;
 
+/// The sessions one listener admits before it drops a new conversation.
+pub const DEFAULT_MAX_SESSIONS: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub mtu: u32,
@@ -13,6 +16,8 @@ pub struct Config {
     pub mask: Mask,
     /// The source-address allow/deny lists applied to received datagrams.
     pub filters: Vec<crate::finalmask::SourceFilter>,
+    /// The sessions one listener admits before it drops a new conversation.
+    pub max_sessions: usize,
 }
 
 impl Default for Config {
@@ -26,6 +31,7 @@ impl Default for Config {
             max_sending_window: 2 * 1024 * 1024,
             mask: Mask::default(),
             filters: Vec::new(),
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
     }
 }
@@ -76,6 +82,7 @@ mod tests {
         assert_eq!(c.downlink_capacity, 20);
         assert_eq!(c.cwnd_multiplier, 1);
         assert_eq!(c.max_sending_window, 2 * 1024 * 1024);
+        assert_eq!(c.max_sessions, DEFAULT_MAX_SESSIONS);
     }
 
     #[test]

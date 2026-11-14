@@ -904,6 +904,9 @@ fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8], out: &mut Vec<u8>)
 /// The credit a lane holds before it grants it back: the edge is granted a 16 MiB window to fill, so a held update cannot stall it, while a write per frame spends a record and a segment on 26 bytes the edge already owes us.
 const CREDIT_FLOOR: u32 = 1 << 16;
 
+/// The staged window one flow may fill without being read: the window this lane advertised, so a flow nobody drains stops at the grant it was given instead of growing `carry` for the session's life. A peer that sends past it has violated flow control and its stream is reset.
+const CARRY_MAX: u32 = frames::WINDOW;
+
 /// The two `WINDOW_UPDATE` frames a credit grants differ only by stream id, so their eighteen header bytes are constant and each call writes the increment into the two slots left zero here; the stream slot is patched per lane.
 const CREDIT_TEMPLATE: [u8; 26] = {
     let mut out = [0u8; 26];
@@ -966,6 +969,86 @@ fn credit(inner: &mut SessionInner, stream: u32, len: usize) -> Result<(), Failu
         return flush_credit(inner, stream);
     }
     Ok(())
+}
+
+/// Grants the connection's share of a staged frame at once: the bytes have left the wire and the session's window is what keeps the other flows moving, while the flow's own window waits for a reader that may never come.
+fn credit_conn(inner: &mut SessionInner, len: usize) -> Result<(), Failure> {
+    let bytes = u32::try_from(len).unwrap_or(u32::MAX);
+    inner.conn_pending = inner.conn_pending.saturating_add(bytes);
+    if inner.conn_pending < CREDIT_FLOOR {
+        return Ok(());
+    }
+    let conn_increment = std::mem::take(&mut inner.conn_pending);
+    if conn_increment == 0 {
+        return Ok(());
+    }
+    let mut out = std::mem::take(&mut inner.out);
+    grant(0, 0, conn_increment, &mut out);
+    let written = inner.tls.write_all(&out);
+    inner.out = out;
+    written.map_err(|_| Failure::Io)
+}
+
+/// Grants back the flow's own window for bytes its reader has taken, never for bytes still staged: this is the half that keeps a flow nobody reads from pulling the session open.
+fn credit_stream(inner: &mut SessionInner, stream: u32, len: usize) -> Result<(), Failure> {
+    let bytes = u32::try_from(len).unwrap_or(u32::MAX);
+    if let Some(entry) = inner.streams.get_mut(&stream) {
+        entry.pending_credit = entry.pending_credit.saturating_add(bytes);
+        if entry.pending_credit < CREDIT_FLOOR {
+            return Ok(());
+        }
+    }
+    flush_credit(inner, stream)
+}
+
+/// Stages a DATA payload that is not going into the caller's buffer, and holds the flow's window until its own reader takes it. An empty body has nothing to stage, so its wire octets are granted at once; a body that would push the flow past the window this lane advertised is a flow-control violation, and that stream is reset rather than allowed to grow for the session's life.
+fn stage_foreign(
+    inner: &mut SessionInner,
+    stream: u32,
+    payload: &[u8],
+    end: bool,
+    wire: usize,
+) -> Result<(), Failure> {
+    let bytes = u32::try_from(wire).unwrap_or(u32::MAX);
+    let mut overflow = false;
+    if let Some(entry) = inner.streams.get_mut(&stream) {
+        entry.fin = end;
+        if !payload.is_empty() {
+            let spent = u64::from(entry.staged)
+                .saturating_add(u64::from(entry.pending_credit))
+                .saturating_add(u64::from(bytes));
+            if spent > u64::from(CARRY_MAX) {
+                overflow = true;
+            } else {
+                entry.carry.extend_from_slice(payload);
+                entry.staged = entry.staged.saturating_add(bytes);
+            }
+        }
+    }
+    if overflow {
+        reset_stream(inner, stream);
+    }
+    if payload.is_empty() {
+        return credit(inner, stream, wire);
+    }
+    credit_conn(inner, wire)
+}
+
+/// Drops a stream that sent past the window it was granted and tells the edge why: the bytes behind it are not kept, so one flow cannot spend the session's memory and the frame that follows it is still read for the flow that is draining.
+fn reset_stream(inner: &mut SessionInner, stream: u32) {
+    if inner.streams.remove(&stream).is_none() {
+        return;
+    }
+    let mut reset = Vec::with_capacity(frames::H2_HEADER + 4);
+    h2_frame(
+        frames::RST_STREAM,
+        0,
+        stream,
+        &3u32.to_be_bytes(),
+        &mut reset,
+    );
+    let _ = inner.tls.write_all(&reset);
+    let _ = inner.tls.flush();
 }
 
 /// The edge's `SETTINGS` applied to the session: a new `INITIAL_WINDOW_SIZE` moves every stream's window by the difference, and a new maximum frame size bounds what the session sends.
@@ -1130,6 +1213,8 @@ struct Stream {
     head_end: bool,
     /// Bytes the edge has sent into this stream's granted window that this stream has taken but not yet granted back: the update goes out when the held credit reaches `CREDIT_FLOOR`, never per frame.
     pending_credit: u32,
+    /// Wire octets of staged DATA not yet granted back to the edge: the stream's window is returned when its reader takes these bytes, so a flow that is not reading stops the edge at `CARRY_MAX` instead of growing this buffer for the session's life.
+    staged: u32,
     /// The peer ended this stream: nothing more will arrive on it.
     fin: bool,
     /// This flow has closed its half of the stream.
@@ -1150,6 +1235,7 @@ impl Stream {
             head: Vec::new(),
             head_end: false,
             pending_credit: 0,
+            staged: 0,
             fin: false,
             sent_end: false,
             packet: Vec::new(),
@@ -1630,12 +1716,8 @@ impl Tls2 {
                         end,
                         wire,
                     } => {
-                        // A DATA frame that arrives while the status is still out is payload the edge sent early: hold its credit like any other, and let the walk ignore the bytes until `END_STREAM` says the status itself is gone.
-                        if let Some(entry) = inner.streams.get_mut(&stream) {
-                            entry.fin = end;
-                            entry.carry.extend_from_slice(payload);
-                        }
-                        let _ = credit(inner, stream, wire);
+                        // A DATA frame that arrives while the status is still out is payload the edge sent early: stage it like any other foreign frame, so its flow's window is returned only when that flow's reader takes the bytes.
+                        stage_foreign(inner, stream, payload, end, wire)?;
                         Ok(None)
                     }
                     frames::H2Routed::Window { stream, increment } => {
@@ -1660,20 +1742,32 @@ impl Tls2 {
         }
     }
 
-    /// Hands the caller what it asked for out of `carry` and moves the cursor: a copy of bytes, never a move of what is left.
+    /// Hands the caller what it asked for out of `carry` and moves the cursor: a copy of bytes, never a move of what is left. What it takes is the only thing that returns the flow's window, so a stage nobody drains never grants the edge room to send more.
     fn take(&mut self, buf: &mut [u8]) -> usize {
         let Ok(mut inner) = self.inner() else {
             return 0;
         };
-        let Some(stream) = inner.streams.get_mut(&self.stream) else {
-            return 0;
+        let (take, grant) = {
+            let Some(stream) = inner.streams.get_mut(&self.stream) else {
+                return 0;
+            };
+            let take = buf.len().min(stream.carry.len() - stream.at);
+            buf[..take].copy_from_slice(&stream.carry[stream.at..stream.at + take]);
+            stream.at += take;
+            if stream.at == stream.carry.len() {
+                let grant = stream.staged;
+                stream.staged = 0;
+                stream.carry.clear();
+                stream.at = 0;
+                (take, grant)
+            } else {
+                let grant = u32::try_from(take).unwrap_or(u32::MAX).min(stream.staged);
+                stream.staged -= grant;
+                (take, grant)
+            }
         };
-        let take = buf.len().min(stream.carry.len() - stream.at);
-        buf[..take].copy_from_slice(&stream.carry[stream.at..stream.at + take]);
-        stream.at += take;
-        if stream.at == stream.carry.len() {
-            stream.carry.clear();
-            stream.at = 0;
+        if grant > 0 {
+            let _ = credit_stream(&mut inner, self.stream, grant as usize);
         }
         take
     }
@@ -2007,12 +2101,8 @@ impl Read for Tls2 {
                             wire,
                         } => {
                             if stream != own {
-                                // A frame for another flow is staged in that flow's own buffer and its credit held here, so a flow that is not reading yet does not lose its bytes and does not stall the one that is.
-                                if let Some(entry) = inner.streams.get_mut(&stream) {
-                                    entry.fin = end;
-                                    entry.carry.extend_from_slice(payload);
-                                }
-                                let _ = credit(inner, stream, wire);
+                                // A frame for another flow is staged in that flow's own buffer and only the connection's credit is held, so a flow that is not reading yet does not lose its bytes, does not stall the one that is, and does not grow past the window it was granted.
+                                stage_foreign(inner, stream, payload, end, wire).map_err(io)?;
                                 return Ok(0);
                             }
                             if delivered {
@@ -2027,15 +2117,8 @@ impl Read for Tls2 {
                                 }
                                 return Ok(got);
                             }
-                            // A caller that asked for nothing and a padded frame both land here: the padding comes off before the rest stages, so the stage holds the payload and the window is owed the body the frame spent.
-                            let taken = 0usize;
-                            if let Some(entry) = inner.streams.get_mut(&stream) {
-                                entry.fin = end;
-                            }
-                            let mut staged = std::mem::take(&mut inner.out);
-                            stage_into(inner, own, payload, taken, &mut staged);
-                            inner.out = staged;
-                            credit(inner, stream, wire).map_err(io)?;
+                            // A caller that asked for nothing and a padded frame both land here: the padding comes off before the rest stages, so the stage holds the payload and the flow's window is returned when that payload is taken.
+                            stage_foreign(inner, own, payload, end, wire).map_err(io)?;
                             Ok(0)
                         }
                         frames::H2Routed::Window { stream, increment } => {
@@ -2062,24 +2145,6 @@ impl Read for Tls2 {
                 return Ok(read);
             }
         }
-    }
-}
-
-/// Stages a payload the caller had no room for, in the stream's own buffer: only the bytes past what was taken are copied, and the buffer is reused so a frame that does not fit costs no allocation.
-fn stage_into(
-    inner: &mut SessionInner,
-    stream: u32,
-    payload: &[u8],
-    taken: usize,
-    _scratch: &mut Vec<u8>,
-) {
-    let Some(entry) = inner.streams.get_mut(&stream) else {
-        return;
-    };
-    if taken < payload.len() {
-        entry.carry.clear();
-        entry.carry.extend_from_slice(&payload[taken..]);
-        entry.at = 0;
     }
 }
 
@@ -4351,6 +4416,8 @@ pub(crate) mod loopback {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         };
         (roots, server)
     }
@@ -7039,10 +7106,24 @@ pub(crate) mod loopback {
     }
 
     fn data_frame(payload: &[u8]) -> Vec<u8> {
+        data_frame_on(1, payload)
+    }
+
+    /// One DATA frame on the stream it names, for a flow that is not the lane's own.
+    fn data_frame_on(stream: u32, payload: &[u8]) -> Vec<u8> {
+        data_frame_with(stream, 0, payload)
+    }
+
+    /// One DATA frame on the stream it names that ends it.
+    fn data_frame_ending_on(stream: u32, payload: &[u8]) -> Vec<u8> {
+        data_frame_with(stream, frames::END_STREAM, payload)
+    }
+
+    fn data_frame_with(stream: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
         let mut out = frames::H2Frame {
             kind: frames::DATA,
-            flags: 0,
-            stream: 1,
+            flags,
+            stream,
             length: payload.len() as u32,
         }
         .header()
@@ -7096,6 +7177,56 @@ pub(crate) mod loopback {
             &rest[..],
             &payload[FRAME / 2..],
             "the second half resumed where the wire stopped"
+        );
+    }
+
+    /// A flow that is not read must not return its own window: staged bytes stay in `carry` and the edge is granted only the connection's share, so the flow stops at the window it was given instead of growing for the session's life.
+    #[test]
+    fn a_flow_that_does_not_read_returns_no_stream_credit() {
+        const FRAME: usize = 16 * 1024;
+        const FRAMES: usize = 5;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let payload: Vec<u8> = (0..FRAME * FRAMES).map(|i| (i % 251) as u8).collect();
+        let mut pieces: Vec<(Vec<u8>, Option<Duration>)> = (0..FRAMES)
+            .map(|i| (data_frame_on(3, &payload[i * FRAME..(i + 1) * FRAME]), None))
+            .collect();
+        pieces.push((data_frame_ending_on(1, b"tail"), None));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let edge = downlink_edge(listener, server, pieces, tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        lane.test_inner()
+            .streams
+            .insert(3, Stream::new(frames::WINDOW));
+        let mut back = Vec::new();
+        lane.read_to_end(&mut back).expect("reads the lane");
+        assert_eq!(back, b"tail", "the drained flow still got its own bytes");
+        let (carry, staged, pending) = {
+            let inner = lane.test_inner();
+            let stream = inner.streams.get(&3).expect("the stalled flow is open");
+            (stream.carry.len(), stream.staged, stream.pending_credit)
+        };
+        assert_eq!(carry, FRAME * FRAMES, "every frame was staged");
+        assert_eq!(
+            staged as usize,
+            FRAME * FRAMES,
+            "the staged wire octets are still owed"
+        );
+        assert_eq!(
+            pending, 0,
+            "credit was held for bytes nobody took, which is what let the flow grow"
+        );
+        drop(tunnel);
+        join_edge_within(edge, Duration::from_secs(5));
+        let updates: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            updates.iter().all(|(stream, _)| *stream != 3),
+            "the stalled flow was granted its window back: {updates:?}"
         );
     }
 
@@ -7355,14 +7486,15 @@ pub(crate) mod loopback {
         while let Ok(update) = rx.try_recv() {
             tally.push(update);
         }
-        let granted: Vec<_> = tally
+        let mut granted: Vec<_> = tally
             .iter()
             .filter(|(_, increment)| *increment == FRAMES as u32 * wire)
             .copied()
             .collect();
+        granted.sort_unstable();
         assert_eq!(
             granted,
-            vec![(1, FRAMES as u32 * wire), (0, FRAMES as u32 * wire)],
+            vec![(0, FRAMES as u32 * wire), (1, FRAMES as u32 * wire)],
             "the grant is every frame's wire length, the pad byte and the pad tail included"
         );
     }

@@ -549,6 +549,18 @@ impl Connection {
         }
     }
 
+    /// The meter whose read counters a kernel receive path bypasses.
+    pub(crate) fn ktls_read_account(&self) -> Option<crate::stats::Meter> {
+        match self {
+            Connection::Metered(metered) if metered.meter.counts() => Some(metered.meter.clone()),
+            Connection::Metered(metered) => metered.inner.ktls_read_account(),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.ktls_read_account()
+            }
+            _ => None,
+        }
+    }
+
     /// Whether a descriptor-level fast path would skip the meter above this stream.
     pub(crate) fn metered(&self) -> bool {
         match self {

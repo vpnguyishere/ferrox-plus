@@ -310,6 +310,7 @@ carrier-xhttp data-window-writes 1 ferrox-app-xhttp_h2::tests::a_data_window_lea
 carrier-xhttp packet-up-windows-per-post 2 ferrox-app-xhttp::tests::a_packet_up_upload_batches_what_queues_behind_an_answer
 carrier-xhttp packet-up-bytes-reordered 0 ferrox-app-xhttp::tests::a_packet_up_upload_posts_every_byte_in_order
 carrier-xhttp window-update-frames-per-credit 2 ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write
+carrier-xhttp h2-body-cap-bytes 4210688 ferrox-app-xhttp_h2::tests::an_unread_body_holds_its_window_and_the_queue_is_capped
 carrier-xhttp head-buffer-reallocations-per-request-head 0 ferrox-app-xhttp_h2::tests::the_synthesized_head_is_sized_for_its_bytes
 carrier-xhttp head-tail-read-syscalls 0 ferrox-app-xhttp::tests::a_chunk_that_rode_in_with_the_head_costs_no_syscall
 carrier-xhttp head-tail-allocations 0 ferrox-app-xhttp::tests::the_record_head_hands_over_the_buffer_it_filled
@@ -376,6 +377,7 @@ carrier-foxy uplink-bytes-blocked-by-a-parked-leg 0 ferrox-app-foxy::loopback::a
 carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads
 carrier-foxy window-update-frames-per-floor-crossing 2 ferrox-app-foxy::loopback::credit_crossing_the_floor_costs_one_pair_not_one_per_frame
 carrier-foxy window-update-frames-below-the-floor 0 ferrox-app-foxy::loopback::credit_held_under_the_floor_never_reaches_the_wire
+carrier-foxy stalled-flow-window-update-frames 0 ferrox-app-foxy::loopback::a_flow_that_does_not_read_returns_no_stream_credit
 carrier-foxy padded-frame-credit-octets 0 ferrox-app-foxy::loopback::a_padded_frame_credits_its_whole_wire_payload
 carrier-foxy padded-frame-pad-octets-delivered 0 ferrox-app-foxy::loopback::a_padded_frame_hands_back_only_its_payload
 carrier-foxy padded-frame-staged-bytes-per-payload-byte 1 ferrox-app-foxy::loopback::a_padded_frame_hands_back_only_its_payload
@@ -534,6 +536,7 @@ kcp mask-chain-wire-overhead-bytes 32 ferrox-core-kcp::listener::tests::the_wire
 kcp mask-read-side-payload-copies-per-datagram 0 ferrox-core-kcp::mask::tests::the_original_frame_round_trips_and_the_checks_fire
 kcp mask-encode-buffer-allocations-per-frame 0 ferrox-core-kcp::mask::tests::the_scratch_holds_its_capacity_across_frames
 kcp datagram-room-zero-filled-bytes 0 ferrox-core-kcp::listener::tests::the_datagram_room_is_not_zeroed
+kcp listener-session-cap 256 ferrox-core-kcp::listener::tests::the_listener_caps_sessions_before_accept
 kcp oracle-mask-lines-against-the-pinned-go 86 ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go
 trojan header-reads-numeric-address 2 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
 trojan header-reads-domain-address 3 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
@@ -762,6 +765,7 @@ front-tun emit-packet-reallocations-per-render 0 ferrox-app-tun::tests::an_emitt
 
 # --- finalmask post-TLS TCP mask chain --------------------------------------
 finalmask sudoku-ops-retired-instructions UNBLESSED scripts/count-ops.sh
+finalmask sudoku-entropy-getrandoms 512 ferrox-core-finalmask-sudoku::tests::the_entropy_supply_serves_a_pure_encode
 finalmask sudoku-encoder-capacity-growth 0 ferrox-core-finalmask-sudoku::tests::the_encoder_buffer_holds_its_capacity
 finalmask sudoku-pure-octets-per-plaintext-octet 4 ferrox-core-finalmask-sudoku::tests::the_wire_ratio_is_the_reference_shape
 finalmask sudoku-packed-octets-per-three-octets 4 ferrox-core-finalmask-sudoku::tests::the_wire_ratio_is_the_reference_shape
@@ -1093,3 +1097,10 @@ engine-tagged tagged-udp-hops 1 ferrox-app-proxy::tests::a_tagged_udp_dial_reach
 engine-tagged kcp-tagged-carrier-echoes 1 ferrox-app-proxy::tests::a_kcp_dial_rides_the_tagged_hop_to_its_server
 engine-tagged kcp-dial-with-stops-on-close 1 ferrox-core-kcp::listener::tests::a_dial_with_rides_the_callers_socket_and_stops_on_close
 engine-tagged pb-dialer-proxy-fields-decoded 1 ferrox-app-xray_pb::tests::a_sender_socket_dialer_proxy_names_the_tagged_outbound
+
+# --- kTLS ------------------------------------------------------------------
+security-ktls ops-retired-instructions UNBLESSED scripts/count-ops.sh
+security-ktls syscalls-per-offloaded-record UNBLESSED scripts/count-ops.sh
+security-ktls user-space-copies-per-offloaded-record UNBLESSED no copy checker yet
+security-ktls seconds-per-offloaded-record UNBLESSED CI bench.yml (no cell yet)
+security-ktls both-directions-carried-by-the-kernel 1 ferrox-core-tls::rustls_backend::tests::a_ktls_loopback_carries_both_directions
