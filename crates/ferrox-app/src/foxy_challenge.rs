@@ -48,9 +48,9 @@ impl Agent {
     }
 }
 
-pub(crate) const FIREFOX_VERSION: &str = "159.0";
+pub(crate) const FIREFOX_VERSION: &str = "160.0";
 const BROWSER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0";
+    "Mozilla/5.0 (X11; Linux x86_64; rv:160.0) Gecko/20100101 Firefox/160.0";
 const BROWSER_LANGUAGE: &str = "en-US,en;q=0.5";
 
 static FXA_USER_AGENT: Mutex<Option<String>> = Mutex::new(None);
