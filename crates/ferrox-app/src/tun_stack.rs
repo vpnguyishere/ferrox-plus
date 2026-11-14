@@ -332,6 +332,19 @@ fn send_loop(
             return;
         };
         if is_gso(&packet, headroom) {
+            static GSO_SEEN: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if GSO_SEEN.fetch_add(1, Ordering::Relaxed) < 3 {
+                let header = VirtioNetHdr::decode(&packet[..headroom]).unwrap();
+                let body = &packet[headroom..];
+                let show = body.len().min(48);
+                eprintln!(
+                    "gso len={} flags={} type={} hdr_len={} gso_size={} csum_start={} csum_offset={} body={:02x?}",
+                    body.len(), header.flags, header.gso_type, header.hdr_len,
+                    header.gso_size, header.csum_start, header.csum_offset,
+                    &body[..show]
+                );
+            }
             if let Err(error) = device.send(&packet) {
                 eprintln!("tun gso write {} bytes: {error}", packet.len());
                 if !refused(&error) {
