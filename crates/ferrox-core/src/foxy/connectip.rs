@@ -779,13 +779,6 @@ pub fn tcp_checksum(source: &[u8], destination: &[u8], segment: &[u8]) -> u16 {
     !fold(sum + word_sum(segment))
 }
 
-/// The pseudo-header sum a TUN checksum-offload frame leaves for the kernel to complete.
-pub fn tcp_pseudo_checksum(source: &[u8], destination: &[u8], length: usize) -> u16 {
-    const TCP_PROTOCOL: u32 = 6;
-    let sum = word_sum(source) + word_sum(destination) + (length as u32) + TCP_PROTOCOL;
-    fold((sum & 0xffff) + (sum >> 16))
-}
-
 /// The pseudo-header a UDP checksum covers (RFC 768, RFC 8200 §8.1) summed without writing it: a one's-complement sum is position-independent, so the addresses contribute their word runs, the length its value (sixteen bits by construction, IPv6's wider field adding an unchanged zero word) and the protocol a lone word whose high half is zero — the same words the materialised header held, so both versions agree with no branch.
 fn pseudo_sum(source: &[u8], destination: &[u8], payload: usize) -> u32 {
     let length = (UDP_HEADER + payload) as u32;
@@ -1932,15 +1925,6 @@ mod tests {
             materialised(&src, &dst, &ones),
             "all-ones segment"
         );
-        // The offload partial sum is the pseudo-header alone, which a zero segment leaves untouched.
-        for len in [0usize, 1, 2, 3, 20, 1333, 65_495] {
-            let empty = vec![0u8; len];
-            assert_eq!(
-                tcp_pseudo_checksum(&src, &dst, len),
-                !tcp_checksum(&src, &dst, &empty),
-                "pseudo len {len}"
-            );
-        }
     }
 
     /// A receiver of a datagram this lane builds sums the pseudo-header, the UDP header with the checksum in it, and the payload, and gets all ones — and a zero answer never goes on the wire.

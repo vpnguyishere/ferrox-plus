@@ -39,7 +39,7 @@ x25519-dalek = "3"
 zeroize = "1"
 socket2 = "0.6"
 route_manager = "0.2"
-smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "segmentation-offload"] }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic"] }
 tun-rs = "2.8.18"
 crypto_box = "0.9"
 crypto_secretbox = "0.1"

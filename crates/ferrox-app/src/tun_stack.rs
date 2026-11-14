@@ -18,7 +18,7 @@ use std::thread;
 use tun_rs::{DeviceBuilder, SyncDevice};
 
 #[cfg(target_os = "linux")]
-use tun_rs::{GROTable, VirtioNetHdr, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
+use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 use crate::proxy::Outbound;
 use crate::tun::Spec;
@@ -174,7 +174,6 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             stack_out,
             Some(recycle),
             headroom,
-            offload,
             wake_read,
             stack_failed,
         );
@@ -186,7 +185,6 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             stack_out,
             Some(recycle),
             headroom,
-            offload,
             stack_failed,
         );
     });
@@ -331,16 +329,6 @@ fn send_loop(
         let Ok(packet) = packets.recv() else {
             return;
         };
-        if is_gso(&packet, headroom) {
-            if let Err(error) = device.send(&packet) {
-                if !refused(&error) {
-                    eprintln!("tun write: {error}");
-                    failed.store(true, Ordering::Relaxed);
-                    return;
-                }
-            }
-            continue;
-        }
         batch.clear();
         let mut take = |packet: &[u8], batch: &mut Vec<Vec<u8>>| {
             let mut buffer = pool
@@ -372,12 +360,6 @@ fn send_loop(
             return;
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-fn is_gso(packet: &[u8], headroom: usize) -> bool {
-    packet.len() >= headroom
-        && VirtioNetHdr::decode(&packet[..headroom]).is_ok_and(|header| header.gso_type != 0)
 }
 
 #[cfg(not(target_os = "linux"))]

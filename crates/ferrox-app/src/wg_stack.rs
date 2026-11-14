@@ -20,8 +20,6 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
-#[cfg(target_os = "linux")]
-use ferrox_core::foxy::connectip::tcp_pseudo_checksum;
 use ferrox_core::foxy::connectip::{
     icmp_echo_reply, ipv4_checksum, tcp_checksum, udp_datagram, udp_from_packet, UdpDatagram,
     IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP,
@@ -30,10 +28,7 @@ use ferrox_core::foxy::connectip::{
 use ferrox_core::wireguard::transport::HEADER_SIZE as WG_HEADER_SIZE;
 use ferrox_core::wireguard::transport::TAG_SIZE as WG_TAG_SIZE;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{
-    Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, PacketMeta, RxToken,
-    TxToken,
-};
+use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{
     CongestionControl, RecvError, SendError, Socket as TcpSocket, SocketBuffer, State,
 };
@@ -160,8 +155,6 @@ struct QueueDevice {
     headroom: usize,
     recycle: Option<Sender<Vec<u8>>>,
     tun_recycle: Option<SyncSender<Vec<u8>>>,
-    unchecked: bool,
-    gso: bool,
 }
 
 impl QueueDevice {
@@ -174,8 +167,6 @@ impl QueueDevice {
             headroom,
             recycle: None,
             tun_recycle: None,
-            unchecked: false,
-            gso: false,
         }
     }
 
@@ -249,10 +240,6 @@ impl Drop for QueueRx {
 struct QueueTx<'a> {
     tx: &'a mut VecDeque<Vec<u8>>,
     headroom: usize,
-    #[cfg(target_os = "linux")]
-    meta: PacketMeta,
-    #[cfg(target_os = "linux")]
-    gso: bool,
 }
 
 /// Build an outgoing segment in one buffer with its tunnel headroom reserved.
@@ -265,108 +252,8 @@ impl TxToken for QueueTx<'_> {
         let mut buffer = Vec::with_capacity(self.headroom + len + WG_TAG_SIZE);
         buffer.resize(self.headroom + len, 0);
         let answer = f(&mut buffer[self.headroom..]);
-        #[cfg(target_os = "linux")]
-        if self.gso {
-            tune_tcp(&mut buffer, self.headroom, self.meta);
-        }
         self.tx.push_back(buffer);
         answer
-    }
-
-    /// Remember the segmentation the stack asks the device to do.
-    fn set_meta(&mut self, meta: PacketMeta) {
-        #[cfg(target_os = "linux")]
-        {
-            self.meta = meta;
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = meta;
-    }
-}
-
-/// `VIRTIO_NET_HDR_F_NEEDS_CSUM`, which asks the kernel to finish the checksum.
-#[cfg(target_os = "linux")]
-const NEEDS_CSUM: u8 = 1;
-
-/// Complete a TUN segment's TCP checksum, or leave only the pseudo-header sum
-/// when the kernel will segment a long one.
-#[cfg(target_os = "linux")]
-fn tune_tcp(buffer: &mut [u8], headroom: usize, meta: PacketMeta) {
-    let Some(packet) = buffer.get_mut(headroom..) else {
-        return;
-    };
-    let Some(layout) = TcpLayout::of(packet) else {
-        return;
-    };
-    packet[layout.checksum..layout.checksum + 2].fill(0);
-    let value = {
-        let source = &packet[layout.source..layout.source + layout.address];
-        let destination =
-            &packet[layout.source + layout.address..layout.source + layout.address * 2];
-        let segment = &packet[layout.ip..];
-        match meta.segmentation_offload_size {
-            Some(_) => tcp_pseudo_checksum(source, destination, segment.len()),
-            None => tcp_checksum(source, destination, segment),
-        }
-    };
-    packet[layout.checksum..layout.checksum + 2].copy_from_slice(&value.to_be_bytes());
-    let Some(mss) = meta.segmentation_offload_size else {
-        return;
-    };
-    if headroom < tun_rs::VIRTIO_NET_HDR_LEN {
-        return;
-    }
-    let header = tun_rs::VirtioNetHdr {
-        flags: NEEDS_CSUM,
-        gso_type: layout.gso_type,
-        hdr_len: layout.payload as u16,
-        gso_size: mss.get(),
-        csum_start: layout.ip as u16,
-        csum_offset: 16,
-    };
-    let _ = header.encode(&mut buffer[..headroom]);
-}
-
-#[cfg(target_os = "linux")]
-struct TcpLayout {
-    ip: usize,
-    source: usize,
-    address: usize,
-    payload: usize,
-    checksum: usize,
-    gso_type: u8,
-}
-
-#[cfg(target_os = "linux")]
-impl TcpLayout {
-    fn of(packet: &[u8]) -> Option<Self> {
-        let (ip, source, address, protocol, gso_type) = match *packet.first()? >> 4 {
-            4 => (
-                usize::from(*packet.first()? & 0x0f) * 4,
-                12,
-                4,
-                *packet.get(9)?,
-                tun_rs::VIRTIO_NET_HDR_GSO_TCPV4,
-            ),
-            6 => (40, 8, 16, *packet.get(6)?, tun_rs::VIRTIO_NET_HDR_GSO_TCPV6),
-            _ => return None,
-        };
-        if protocol != 6 || ip < 20 || packet.len() < ip + 20 {
-            return None;
-        }
-        let header = usize::from(*packet.get(ip + 12)? >> 4) * 4;
-        if header < 20 {
-            return None;
-        }
-        let payload = ip + header;
-        (payload <= packet.len()).then(|| Self {
-            ip,
-            source,
-            address,
-            payload,
-            checksum: ip + 16,
-            gso_type,
-        })
     }
 }
 
@@ -401,10 +288,6 @@ impl Device for QueueDevice {
             QueueTx {
                 tx: &mut self.tx,
                 headroom: self.headroom,
-                #[cfg(target_os = "linux")]
-                meta: PacketMeta::default(),
-                #[cfg(target_os = "linux")]
-                gso: self.gso,
             },
         ))
     }
@@ -414,10 +297,6 @@ impl Device for QueueDevice {
         Some(QueueTx {
             tx: &mut self.tx,
             headroom: self.headroom,
-            #[cfg(target_os = "linux")]
-            meta: PacketMeta::default(),
-            #[cfg(target_os = "linux")]
-            gso: self.gso,
         })
     }
 
@@ -426,21 +305,6 @@ impl Device for QueueDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
-        if self.unchecked {
-            let mut checksum = ChecksumCapabilities::default();
-            checksum.tcp = if self.gso {
-                Checksum::None
-            } else {
-                Checksum::Tx
-            };
-            checksum.udp = Checksum::Tx;
-            caps.checksum = checksum;
-        }
-        #[cfg(target_os = "linux")]
-        if self.gso {
-            caps.segmentation.tcpv4 = core::num::NonZeroUsize::new(INNER_MTU);
-            caps.segmentation.tcpv6 = core::num::NonZeroUsize::new(INNER_MTU);
-        }
         caps
     }
 }
@@ -1460,11 +1324,10 @@ pub(crate) fn serve_tun_device(
     out: Outbound,
     recycle: Option<SyncSender<Vec<u8>>>,
     headroom: usize,
-    gso: bool,
     wake: std::os::unix::net::UnixStream,
     failed: Arc<AtomicBool>,
 ) {
-    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, headroom, gso);
+    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, headroom);
     stack.device.tun_recycle = recycle;
     let _ = wake.set_nonblocking(true);
     loop {
@@ -1505,10 +1368,9 @@ pub(crate) fn serve_tun_device(
     out: Outbound,
     recycle: Option<SyncSender<Vec<u8>>>,
     headroom: usize,
-    gso: bool,
     failed: Arc<AtomicBool>,
 ) {
-    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, headroom, gso);
+    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, headroom);
     stack.device.tun_recycle = recycle;
     loop {
         if failed.load(Ordering::Relaxed) {
@@ -1889,13 +1751,6 @@ struct ServerStack {
     started: StdInstant,
 }
 
-/// Whether this stack rides a tunnel record or a TUN whose GSO the kernel completes.
-#[derive(Clone, Copy)]
-enum QueueMode {
-    Tunnel,
-    Tun { gso: bool },
-}
-
 impl ServerStack {
     /// Build the server's interface, sockets and routes over a device that reserves its headroom.
     fn new(
@@ -1909,15 +1764,7 @@ impl ServerStack {
         } else {
             config.mtu
         };
-        Self::with_mtu(
-            config,
-            to_tunnel,
-            out,
-            headroom,
-            INNER_MTU,
-            fragment,
-            QueueMode::Tunnel,
-        )
+        Self::with_mtu(config, to_tunnel, out, headroom, INNER_MTU, fragment)
     }
 
     /// Build the same interface over a TUN whose packets already carry their IP header.
@@ -1926,17 +1773,8 @@ impl ServerStack {
         to_tunnel: impl Into<ToTunnel>,
         out: Outbound,
         headroom: usize,
-        gso: bool,
     ) -> Self {
-        Self::with_mtu(
-            config,
-            to_tunnel,
-            out,
-            headroom,
-            config.mtu,
-            config.mtu,
-            QueueMode::Tun { gso },
-        )
+        Self::with_mtu(config, to_tunnel, out, headroom, config.mtu, config.mtu)
     }
 
     fn with_mtu(
@@ -1946,16 +1784,8 @@ impl ServerStack {
         headroom: usize,
         device_mtu: usize,
         fragment: usize,
-        mode: QueueMode,
     ) -> Self {
         let mut device = QueueDevice::new(device_mtu, headroom);
-        match mode {
-            QueueMode::Tunnel => {}
-            QueueMode::Tun { gso } => {
-                device.unchecked = true;
-                device.gso = gso;
-            }
-        }
         let mut iface = Interface::new(
             iface_config(0x5eed_5678),
             &mut device,
@@ -5572,53 +5402,6 @@ mod client_tests {
         let back = recycled.try_recv().expect("the slot comes back");
         assert_eq!(back.as_ptr(), base);
         assert_eq!(back.capacity(), capacity);
-    }
-
-    /// A long TCP segment leaves the kernel its pseudo-header sum and a GSO header.
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[allow(clippy::field_reassign_with_default)]
-    fn a_long_tcp_segment_carries_a_gso_header() {
-        let payload = vec![0x5a; 3_000];
-        let length = 40 + payload.len();
-        let mut buffer = vec![0u8; 10 + length];
-        let packet = &mut buffer[10..];
-        packet[0] = 0x45;
-        packet[2..4].copy_from_slice(&(length as u16).to_be_bytes());
-        packet[8] = 64;
-        packet[9] = 6;
-        packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
-        packet[16..20].copy_from_slice(&[198, 51, 100, 7]);
-        packet[20..22].copy_from_slice(&1234u16.to_be_bytes());
-        packet[22..24].copy_from_slice(&80u16.to_be_bytes());
-        packet[32] = 5 << 4;
-        packet[40..].copy_from_slice(&payload);
-        let mut meta = PacketMeta::default();
-        meta.segmentation_offload_size = core::num::NonZeroU16::new(1460);
-        tune_tcp(&mut buffer, 10, meta);
-        let header = tun_rs::VirtioNetHdr::decode(&buffer[..10]).expect("a GSO header");
-        assert_eq!(header.gso_type, tun_rs::VIRTIO_NET_HDR_GSO_TCPV4);
-        assert_eq!(header.gso_size, 1460);
-        assert_eq!(header.hdr_len, 40);
-        assert_eq!(header.csum_start, 20);
-        assert_eq!(header.csum_offset, 16);
-        let packet = &buffer[10..];
-        let stored = u16::from_be_bytes([packet[36], packet[37]]);
-        assert_eq!(
-            stored,
-            tcp_pseudo_checksum(&packet[12..16], &packet[16..20], packet.len() - 20)
-        );
-
-        let mut plain = vec![0u8; 10 + length];
-        plain[10..].copy_from_slice(&buffer[10..]);
-        tune_tcp(&mut plain, 10, PacketMeta::default());
-        let packet = &plain[10..];
-        let mut segment = packet[20..].to_vec();
-        segment[16..18].fill(0);
-        assert_eq!(
-            u16::from_be_bytes([packet[36], packet[37]]),
-            tcp_checksum(&packet[12..16], &packet[16..20], &segment)
-        );
     }
 
     /// A Packet Too Big lowers the device MTU once and never widens it.
