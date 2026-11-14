@@ -28,7 +28,7 @@ use ferrox_core::foxy::connectip::{
 use ferrox_core::wireguard::transport::HEADER_SIZE as WG_HEADER_SIZE;
 use ferrox_core::wireguard::transport::TAG_SIZE as WG_TAG_SIZE;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{
     CongestionControl, RecvError, SendError, Socket as TcpSocket, SocketBuffer, State,
 };
@@ -155,6 +155,7 @@ struct QueueDevice {
     headroom: usize,
     recycle: Option<Sender<Vec<u8>>>,
     tun_recycle: Option<SyncSender<Vec<u8>>>,
+    unchecked: bool,
 }
 
 impl QueueDevice {
@@ -167,6 +168,7 @@ impl QueueDevice {
             headroom,
             recycle: None,
             tun_recycle: None,
+            unchecked: false,
         }
     }
 
@@ -305,6 +307,12 @@ impl Device for QueueDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
+        if self.unchecked {
+            let mut checksum = ChecksumCapabilities::default();
+            checksum.tcp = Checksum::Tx;
+            checksum.udp = Checksum::Tx;
+            caps.checksum = checksum;
+        }
         caps
     }
 }
@@ -1764,7 +1772,7 @@ impl ServerStack {
         } else {
             config.mtu
         };
-        Self::with_mtu(config, to_tunnel, out, headroom, INNER_MTU, fragment)
+        Self::with_mtu(config, to_tunnel, out, headroom, INNER_MTU, fragment, false)
     }
 
     /// Build the same interface over a TUN whose packets already carry their IP header.
@@ -1784,8 +1792,10 @@ impl ServerStack {
         headroom: usize,
         device_mtu: usize,
         fragment: usize,
+        unchecked: bool,
     ) -> Self {
         let mut device = QueueDevice::new(device_mtu, headroom);
+        device.unchecked = unchecked;
         let mut iface = Interface::new(
             iface_config(0x5eed_5678),
             &mut device,
