@@ -331,7 +331,7 @@ fn tune_tcp(buffer: &mut [u8], headroom: usize, meta: PacketMeta) {
             mss.get(),
             layout.payload,
             layout.gso_type,
-            segment.len()
+            packet.len() - layout.ip
         );
     }
     if headroom < tun_rs::VIRTIO_NET_HDR_LEN {
