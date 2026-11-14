@@ -303,7 +303,7 @@ fn tune_tcp(buffer: &mut [u8], headroom: usize, meta: PacketMeta) {
         let source = &packet[layout.source..layout.source + layout.address];
         let destination =
             &packet[layout.source + layout.address..layout.source + layout.address * 2];
-        let segment = &packet[layout.segment..];
+        let segment = &packet[layout.ip..];
         match meta.segmentation_offload_size {
             Some(_) => tcp_pseudo_checksum(source, destination, segment.len()),
             None => tcp_checksum(source, destination, segment),
@@ -319,7 +319,7 @@ fn tune_tcp(buffer: &mut [u8], headroom: usize, meta: PacketMeta) {
     let header = tun_rs::VirtioNetHdr {
         flags: NEEDS_CSUM,
         gso_type: layout.gso_type,
-        hdr_len: layout.segment as u16,
+        hdr_len: layout.payload as u16,
         gso_size: mss.get(),
         csum_start: layout.ip as u16,
         csum_offset: 16,
@@ -332,7 +332,7 @@ struct TcpLayout {
     ip: usize,
     source: usize,
     address: usize,
-    segment: usize,
+    payload: usize,
     checksum: usize,
     gso_type: u8,
 }
@@ -358,12 +358,12 @@ impl TcpLayout {
         if header < 20 {
             return None;
         }
-        let segment = ip + header;
-        (segment <= packet.len()).then(|| Self {
+        let payload = ip + header;
+        (payload <= packet.len()).then(|| Self {
             ip,
             source,
             address,
-            segment,
+            payload,
             checksum: ip + 16,
             gso_type,
         })
@@ -1889,6 +1889,12 @@ struct ServerStack {
     started: StdInstant,
 }
 
+/// Whether this stack rides a tunnel record or a TUN whose GSO the kernel completes.
+enum QueueMode {
+    Tunnel,
+    Tun { gso: bool },
+}
+
 impl ServerStack {
     /// Build the server's interface, sockets and routes over a device that reserves its headroom.
     fn new(
@@ -1903,7 +1909,13 @@ impl ServerStack {
             config.mtu
         };
         Self::with_mtu(
-            config, to_tunnel, out, headroom, INNER_MTU, fragment, false, false,
+            config,
+            to_tunnel,
+            out,
+            headroom,
+            INNER_MTU,
+            fragment,
+            QueueMode::Tunnel,
         )
     }
 
@@ -1916,7 +1928,13 @@ impl ServerStack {
         gso: bool,
     ) -> Self {
         Self::with_mtu(
-            config, to_tunnel, out, headroom, config.mtu, config.mtu, true, gso,
+            config,
+            to_tunnel,
+            out,
+            headroom,
+            config.mtu,
+            config.mtu,
+            QueueMode::Tun { gso },
         )
     }
 
@@ -1927,12 +1945,16 @@ impl ServerStack {
         headroom: usize,
         device_mtu: usize,
         fragment: usize,
-        unchecked: bool,
-        gso: bool,
+        mode: QueueMode,
     ) -> Self {
         let mut device = QueueDevice::new(device_mtu, headroom);
-        device.unchecked = unchecked;
-        device.gso = gso;
+        match mode {
+            QueueMode::Tunnel => {}
+            QueueMode::Tun { gso } => {
+                device.unchecked = true;
+                device.gso = gso;
+            }
+        }
         let mut iface = Interface::new(
             iface_config(0x5eed_5678),
             &mut device,
