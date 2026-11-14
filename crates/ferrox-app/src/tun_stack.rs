@@ -22,7 +22,7 @@ use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 use crate::proxy::Outbound;
 use crate::tun::Spec;
-use crate::wg_stack::Packet;
+use crate::wg_stack::{Packet, TxPool};
 use crate::wireguard::DeviceConfig;
 
 pub(crate) const RX_QUEUE: usize = 1024;
@@ -152,6 +152,15 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
     let headroom = VIRTIO_NET_HDR_LEN;
     #[cfg(not(target_os = "linux"))]
     let headroom = 0;
+    #[cfg(target_os = "linux")]
+    let (tx_pool, tx_free) = if headroom == VIRTIO_NET_HDR_LEN {
+        let (pool, free) = TxPool::new(WRITE_BATCH, headroom + 65_535);
+        (Some(pool), Some(free))
+    } else {
+        (None, None)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (tx_pool, tx_free): (Option<TxPool>, Option<SyncSender<Vec<u8>>>) = (None, None);
     let (packets, incoming) = mpsc::sync_channel(RX_QUEUE);
     let (outgoing, writes) = mpsc::sync_channel(TX_QUEUE);
     let (recycle, reused) = mpsc::sync_channel(RX_QUEUE);
@@ -174,6 +183,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             stack_out,
             Some(recycle),
             headroom,
+            tx_pool,
             wake_read,
             stack_failed,
         );
@@ -185,11 +195,14 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             stack_out,
             Some(recycle),
             headroom,
+            tx_pool,
             stack_failed,
         );
     });
     let send_device = Arc::clone(&device);
-    thread::spawn(move || send_loop(send_device, writes, offload, headroom, &failed));
+    thread::spawn(move || {
+        send_loop(send_device, writes, offload, headroom, tx_free.as_ref(), &failed);
+    });
     let mtu = spec.mtu();
     thread::spawn(move || recv_loop(device, packets, reused, mtu, headroom, wake_write));
 }
@@ -303,10 +316,11 @@ fn send_loop(
     packets: Receiver<Vec<u8>>,
     offload: bool,
     headroom: usize,
+    tx_free: Option<&SyncSender<Vec<u8>>>,
     failed: &AtomicBool,
 ) {
     if !offload {
-        send_packets_offset(device, packets, failed, headroom);
+        send_packets_offset(device, packets, failed, headroom, tx_free);
         return;
     }
     let mut gro = GROTable::default();
@@ -324,6 +338,11 @@ fn send_loop(
             }
         }
         let written = device.send_multiple(&mut gro, &mut batch, headroom);
+        for buffer in batch.drain(..) {
+            if let Some(free) = tx_free {
+                let _ = free.try_send(buffer);
+            }
+        }
         if let Err(error) = written {
             if refused(&error) {
                 continue;
@@ -341,6 +360,7 @@ fn send_loop(
     packets: Receiver<Vec<u8>>,
     _offload: bool,
     _headroom: usize,
+    _tx_free: Option<&SyncSender<Vec<u8>>>,
     failed: &AtomicBool,
 ) {
     send_plain(device, packets, failed, None);
@@ -361,8 +381,9 @@ fn send_packets_offset(
     packets: Receiver<Vec<u8>>,
     failed: &AtomicBool,
     offset: usize,
+    recycle: Option<&SyncSender<Vec<u8>>>,
 ) {
-    send_packets(&packets, failed, None, |packet| {
+    send_packets(&packets, failed, recycle, |packet| {
         let body = packet
             .get(offset..)
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
