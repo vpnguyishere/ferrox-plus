@@ -19467,11 +19467,12 @@ fn settle_ktls<S: ferrox_core::tls::TlsProvider + Drivable>(session: &mut S) -> 
 
 fn transport_ktls_fd(conn: &Connection) -> Option<ferrox_core::tls::RawFd> {
     #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd as _;
+    #[cfg(target_os = "linux")]
     {
         if conn.has_mask() || matches!(conn, Connection::Unix(_)) {
             return None;
         }
-        use std::os::fd::AsRawFd as _;
         Some(conn.as_raw_fd())
     }
     #[cfg(not(target_os = "linux"))]

@@ -50,7 +50,7 @@ No matrix cell isolates a kTLS session: the bench cells time relays whose transp
 - **A read-ahead buffered handshake.** The kTLS dial and listener drive rustls one TLS record at a time, so no post-handshake record is consumed before `setsockopt`; the stock `complete_io` path would read ciphertext the kernel must then decrypt.
 - **A fallback when the kernel refuses.** A config that asks for kTLS and cannot get it fails instead of sending userspace ciphertext, so the bytes on the wire never diverge silently.
 
-What was **not** removed: the kernel still allocates its own record buffers, and the RX path does not use `splice`. A server-side RX splice is disabled by the reference for the same reason it is absent here. TLS 1.2 sessions never take this path, and session tickets are dropped because a kernel-offloaded session does not resume.
+What was **not** removed: the kernel still allocates its own record buffers, and the RX path does not use `splice`. A server-side RX splice is disabled by the reference for the same reason it is absent here. TLS 1.2 sessions never take this path; a rustls server sends no tickets when TX is offloaded, because rustls emits them before the kernel starts at sequence zero, and a received ticket is dropped.
 
 ## Pins
 
