@@ -54,6 +54,7 @@ mod proxy;
 mod psiphon;
 mod psiphon_broker;
 mod psiphon_burst;
+mod psiphon_cdn;
 mod psiphon_dns;
 mod psiphon_fragment;
 mod psiphon_geoip;

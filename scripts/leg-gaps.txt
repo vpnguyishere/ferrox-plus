@@ -86,3 +86,31 @@ shadowsocks-kcp-down-8|server-threads|1.20|696
 shadowsocks2022-kcp-down-8|server-threads|1.20|696
 # The Hysteria relay peaks 11-18 threads against the reference's 10-11 across runs; file the worst pairing.
 trojan-hysteria-down-8|server-threads|1.64|696
+
+# Full-tier run 43529363754 (linux-aarch64, 5 repeats): server legs newly below 0.85 and the REALITY upload client.
+shadowsocks-tls-httpupgrade-down-8|server|0.77|1208
+shadowsocks-tls-httpupgrade-ed-down-8|server|0.74|1208
+shadowsocks-tls-raw-down-8|server|0.72|1208
+shadowsocks-tls-ws-down-8|server|0.77|1208
+shadowsocks-ws-down-8|server|0.72|1208
+shadowsocks2022-hysteria-down-8|server|0.81|1208
+trojan-httpupgrade-down-8|server|0.54|1208
+trojan-raw-udp-8|server|0.40|1208
+trojan-tls-httpupgrade-ed-down-8|server|0.74|1208
+trojan-ws-down-8|server|0.61|1208
+vless-encryption-raw-down-8|server|0.38|1213
+vless-encryption-reality-raw-down-8|server|0.37|1213
+vless-encryption-tls-raw-down-8|server|0.37|1213
+vless-httpupgrade-down-8|server|0.37|1208
+vless-reality-raw-up-1|client|0.61|1645
+vless-tls-httpupgrade-down-8|server|0.39|1208
+vless-tls-httpupgrade-ed-down-8|server|0.40|1208
+vless-tls-ws-down-8|server|0.41|1208
+vless-ws-down-8|server|0.39|1208
+vmess-httpupgrade-down-8|server|0.64|1208
+vmess-raw-udp-8|server|0.67|1208
+vmess-tls-httpupgrade-down-8|server|0.72|1208
+vmess-tls-httpupgrade-ed-down-8|server|0.73|1208
+vmess-tls-ws-down-8|server|0.77|1208
+vmess-tls-ws-ed-down-8|server|0.76|1208
+vmess-ws-down-8|server|0.64|1208
