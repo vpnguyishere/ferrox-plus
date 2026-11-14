@@ -320,7 +320,9 @@ fn send_loop(
         };
         batch.clear();
         let mut take = |packet: &[u8], batch: &mut Vec<Vec<u8>>| {
-            let mut buffer = pool.pop().unwrap_or_else(|| Vec::with_capacity(headroom + 65_535));
+            let mut buffer = pool
+                .pop()
+                .unwrap_or_else(|| Vec::with_capacity(headroom + 65_535));
             buffer.clear();
             buffer.resize(headroom, 0);
             buffer.extend_from_slice(&packet[headroom..]);
