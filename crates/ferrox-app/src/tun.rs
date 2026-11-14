@@ -1827,7 +1827,7 @@ mod tests {
     }
 
     /// A response read larger than one segment leaves as one GSO frame: the end-to-end gate the header-only test cannot be, because it drives the response thread rather than calling the header builder.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_large_response_read_leaves_as_one_gso_frame() {
         use std::io::Write;
