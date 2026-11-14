@@ -5612,9 +5612,11 @@ mod client_tests {
         plain[10..].copy_from_slice(&buffer[10..]);
         tune_tcp(&mut plain, 10, PacketMeta::default());
         let packet = &plain[10..];
+        let mut segment = packet[20..].to_vec();
+        segment[16..18].fill(0);
         assert_eq!(
             u16::from_be_bytes([packet[36], packet[37]]),
-            tcp_checksum(&packet[12..16], &packet[16..20], &packet[20..])
+            tcp_checksum(&packet[12..16], &packet[16..20], &segment)
         );
     }
 

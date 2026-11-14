@@ -779,8 +779,7 @@ pub fn tcp_checksum(source: &[u8], destination: &[u8], segment: &[u8]) -> u16 {
     !fold(sum + word_sum(segment))
 }
 
-/// The unfolded pseudo-header sum a TUN checksum-offload frame leaves for the
-/// kernel to complete over each segment.
+/// The pseudo-header sum a TUN checksum-offload frame leaves for the kernel to complete.
 pub fn tcp_pseudo_checksum(source: &[u8], destination: &[u8], length: usize) -> u16 {
     const TCP_PROTOCOL: u32 = 6;
     let sum = word_sum(source) + word_sum(destination) + (length as u32) + TCP_PROTOCOL;
