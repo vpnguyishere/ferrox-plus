@@ -201,8 +201,8 @@ finalmask  finalmask::sudoku::tests::the_sudoku_tail_and_lookup_costs_the_bytes 
 finalmask  finalmask::sudoku::tests::the_sudoku_tail_and_lookup_costs_the_bytes  ferrox_core::finalmask::sudoku::tests::packed_encode_probe
 # The frame path in each direction: one 24 KiB payload per frame, one frame per
 # write, and a reader that consumes the same wire eight times.
-finalmask  xmc::packet_stream::tests::the_xmc_frame_path_costs_the_payload  ferrox_core::finalmask::xmc::packet_stream::tests::frame_read_probe
-finalmask  xmc::packet_stream::tests::the_xmc_frame_path_costs_the_payload  ferrox_core::finalmask::xmc::packet_stream::tests::frame_write_probe
+finalmask  finalmask::xmc::packet_stream::tests::the_xmc_frame_path_costs_the_payload  ferrox_core::finalmask::xmc::packet_stream::tests::frame_read_probe
+finalmask  finalmask::xmc::packet_stream::tests::the_xmc_frame_path_costs_the_payload  ferrox_core::finalmask::xmc::packet_stream::tests::frame_write_probe
 reverse  proxy::reverse_tests::a_sixteen_kib_downlink_is_echoed_whole  reverse::Session::read_loop
 http-proxy  proxy::tests::the_connect_request_builds_in_one_buffer  proxy::http_connect_request
 http-proxy  proxy::tests::http_request_parses_connect_and_both_get_forms  proxy::http_proxy_request
