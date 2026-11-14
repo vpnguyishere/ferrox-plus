@@ -20,12 +20,12 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
+#[cfg(target_os = "linux")]
+use ferrox_core::foxy::connectip::tcp_pseudo_checksum;
 use ferrox_core::foxy::connectip::{
     icmp_echo_reply, ipv4_checksum, tcp_checksum, udp_datagram, udp_from_packet, UdpDatagram,
     IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP,
 };
-#[cfg(target_os = "linux")]
-use ferrox_core::foxy::connectip::tcp_pseudo_checksum;
 #[cfg(test)]
 use ferrox_core::wireguard::transport::HEADER_SIZE as WG_HEADER_SIZE;
 use ferrox_core::wireguard::transport::TAG_SIZE as WG_TAG_SIZE;
@@ -319,7 +319,7 @@ fn tune_tcp(buffer: &mut [u8], headroom: usize, meta: PacketMeta) {
     let header = tun_rs::VirtioNetHdr {
         flags: NEEDS_CSUM,
         gso_type: layout.gso_type,
-        hdr_len: (layout.segment - layout.ip) as u16,
+        hdr_len: layout.segment as u16,
         gso_size: mss.get(),
         csum_start: layout.ip as u16,
         csum_offset: 16,
@@ -348,13 +348,7 @@ impl TcpLayout {
                 *packet.get(9)?,
                 tun_rs::VIRTIO_NET_HDR_GSO_TCPV4,
             ),
-            6 => (
-                40,
-                8,
-                16,
-                *packet.get(6)?,
-                tun_rs::VIRTIO_NET_HDR_GSO_TCPV6,
-            ),
+            6 => (40, 8, 16, *packet.get(6)?, tun_rs::VIRTIO_NET_HDR_GSO_TCPV6),
             _ => return None,
         };
         if protocol != 6 || ip < 20 || packet.len() < ip + 20 {
@@ -1908,7 +1902,9 @@ impl ServerStack {
         } else {
             config.mtu
         };
-        Self::with_mtu(config, to_tunnel, out, headroom, INNER_MTU, fragment, false, false)
+        Self::with_mtu(
+            config, to_tunnel, out, headroom, INNER_MTU, fragment, false, false,
+        )
     }
 
     /// Build the same interface over a TUN whose packets already carry their IP header.

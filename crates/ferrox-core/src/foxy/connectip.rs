@@ -1933,8 +1933,7 @@ mod tests {
             materialised(&src, &dst, &ones),
             "all-ones segment"
         );
-        // The offload partial sum is the pseudo-header alone, which the empty
-        // zero segment leaves untouched at every length.
+        // The offload partial sum is the pseudo-header alone, which a zero segment leaves untouched.
         for len in [0usize, 1, 2, 3, 20, 1333, 65_495] {
             let empty = vec![0u8; len];
             assert_eq!(

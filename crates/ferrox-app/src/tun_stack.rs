@@ -18,7 +18,7 @@ use std::thread;
 use tun_rs::{DeviceBuilder, SyncDevice};
 
 #[cfg(target_os = "linux")]
-use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN, VirtioNetHdr};
+use tun_rs::{GROTable, VirtioNetHdr, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 use crate::proxy::Outbound;
 use crate::tun::Spec;
