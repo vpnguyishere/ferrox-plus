@@ -249,7 +249,9 @@ impl Drop for QueueRx {
 struct QueueTx<'a> {
     tx: &'a mut VecDeque<Vec<u8>>,
     headroom: usize,
+    #[cfg(target_os = "linux")]
     meta: PacketMeta,
+    #[cfg(target_os = "linux")]
     gso: bool,
 }
 
@@ -273,9 +275,18 @@ impl TxToken for QueueTx<'_> {
 
     /// Remember the segmentation the stack asks the device to do.
     fn set_meta(&mut self, meta: PacketMeta) {
-        self.meta = meta;
+        #[cfg(target_os = "linux")]
+        {
+            self.meta = meta;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = meta;
     }
 }
+
+/// `VIRTIO_NET_HDR_F_NEEDS_CSUM`, which asks the kernel to finish the checksum.
+#[cfg(target_os = "linux")]
+const NEEDS_CSUM: u8 = 1;
 
 /// Complete a TUN segment's TCP checksum, or leave only the pseudo-header sum
 /// when the kernel will segment a long one.
@@ -306,7 +317,7 @@ fn tune_tcp(buffer: &mut [u8], headroom: usize, meta: PacketMeta) {
         return;
     }
     let header = tun_rs::VirtioNetHdr {
-        flags: tun_rs::VIRTIO_NET_HDR_F_NEEDS_CSUM,
+        flags: NEEDS_CSUM,
         gso_type: layout.gso_type,
         hdr_len: (layout.segment - layout.ip) as u16,
         gso_size: mss.get(),
@@ -396,7 +407,9 @@ impl Device for QueueDevice {
             QueueTx {
                 tx: &mut self.tx,
                 headroom: self.headroom,
+                #[cfg(target_os = "linux")]
                 meta: PacketMeta::default(),
+                #[cfg(target_os = "linux")]
                 gso: self.gso,
             },
         ))
@@ -407,7 +420,9 @@ impl Device for QueueDevice {
         Some(QueueTx {
             tx: &mut self.tx,
             headroom: self.headroom,
+            #[cfg(target_os = "linux")]
             meta: PacketMeta::default(),
+            #[cfg(target_os = "linux")]
             gso: self.gso,
         })
     }
