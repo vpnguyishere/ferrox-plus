@@ -1946,7 +1946,11 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
     config.alpn_protocols.clear();
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
     // A kTLS TX starts at sequence zero, so it must not follow a ticket sent before install.
-    config.send_tls13_tickets = if cfg.send_tickets && !cfg.kernel_tx { 2 } else { 0 };
+    config.send_tls13_tickets = if cfg.send_tickets && !cfg.kernel_tx {
+        2
+    } else {
+        0
+    };
     if config.send_tls13_tickets > 0 {
         if let Some(key) = ticket_key() {
             config.ticketer = key;

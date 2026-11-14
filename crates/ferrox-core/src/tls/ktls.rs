@@ -334,7 +334,8 @@ fn set_ulp(fd: RawFd) -> io::Result<()> {
         )
     };
     if set < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(error.kind(), format!("ktls: set tcp_ulp: {error}")));
     }
     Ok(())
 }
@@ -367,7 +368,12 @@ fn install_key(fd: RawFd, direction: libc::c_int, material: &Material) -> io::Re
         )
     };
     if set < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        let direction = if direction == TLS_TX { "TX" } else { "RX" };
+        return Err(io::Error::new(
+            error.kind(),
+            format!("ktls: install {direction} key: {error}"),
+        ));
     }
     Ok(())
 }
