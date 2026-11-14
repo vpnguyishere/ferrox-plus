@@ -881,7 +881,7 @@ mod tests {
                 let mut hit = None;
                 for bits in SHORTEST..=remaining {
                     let probe = table.probe[bits];
-                    let acc = (window >> (PEEK - at - bits)) as u32;
+                    let acc = ((window >> (PEEK - at - bits)) & ((1u32 << bits) - 1)) as u32;
                     let offset = acc.wrapping_sub((probe >> 32) as u32);
                     if offset < probe as u32 {
                         let symbol =
