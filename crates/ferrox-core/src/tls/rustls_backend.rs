@@ -4503,7 +4503,7 @@ mod tests {
                 let mut server = RustlsServerProvider::accept(identity, stream).expect("accepts");
                 server.handshake().expect("handshakes");
                 server
-                    .enable_ktls(server.get_ref().get_ref().as_raw_fd())
+                    .enable_ktls(server.get_ref().as_raw_fd())
                     .expect("the server hands both directions to the kernel");
                 let mut ping = [0u8; 4];
                 server

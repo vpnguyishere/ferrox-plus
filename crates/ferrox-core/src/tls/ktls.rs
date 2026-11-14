@@ -145,8 +145,7 @@ impl Ktls {
                 install_key(fd, TLS_RX, &material)?;
                 ktls.rx = Some(material);
                 let one: libc::c_int = 1;
-                // An optimisation, not a correctness switch: an older kernel that
-                // does not know it still decrypts every record.
+                // An optimisation, not a correctness switch: an older kernel still decrypts.
                 unsafe {
                     libc::setsockopt(
                         fd,
@@ -223,7 +222,7 @@ impl Ktls {
                 (*cmsg).cmsg_level = SOL_TLS;
                 (*cmsg).cmsg_type = TLS_SET_RECORD_TYPE;
                 *control.as_mut_ptr().add(header) = kind;
-                let wrote = libc::sendmsg(self.fd, &msg, 0);
+                let wrote = libc::sendmsg(self.fd, &raw const msg, 0);
                 if wrote < 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -258,7 +257,7 @@ impl Ktls {
             msg.msg_iovlen = 1;
             msg.msg_control = control.as_mut_ptr().cast();
             msg.msg_controllen = control.len() as _;
-            let got = unsafe { libc::recvmsg(self.fd, &mut msg, 0) };
+            let got = unsafe { libc::recvmsg(self.fd, &raw mut msg, 0) };
             if got < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -816,9 +815,8 @@ impl Layer {
     }
 
     pub(crate) fn seal_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> io::Result<usize> {
-        // A kernel TX control record goes straight to the socket, so it must wait for a
-        // caller whose buffer already holds plaintext: the next call sends it in order.
-        if !(self.tx_offloaded() && !out.is_empty()) {
+        // A kernel TX control record must wait for a caller whose buffer holds plaintext.
+        if !self.tx_offloaded() || out.is_empty() {
             self.flush_control_into(out)?;
         }
         let total = parts.iter().map(|part| part.len()).sum();
