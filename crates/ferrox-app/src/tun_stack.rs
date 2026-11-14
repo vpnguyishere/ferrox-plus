@@ -148,6 +148,7 @@ pub(crate) fn build(
 
 #[allow(clippy::needless_pass_by_value)]
 fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outbound) {
+    eprintln!("spawn_queue offload={offload}");
     #[cfg(target_os = "linux")]
     let headroom = VIRTIO_NET_HDR_LEN;
     #[cfg(not(target_os = "linux"))]
@@ -318,6 +319,7 @@ fn send_loop(
     headroom: usize,
     failed: &AtomicBool,
 ) {
+    eprintln!("send_loop offload={offload} headroom={headroom}");
     if !offload {
         send_packets_offset(device, packets, failed, headroom);
         return;
@@ -331,6 +333,17 @@ fn send_loop(
         let Ok(packet) = packets.recv() else {
             return;
         };
+        static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if SEEN.fetch_add(1, Ordering::Relaxed) < 5 {
+            let header = VirtioNetHdr::decode(&packet[..headroom]);
+            eprintln!(
+                "send len={} gso={} header={:?} front={:02x?}",
+                packet.len(),
+                is_gso(&packet, headroom),
+                header,
+                &packet[..packet.len().min(44)]
+            );
+        }
         if is_gso(&packet, headroom) {
             static GSO_SEEN: std::sync::atomic::AtomicUsize =
                 std::sync::atomic::AtomicUsize::new(0);
