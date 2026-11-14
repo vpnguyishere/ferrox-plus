@@ -1949,13 +1949,14 @@ impl ServerStack {
         headroom: usize,
         gso: bool,
     ) -> Self {
+        let fragment = if gso { INNER_MTU } else { config.mtu };
         Self::with_mtu(
             config,
             to_tunnel,
             out,
             headroom,
             config.mtu,
-            config.mtu,
+            fragment,
             QueueMode::Tun { gso },
         )
     }
