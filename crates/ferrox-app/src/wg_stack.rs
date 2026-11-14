@@ -310,9 +310,30 @@ fn tune_tcp(buffer: &mut [u8], headroom: usize, meta: PacketMeta) {
         }
     };
     packet[layout.checksum..layout.checksum + 2].copy_from_slice(&value.to_be_bytes());
+    static TUNE_SEEN: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    if TUNE_SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+        eprintln!(
+            "tune meta={:?} ip={} hdr={} stored={:04x}",
+            meta.segmentation_offload_size,
+            layout.ip,
+            layout.payload,
+            value
+        );
+    }
     let Some(mss) = meta.segmentation_offload_size else {
         return;
     };
+    static GSO_TX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if GSO_TX.fetch_add(1, Ordering::Relaxed) < 5 {
+        eprintln!(
+            "gso_tx mss={} hdr_len={} type={} len={}",
+            mss.get(),
+            layout.payload,
+            layout.gso_type,
+            segment.len()
+        );
+    }
     if headroom < tun_rs::VIRTIO_NET_HDR_LEN {
         return;
     }
