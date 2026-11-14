@@ -28,7 +28,9 @@ use ferrox_core::foxy::connectip::{
 use ferrox_core::wireguard::transport::HEADER_SIZE as WG_HEADER_SIZE;
 use ferrox_core::wireguard::transport::TAG_SIZE as WG_TAG_SIZE;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{
+    Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken,
+};
 use smoltcp::socket::tcp::{
     CongestionControl, RecvError, SendError, Socket as TcpSocket, SocketBuffer, State,
 };
@@ -1782,7 +1784,7 @@ impl ServerStack {
         out: Outbound,
         headroom: usize,
     ) -> Self {
-        Self::with_mtu(config, to_tunnel, out, headroom, config.mtu, config.mtu)
+        Self::with_mtu(config, to_tunnel, out, headroom, config.mtu, config.mtu, true)
     }
 
     fn with_mtu(
