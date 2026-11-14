@@ -80,37 +80,30 @@ fn huffman() -> &'static Huffman {
                 next += 1;
             }
             table.probe[bits] = (u64::from(first) << 32) | u64::from(count);
+            if bits <= PEEK {
+                let spread = 1usize << (PEEK - bits);
+                let base = placed - count as usize;
+                for slot in 0..count as usize {
+                    let entry = table.symbols[base + slot] as u32 | ((bits as u32) << 8);
+                    let at = ((first as usize) << (PEEK - bits)) + (slot << (PEEK - bits));
+                    table.pair[at..at + spread].fill(entry);
+                }
+            }
         }
         for window in 0..(1u32 << PEEK) {
-            let mut entry = 0u32;
-            let mut first_len = 0usize;
-            for bits in SHORTEST..=PEEK {
-                let probe = table.probe[bits];
-                let acc = (window >> (PEEK - bits)) as u32;
-                let offset = acc.wrapping_sub((probe >> 32) as u32);
-                if offset < probe as u32 {
-                    let symbol = table.symbols[table.base[bits] as usize + offset as usize] as u32;
-                    entry = symbol | ((bits as u32) << 8);
-                    first_len = bits;
-                    break;
-                }
+            let entry = table.pair[window as usize];
+            let first_len = ((entry >> 8) & 0x1f) as usize;
+            if first_len == 0 {
+                continue;
             }
-            if first_len != 0 {
-                let remaining = PEEK - first_len;
-                let rest = (window << first_len) & ((1u32 << PEEK) - 1);
-                for bits in SHORTEST..=remaining {
-                    let probe = table.probe[bits];
-                    let acc = (rest >> (PEEK - bits)) as u32;
-                    let offset = acc.wrapping_sub((probe >> 32) as u32);
-                    if offset < probe as u32 {
-                        let symbol =
-                            table.symbols[table.base[bits] as usize + offset as usize] as u32;
-                        entry |= (symbol << 13) | ((bits as u32) << 21) | TWO_CODES;
-                        break;
-                    }
-                }
+            let remaining = PEEK - first_len;
+            let rest = ((window << first_len) & ((1u32 << PEEK) - 1)) as usize;
+            let second = table.pair[rest];
+            let second_len = ((second >> 8) & 0x1f) as usize;
+            if second_len != 0 && second_len <= remaining {
+                table.pair[window as usize] =
+                    entry | ((second & 0xff) << 13) | ((second_len as u32) << 21) | TWO_CODES;
             }
-            table.pair[window as usize] = entry;
         }
         table
     })
