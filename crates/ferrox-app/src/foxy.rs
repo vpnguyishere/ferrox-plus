@@ -4351,6 +4351,8 @@ pub(crate) mod loopback {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         };
         (roots, server)
     }

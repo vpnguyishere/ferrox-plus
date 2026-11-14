@@ -1022,6 +1022,7 @@ dependencies = [
  "des",
  "getrandom 0.4.3",
  "hkdf",
+ "libc",
  "md5",
  "ml-kem",
  "poly1305 0.9.1",

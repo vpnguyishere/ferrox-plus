@@ -789,6 +789,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         };
         assert_eq!(
             identity.reload_interval(),

@@ -9538,12 +9538,12 @@ fn serve_vless_kcp_tls(
 }
 
 /// An idle handshake is retried until the deadline; anything but silence refuses at once.
-fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
+fn shake_tls<S: ferrox_core::tls::TlsProvider + Drivable>(session: &mut S) -> bool {
     let _quantum = KcpHandshakeRead::enter();
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     loop {
         match session.handshake() {
-            Ok(()) => return true,
+            Ok(()) => return settle_ktls(session),
             Err(ferrox_core::tls::TlsError::Timeout) if Instant::now() < deadline => {}
             Err(_) => return false,
         }
@@ -9615,7 +9615,7 @@ where
             };
             if !handshaken {
                 match current.handshake() {
-                    Ok(()) => {
+                    Ok(()) if settle_ktls(&mut current) => {
                         handshaken = true;
                         request_until = Some(Instant::now() + budgets::handshake());
                     }
@@ -9623,7 +9623,7 @@ where
                         session = Some(current);
                         return Next::Idle;
                     }
-                    Err(_) => return Next::Done,
+                    Ok(()) | Err(_) => return Next::Done,
                 }
             }
             if request_until.is_some_and(|until| Instant::now() >= until) {
@@ -18683,10 +18683,11 @@ fn dial_tls_session(
             return None;
         };
         match session.handshake() {
-            Ok(()) => {
+            Ok(()) if settle_ktls(&mut session) => {
                 ready = Some(session);
                 break;
             }
+            Ok(()) => return None,
             Err(ferrox_core::tls::TlsError::EchRetry(list)) if attempt == 0 && !list.is_empty() => {
                 let mut next = current.clone();
                 next.ech_config_list = Some(list);
@@ -19444,18 +19445,54 @@ fn is_driven_yield(error: &std::io::Error) -> bool {
 trait Drivable {
     fn transport(&self) -> Option<Connection>;
 
+    /// The socket a finished kTLS session hands to the kernel, when the transport is one.
+    fn ktls_fd(&self) -> Option<ferrox_core::tls::RawFd> {
+        None
+    }
+
     /// Arms the read a session performs on its own transport, under its own lock.
     fn arm_own_transport(&self, _grain: Duration) {}
+}
+
+/// Hands the record layer to the kernel when the config asked and the transport has a socket.
+fn settle_ktls<S: ferrox_core::tls::TlsProvider + Drivable>(session: &mut S) -> bool {
+    if !session.wants_ktls() {
+        return true;
+    }
+    let Some(fd) = session.ktls_fd() else {
+        return false;
+    };
+    session.enable_ktls(fd).is_ok()
+}
+
+fn transport_ktls_fd(conn: &Connection) -> Option<ferrox_core::tls::RawFd> {
+    #[cfg(target_os = "linux")]
+    {
+        if conn.has_mask() || matches!(conn, Connection::Unix(_)) {
+            return None;
+        }
+        use std::os::fd::AsRawFd as _;
+        Some(conn.as_raw_fd())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = conn;
+        None
+    }
 }
 
 impl Drivable
     for ferrox_core::tls::RustlsServerProvider<ferrox_core::tls::reality::RecordLimiter<Connection>>
 {
     fn transport(&self) -> Option<Connection> {
-        if self.owns_transport() {
+        if self.owns_transport() || self.kernel_rx() {
             return None;
         }
         self.get_ref().get_ref().try_clone().ok()
+    }
+
+    fn ktls_fd(&self) -> Option<ferrox_core::tls::RawFd> {
+        transport_ktls_fd(self.get_ref().get_ref())
     }
 }
 
@@ -19469,7 +19506,14 @@ impl Drivable
 
 impl Drivable for ferrox_core::tls::RustlsProvider<Connection> {
     fn transport(&self) -> Option<Connection> {
+        if self.kernel_rx() {
+            return None;
+        }
         self.get_ref().try_clone().ok()
+    }
+
+    fn ktls_fd(&self) -> Option<ferrox_core::tls::RawFd> {
+        transport_ktls_fd(self.get_ref())
     }
 }
 
@@ -19485,6 +19529,10 @@ impl Drivable for ferrox_core::tls::ClientSession<Connection> {
             return None;
         }
         self.get_ref().try_clone().ok()
+    }
+
+    fn ktls_fd(&self) -> Option<ferrox_core::tls::RawFd> {
+        transport_ktls_fd(self.get_ref())
     }
 
     fn arm_own_transport(&self, grain: Duration) {
@@ -21614,6 +21662,9 @@ fn tls_session_on(
 ) -> Option<ferrox_core::tls::ClientSession<Connection>> {
     let mut session = ferrox_core::tls::connect(cfg, uplink).ok()?;
     session.handshake().ok()?;
+    if !settle_ktls(&mut session) {
+        return None;
+    }
     session
         .get_ref()
         .set_read_timeout(Some(SESSION_POLL))
@@ -47793,6 +47844,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         });
         let client = ferrox_core::tls::TlsConfig {
             server_name: "carrier.test".to_owned(),
@@ -65082,6 +65135,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         });
         (identity, roots)
     }

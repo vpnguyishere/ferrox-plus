@@ -1,7 +1,7 @@
 // A ClientHello shaped like a real browser's: the pinned uTLS parrots as data, and the handshake that carries them.
 mod client;
 pub(crate) mod hello;
-mod kdf;
+pub(crate) mod kdf;
 pub(crate) mod keys;
 #[cfg(test)]
 mod oracle;
@@ -12,6 +12,7 @@ pub(crate) mod server;
 pub(crate) mod ticket;
 pub(crate) mod tls12;
 
+pub(crate) use client::seal_chunks;
 pub use client::Session;
 
 use crate::tls::TlsConfig;

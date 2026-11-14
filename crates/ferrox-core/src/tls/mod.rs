@@ -1,6 +1,15 @@
 use crate::b64;
 use std::fmt;
 
+/// A socket descriptor the kernel record layer can be installed on.
+#[cfg(unix)]
+pub type RawFd = std::os::fd::RawFd;
+/// A socket descriptor the kernel record layer can be installed on.
+#[cfg(not(unix))]
+pub type RawFd = i32;
+
+pub(crate) mod ktls;
+
 pub trait Stream: std::io::Read + std::io::Write {}
 impl<T: std::io::Read + std::io::Write> Stream for T {}
 
@@ -108,6 +117,10 @@ pub struct TlsConfig {
     /// The shared secret for a client-made obfuscated session ticket, as Psiphon's
     /// `ObfuscatedSessionTicketKey` names one.
     pub obfuscated_ticket: Option<ObfuscatedTicket>,
+    /// Linux kernel TLS for the TX direction: the record layer encrypts after the handshake.
+    pub kernel_tx: bool,
+    /// Linux kernel TLS for the RX direction: the kernel decrypts after the handshake.
+    pub kernel_rx: bool,
 }
 
 /// Whether a client build can offer a group a config named: the shaped hello draws its own key
@@ -234,6 +247,25 @@ pub trait TlsProvider: std::io::Read + std::io::Write {
     /// bytes to their verifier instead, so they answer `None`.
     fn peer_ocsp(&self) -> Option<&[u8]> {
         None
+    }
+
+    /// Whether this session's config asked the kernel to carry a direction. A host
+    /// without Linux kTLS still answers the request, and `enable_ktls` refuses it.
+    fn wants_ktls(&self) -> bool {
+        false
+    }
+
+    /// Whether the kernel now decrypts this session's reads.
+    fn kernel_rx(&self) -> bool {
+        false
+    }
+
+    /// Hands one direction to the kernel after the handshake. A direction that is
+    /// not offloaded keeps the same traffic-secret epoch here, so a `KeyUpdate` moves
+    /// both together.
+    fn enable_ktls(&mut self, fd: RawFd) -> std::io::Result<()> {
+        let _ = fd;
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 
     /// The ciphertext the caller read from the transport is decrypted, and the plaintext comes
@@ -448,6 +480,7 @@ pub struct CertReload {
 pub type CertReader = fn(&str) -> Option<Vec<u8>>;
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct TlsServerConfig {
     /// The identities the listener serves, in the order the block lists them: the SNI
     /// resolver takes the first whose names match, so element 0 is the fallback.
@@ -481,6 +514,10 @@ pub struct TlsServerConfig {
     pub ech_server_keys: Option<std::sync::Arc<[u8]>>,
     /// The `masterKeyLog` file this listener's handshakes append to, or `None` to log none.
     pub master_key_log: Option<std::sync::Arc<MasterKeyLog>>,
+    /// Linux kernel TLS for the TX direction: the record layer encrypts after the handshake.
+    pub kernel_tx: bool,
+    /// Linux kernel TLS for the RX direction: the kernel decrypts after the handshake.
+    pub kernel_rx: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -631,6 +668,8 @@ pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerCo
         server_config_cache: std::sync::Arc::default(),
         ech_server_keys: None,
         master_key_log: None,
+        kernel_tx: false,
+        kernel_rx: false,
     })
 }
 
@@ -801,7 +840,7 @@ impl<S: Stream> ClientSession<S> {
     /// Whether a relay may read this session's transport itself and hand it only the ciphertext.
     /// The `BoringSSL` path owns its transport, so it stays on the shared shape.
     pub fn separates_ciphertext(&self) -> bool {
-        !matches!(self, Self::Legacy(_))
+        !matches!(self, Self::Legacy(_)) && !self.kernel_rx()
     }
 }
 
@@ -858,6 +897,30 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
             Self::Stock(session) => session.peer_ocsp(),
             Self::Shaped(session) => session.peer_ocsp(),
             Self::Legacy(session) => session.peer_ocsp(),
+        }
+    }
+
+    fn wants_ktls(&self) -> bool {
+        match self {
+            Self::Stock(session) => session.wants_ktls(),
+            Self::Shaped(session) => session.wants_ktls(),
+            Self::Legacy(session) => session.wants_ktls(),
+        }
+    }
+
+    fn kernel_rx(&self) -> bool {
+        match self {
+            Self::Stock(session) => session.kernel_rx(),
+            Self::Shaped(session) => session.kernel_rx(),
+            Self::Legacy(session) => session.kernel_rx(),
+        }
+    }
+
+    fn enable_ktls(&mut self, fd: RawFd) -> std::io::Result<()> {
+        match self {
+            Self::Stock(session) => session.enable_ktls(fd),
+            Self::Shaped(session) => session.enable_ktls(fd),
+            Self::Legacy(session) => session.enable_ktls(fd),
         }
     }
 

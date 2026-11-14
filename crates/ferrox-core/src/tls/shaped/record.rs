@@ -192,6 +192,31 @@ impl Direction {
         }
     }
 
+    /// The traffic secret a kernel offload installs, when this is a TLS 1.3 direction.
+    pub(crate) fn ktls_material(&self) -> Option<(crate::tls::ktls::Cipher, Hash, Vec<u8>, u64)> {
+        let Self::Aead(keys) = self else {
+            return None;
+        };
+        if !keys.tls13 {
+            return None;
+        }
+        let cipher = match (keys.secret.len(), keys.gcm) {
+            (48, _) => crate::tls::ktls::Cipher::Aes256Gcm,
+            (_, true) => crate::tls::ktls::Cipher::Aes128Gcm,
+            (_, false) => crate::tls::ktls::Cipher::ChaCha20Poly1305,
+        };
+        Some((cipher, keys.hash, keys.secret.clone(), keys.seq))
+    }
+
+    /// Rebuilds a direction at a counter a caller already reached, for a layer taking over mid-stream.
+    pub(crate) fn tls13_at(suite: Suite, secret: &[u8], seq: u64) -> Self {
+        let mut direction = Self::tls13(suite, secret);
+        if let Self::Aead(keys) = &mut direction {
+            keys.seq = seq;
+        }
+        direction
+    }
+
     /// The next traffic secret of a TLS 1.3 direction; TLS 1.2 has no key update.
     pub(crate) fn update(&mut self) {
         if let Self::Aead(keys) = self {

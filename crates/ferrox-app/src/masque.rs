@@ -5907,6 +5907,8 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
         };
         let mut server_config = quic::serve_config(&identity).expect("serves");
         server_config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
