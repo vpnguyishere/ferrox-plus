@@ -46,19 +46,19 @@ graph TD
 | ops-retired-instructions | 32598 | scripts/count-ops.sh |
 | syscalls-per-tun-packet | UNBLESSED | no syscall checker yet |
 | user-space-copies-per-tun-packet | UNBLESSED | no copy checker yet |
-| time-tcp-down-1 | ferrox=9.883Gbit/s,zeptun=17.937Gbit/s,ratio=0.55 | tun-bench.yml |
-| time-tcp-down-10 | ferrox=14.309Gbit/s,zeptun=23.950Gbit/s,ratio=0.60 | tun-bench.yml |
-| time-tcp-up-1 | ferrox=12.860Gbit/s,zeptun=20.331Gbit/s,ratio=0.63 | tun-bench.yml |
-| time-tcp-up-10 | ferrox=15.854Gbit/s,zeptun=26.821Gbit/s,ratio=0.59 | tun-bench.yml |
-| time-rr | ferrox=6581tps,zeptun=11504tps,ratio=0.57 | tun-bench.yml |
-| time-rr-8x1k | ferrox=38261tps,zeptun=64001tps,ratio=0.60 | tun-bench.yml |
-| time-udp-100k | ferrox=99920pps,zeptun=99962pps,ratio=1.00 | tun-bench.yml |
-| cpu-cores-at-tcp-down-10 | ferrox=2.9cores,zeptun=1.7cores | tun-bench.yml |
-| rss-mb-at-ten-flows | ferrox=60-75MB,zeptun=2-8MB | tun-bench.yml |
+| time-tcp-down-1 | ferrox=13.694Gbit/s,zeptun=24.779Gbit/s,ratio=0.55 | tun-bench.yml |
+| time-tcp-down-10 | ferrox=20.155Gbit/s,zeptun=37.995Gbit/s,ratio=0.53 | tun-bench.yml |
+| time-tcp-up-1 | ferrox=18.249Gbit/s,zeptun=25.497Gbit/s,ratio=0.72 | tun-bench.yml |
+| time-tcp-up-10 | ferrox=21.682Gbit/s,zeptun=34.407Gbit/s,ratio=0.63 | tun-bench.yml |
+| time-rr | ferrox=8777tps,zeptun=20447tps,ratio=0.43 | tun-bench.yml |
+| time-rr-8x1k | ferrox=57098tps,zeptun=113654tps,ratio=0.50 | tun-bench.yml |
+| time-udp-100k | ferrox=96226pps,zeptun=99950pps,ratio=0.96 | tun-bench.yml |
+| cpu-cores-at-tcp-down-10 | ferrox=2.9cores,zeptun=1.8cores | tun-bench.yml |
+| rss-mb-at-ten-flows | ferrox=74MB,zeptun=5MB | tun-bench.yml |
 | writes-after-a-refused-packet | 2 | ferrox-app-tun-stack::tests::a_refused_packet_is_dropped_and_the_next_still_goes_out |
 <!-- counts:end -->
 
-`scripts/count-ops.sh` measures `Nat::rewrite` over the payload lengths in `a_rewrite_keeps_the_checksum_of_every_payload_length`; no pointer-identity or copy-count checker yet covers this path, so the syscall and copy rows stay open. The writer copies each smoltcp segment into an aggregate buffer, and the reader copies each device packet into a stack slot. The `time-*` rows measure the userspace stack; no `system` or `hybrid` row has been measured, so this page makes no speed claim for either.
+`scripts/count-ops.sh` measures `Nat::rewrite` over the payload lengths in `a_rewrite_keeps_the_checksum_of_every_payload_length`; no pointer-identity or copy-count checker yet covers this path, so the syscall and copy rows stay open. The writer copies each smoltcp segment into an aggregate buffer; the reader hands each device slot to the stack without a copy, and `a_received_slot_keeps_its_allocation` holds its base pointer and capacity fixed. The `time-*` rows measure the userspace stack; no `system` or `hybrid` row has been measured, so this page makes no speed claim for either.
 
 ## Time
 
@@ -74,7 +74,7 @@ Against the pinned references, xray-core and sing-box open the platform device a
 
 ## What was not removed
 
-- **The userspace stack itself.** `smoltcp` per-socket receive and send buffers still copy every byte: the device read copies into a stack slot, `smoltcp` copies into the socket ring, the pump copies to the local stream, and the writer copies into the aggregate. The reference's custom stack does less of that; this is the measured CPU gap, not a device limitation. `system` and `hybrid` still keep that stack alive for UDP and ICMP, so they do not remove it.
+- **The userspace stack itself.** `smoltcp` per-socket receive and send buffers still copy every byte: `smoltcp` copies from the device slot into the socket ring, the pump copies to the local stream, and the writer copies into the aggregate. The device read no longer copies the slot. The reference's custom stack does less of that; this is the measured CPU gap, not a device limitation. `system` and `hybrid` still keep that stack alive for UDP and ICMP, so they do not remove it.
 - **The system path's copies.** A handled TCP packet is parsed, rewritten in place and written back to the device, and the payload is still copied there; the accepted flow then copies through the relay pair like every other front. The checksum pass over the segment is gone, but no pointer-identity or copy-count checker covers the remaining copies yet, so it stays out of the Measured table.
 - **System-mode offload and multi-queue.** The kernel path opens one queue and leaves virtio GSO/GRO off; `queues > 1` warns once and runs one queue. No benchmark says the single-queue kernel path is faster or slower than the userspace multi-queue path.
 - **The native handler.** It remains the path for `stack: "loopback"` with an IPv4 or IPv6 address; a failed userspace open returns its error instead of falling back. Its page stays the description of that path.
