@@ -333,6 +333,7 @@ fn send_loop(
         };
         if is_gso(&packet, headroom) {
             if let Err(error) = device.send(&packet) {
+                eprintln!("tun gso write {} bytes: {error}", packet.len());
                 if !refused(&error) {
                     eprintln!("tun write: {error}");
                     failed.store(true, Ordering::Relaxed);
