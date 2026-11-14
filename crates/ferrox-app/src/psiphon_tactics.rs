@@ -37,6 +37,13 @@ pub(crate) struct Broker {
     pub(crate) fronts: Vec<Fronting>,
 }
 
+/// The STUN servers a tactics payload names, split by the exchange they answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StunServers {
+    pub(crate) basic: Vec<String>,
+    pub(crate) rfc5780: Vec<String>,
+}
+
 /// The parts of a tactics payload this lane reads.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Tactics {
@@ -44,7 +51,7 @@ pub(crate) struct Tactics {
     pub(crate) ttl: String,
     pub(crate) brokers: Vec<Broker>,
     pub(crate) compartments: Vec<String>,
-    pub(crate) stun_servers: Vec<String>,
+    pub(crate) stun_servers: StunServers,
     pub(crate) parameters: Option<Json>,
 }
 
@@ -288,7 +295,7 @@ fn tactics_from_json(payload: &Json) -> Tactics {
             ttl: String::new(),
             brokers: Vec::new(),
             compartments: Vec::new(),
-            stun_servers: Vec::new(),
+            stun_servers: StunServers::default(),
             parameters: None,
         };
     };
@@ -313,23 +320,18 @@ fn tactics_from_json(payload: &Json) -> Tactics {
                 .collect()
         })
         .unwrap_or_default();
-    let stun_servers = parameters
-        .and_then(|parameters| {
-            parameters
-                .get("InproxyClientSTUNServerAddresses")
-                .or_else(|| parameters.get("InproxyClientSTUNServerAddressesRFC5780"))
-                .or_else(|| parameters.get("InproxySTUNServerAddresses"))
-                .or_else(|| parameters.get("InproxySTUNServerAddressesRFC5780"))
-        })
-        .and_then(Json::as_arr)
-        .map(|addresses| {
-            addresses
-                .iter()
-                .filter_map(Json::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+    let stun_servers = StunServers {
+        basic: stun_list(
+            parameters,
+            "InproxyClientSTUNServerAddresses",
+            "InproxySTUNServerAddresses",
+        ),
+        rfc5780: stun_list(
+            parameters,
+            "InproxyClientSTUNServerAddressesRFC5780",
+            "InproxySTUNServerAddressesRFC5780",
+        ),
+    };
     Tactics {
         tag,
         ttl,
@@ -338,6 +340,27 @@ fn tactics_from_json(payload: &Json) -> Tactics {
         stun_servers,
         parameters: parameters.cloned(),
     }
+}
+
+/// The client-specific list wins over the generic one, as in the reference.
+fn stun_list(parameters: Option<&Json>, client: &str, generic: &str) -> Vec<String> {
+    for key in [client, generic] {
+        let Some(addresses) = parameters
+            .and_then(|parameters| parameters.get(key))
+            .and_then(Json::as_arr)
+        else {
+            continue;
+        };
+        let addresses: Vec<String> = addresses
+            .iter()
+            .filter_map(Json::as_str)
+            .map(str::to_owned)
+            .collect();
+        if !addresses.is_empty() {
+            return addresses;
+        }
+    }
+    Vec::new()
 }
 
 fn broker(spec: &Json) -> Option<Broker> {
@@ -538,7 +561,26 @@ mod tests {
             }]
         );
         assert_eq!(tactics.compartments, vec!["c1".to_owned(), "c2".to_owned()]);
-        assert_eq!(tactics.stun_servers, vec!["192.0.2.10".to_owned()]);
+        assert_eq!(
+            tactics.stun_servers,
+            StunServers {
+                basic: vec!["192.0.2.10".to_owned()],
+                rfc5780: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_client_stun_list_wins_over_the_generic_one() {
+        let text = br#"{"Tag":"tag","Tactics":{"Parameters":{"InproxySTUNServerAddresses":["generic.example"],"InproxySTUNServerAddressesRFC5780":["generic-rfc.example"],"InproxyClientSTUNServerAddresses":["client.example"],"InproxyClientSTUNServerAddressesRFC5780":["client-rfc.example"]}}}"#;
+        let tactics = parse_payload(text).expect("payload");
+        assert_eq!(
+            tactics.stun_servers,
+            StunServers {
+                basic: vec!["client.example".to_owned()],
+                rfc5780: vec!["client-rfc.example".to_owned()],
+            }
+        );
     }
 
     #[test]

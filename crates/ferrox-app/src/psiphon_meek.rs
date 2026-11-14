@@ -661,6 +661,27 @@ impl MeekStream {
         }
     }
 
+    /// Both socket timeouts on the stream under any wrapper.
+    fn set_timeout(&mut self, timeout: Duration) -> Result<(), String> {
+        match self {
+            Self::Plain(stream) => MeekHttp::set_timeouts(stream, timeout),
+            Self::Fragment(stream) => MeekHttp::set_timeouts(stream.get_ref(), timeout),
+            Self::Tls(stream) => MeekHttp::set_timeouts(stream.get_ref().inner(), timeout),
+            Self::TlsFragment(stream) => {
+                MeekHttp::set_timeouts(stream.get_ref().inner().get_ref(), timeout)
+            }
+            Self::WebRtc(stream) => {
+                stream.set_timeout(Some(timeout));
+                Ok(())
+            }
+            Self::TlsWebRtc(stream) => {
+                stream.get_ref().inner().set_timeout(Some(timeout));
+                Ok(())
+            }
+            Self::H3(_) => Ok(()),
+        }
+    }
+
     /// Whether the peer closed the stream.
     fn peer_closed(&self) -> bool {
         let stream = match self {
@@ -702,6 +723,70 @@ fn http_transform(meek: &Meek) -> Option<std::sync::Arc<Vec<crate::psiphon_dns::
     }
     meek.shape
         .http_transform(meek.fronted, meek.provider_id.as_deref())
+}
+
+/// A stream whose every read and write must finish before one request deadline.
+struct DeadlineStream<'a> {
+    stream: &'a mut MeekStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream<'_> {
+    /// The request budget left, armed on the stream before the next syscall.
+    fn arm(&mut self) -> std::io::Result<()> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "psiphon meek request deadline",
+            ));
+        }
+        self.stream.set_timeout(left).map_err(std::io::Error::other)
+    }
+
+    fn write_parts(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        self.arm()?;
+        self.stream.write_parts(parts).map_err(expired_as_timed_out)
+    }
+}
+
+/// A configured timeout is caller data, so a value too large for `Instant`
+/// must not panic; such a budget is effectively unbounded for one request.
+fn request_deadline(timeout: Duration) -> Instant {
+    Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(|| Instant::now() + Duration::from_hours(100 * 365 * 24))
+}
+
+/// The armed socket timeout reports `WouldBlock` on Unix, including macOS;
+/// after `arm` that means the request deadline fired.
+fn expired_as_timed_out(error: std::io::Error) -> std::io::Error {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "psiphon meek request deadline",
+        );
+    }
+    error
+}
+
+impl Read for DeadlineStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.arm()?;
+        self.stream.read(buf).map_err(expired_as_timed_out)
+    }
+}
+
+impl Write for DeadlineStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.arm()?;
+        self.stream.write(buf).map_err(expired_as_timed_out)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.arm()?;
+        self.stream.flush().map_err(expired_as_timed_out)
+    }
 }
 
 pub(crate) struct MeekHttp {
@@ -779,6 +864,11 @@ impl MeekHttp {
             #[cfg(test)]
             injected_addresses: None,
         })
+    }
+
+    /// Apply a per-request timeout to the next round trip and every later dial.
+    pub(crate) fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
     }
 
     /// Build a cookieless HTTP client for a plaintext broker endpoint.
@@ -947,7 +1037,7 @@ impl MeekHttp {
         if self.preconnected {
             return Err("psiphon meek connection is gone".to_owned());
         }
-        let deadline = Instant::now() + self.timeout;
+        let deadline = request_deadline(self.timeout);
         let mut last = "psiphon meek: no front to dial".to_owned();
         let fronts = self.meek.fronts.len().max(1);
         for _ in 0..fronts {
@@ -1247,17 +1337,21 @@ impl MeekHttp {
             head = crate::psiphon_dns::apply_bytes_transform(transform, &head)
                 .map_err(|error| format!("psiphon meek transform: {error}"))?;
         }
+        let deadline = request_deadline(self.timeout);
         let stream = self
             .stream
             .as_mut()
             .ok_or_else(|| "psiphon meek has no connection".to_owned())?;
+        let mut stream = DeadlineStream { stream, deadline };
         stream
             .write_parts(&[&head, body])
             .and_then(|()| stream.flush())
             .map_err(|error| format!("psiphon meek request: {error}"))?;
-        let reply =
-            crate::foxy_account::read_reply(stream, response_read_chunk(self.limit_buffer_sizes))
-                .map_err(|_| "psiphon meek response".to_owned())?;
+        let reply = crate::foxy_account::read_reply(
+            &mut stream,
+            response_read_chunk(self.limit_buffer_sizes),
+        )
+        .map_err(|_| "psiphon meek response".to_owned())?;
         if reply.status != 200 {
             return Err(format!("psiphon meek status {}", reply.status));
         }
@@ -1637,6 +1731,53 @@ mod tests {
         meek.write_parts(&[&head, &body]).expect("writes");
         meek.flush().expect("flushes");
         assert_eq!(reader.join().expect("joins"), want);
+    }
+
+    /// A timeout larger than an `Instant` can hold is a budget, not a panic.
+    #[test]
+    fn a_timeout_too_large_for_an_instant_still_gets_a_deadline() {
+        assert!(request_deadline(Duration::MAX) > Instant::now());
+    }
+
+    /// A response that trickles bytes still stops at the request deadline.
+    #[test]
+    fn a_trickling_response_cannot_outlive_the_request_deadline() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("binds");
+        let address = listener.local_addr().expect("address");
+        let writer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accepts");
+            for _ in 0..50 {
+                if socket.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let stream = TcpStream::connect(address).expect("connects");
+        let mut meek = MeekStream::Plain(stream);
+        let mut io = DeadlineStream {
+            stream: &mut meek,
+            deadline: Instant::now() + Duration::from_millis(40),
+        };
+        let mut got = 0usize;
+        let mut buf = [0u8; 8];
+        let error = loop {
+            match io.read(&mut buf) {
+                Ok(0) => break None,
+                Ok(read) => got += read,
+                Err(error) => break Some(error),
+            }
+        };
+        assert!(
+            got < 50,
+            "the deadline stopped the trickle after {got} bytes"
+        );
+        assert_eq!(
+            error.expect("a timed-out read").kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        drop(meek);
+        writer.join().expect("joins");
     }
 
     /// Padding is selected only for a MEEK protocol and only when its coin lands.

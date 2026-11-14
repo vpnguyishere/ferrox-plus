@@ -400,6 +400,10 @@ fn json_value(value: &Json) -> Value {
     }
 }
 
+const DEFAULT_OFFER_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_OFFER_PERSONAL_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_RELAY_TIMEOUT: Duration = Duration::from_secs(35);
+
 /// One broker fronting endpoint.
 #[derive(Debug, Clone)]
 pub(crate) struct Front {
@@ -431,6 +435,8 @@ pub(crate) struct Offer {
 /// Anything that carries one opaque broker round trip.
 pub(crate) trait Transport: Send {
     fn round_trip(&mut self, body: &[u8]) -> Result<Vec<u8>, String>;
+
+    fn set_timeout(&mut self, timeout: Duration);
 }
 
 /// A fronted plaintext broker transport that reuses one HTTP stream.
@@ -441,6 +447,10 @@ struct MeekTransport {
 impl Transport for MeekTransport {
     fn round_trip(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
         self.http.round_trip(body)
+    }
+
+    fn set_timeout(&mut self, timeout: Duration) {
+        self.http.set_timeout(timeout);
     }
 }
 
@@ -460,6 +470,9 @@ pub(crate) struct Client {
     offer_secret: [u8; 32],
     transport: Box<dyn Transport>,
     session: Option<Session>,
+    offer_timeout: Duration,
+    offer_personal_timeout: Duration,
+    relay_timeout: Duration,
 }
 
 impl Client {
@@ -481,10 +494,14 @@ impl Client {
             offer_secret: random::<32>(),
             transport,
             session: None,
+            offer_timeout: DEFAULT_OFFER_TIMEOUT,
+            offer_personal_timeout: DEFAULT_OFFER_PERSONAL_TIMEOUT,
+            relay_timeout: DEFAULT_RELAY_TIMEOUT,
         })
     }
 
     /// Build a client from a broker spec and one paired front.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect(
         broker: Broker,
         front: &Front,
@@ -492,6 +509,9 @@ impl Client {
         proxy: Option<&Proxy>,
         headers: &[(String, String)],
         dns: &crate::psiphon_dns::Config,
+        offer_timeout: Duration,
+        offer_personal_timeout: Duration,
+        relay_timeout: Duration,
     ) -> Result<Self, String> {
         let sni = if front.disable_sni || front.dial.parse::<std::net::IpAddr>().is_ok() {
             String::new()
@@ -523,7 +543,11 @@ impl Client {
         let http = psiphon_meek::MeekHttp::new_plain(meek, proxy.cloned(), timeout, BROKER_PATH)
             .with_dns(dns.clone());
         let transport = Box::new(MeekTransport { http });
-        Self::new(broker, transport, random::<32>())
+        let mut client = Self::new(broker, transport, random::<32>())?;
+        client.offer_timeout = offer_timeout;
+        client.offer_personal_timeout = offer_personal_timeout;
+        client.relay_timeout = relay_timeout;
+        Ok(client)
     }
 
     /// Send one client offer and return the broker's answer.
@@ -546,6 +570,12 @@ impl Client {
             metrics,
             self.offer_secret,
         );
+        self.transport
+            .set_timeout(if personal_compartments.is_empty() {
+                self.offer_timeout
+            } else {
+                self.offer_personal_timeout
+            });
         let reply = self.session_request(&record(CLIENT_OFFER_REQUEST, &request)?)?;
         let response = decode_record(&reply)?;
         if response.kind != CLIENT_OFFER_RESPONSE {
@@ -568,6 +598,7 @@ impl Client {
             (Value::UInt(1), Value::Bytes(connection_id.to_vec())),
             (Value::UInt(2), Value::Bytes(packet.to_vec())),
         ]);
+        self.transport.set_timeout(self.relay_timeout);
         let reply = self.session_request(&record(CLIENT_RELAYED_PACKET_REQUEST, &request)?)?;
         let response = decode_record(&reply)?;
         if response.kind != CLIENT_RELAYED_PACKET_RESPONSE {
@@ -1750,6 +1781,8 @@ mod tests {
     }
 
     impl Transport for MockBroker {
+        fn set_timeout(&mut self, _timeout: Duration) {}
+
         fn round_trip(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
             let packet = unwrap_session_packet(body, &self.receive, true)?;
             let mut buffer = vec![0u8; MAX_MESSAGE];

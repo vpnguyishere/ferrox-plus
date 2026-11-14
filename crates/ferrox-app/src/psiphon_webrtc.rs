@@ -1,8 +1,8 @@
 //! A str0m WebRTC data channel between the client and an in-proxy destination.
 
 use crate::psiphon_broker::{Broker, Client, Destination, Front, Metrics};
+use crate::psiphon_ssh::dial_random;
 use crate::psiphon_ssh::Identity;
-use crate::psiphon_ssh::{dial_random, random};
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -40,6 +40,7 @@ impl WebRtc {
     pub(crate) fn offer(
         destination: IpAddr,
         stun_servers: &[String],
+        disable_stun: bool,
         timeout: Duration,
         dns: &crate::psiphon_dns::Config,
         unreliable: bool,
@@ -52,11 +53,13 @@ impl WebRtc {
         let host = Candidate::host(local, "udp")
             .map_err(|error| format!("psiphon webrtc candidate: {error}"))?;
         let _ = rtc.add_local_candidate(host);
-        let stun_timeout = timeout.min(Duration::from_secs(3));
-        for server in stun_servers.iter().take(2) {
-            if let Ok(Some(mapped)) = stun_binding(&socket, local, server, stun_timeout, dns) {
-                if let Ok(candidate) = Candidate::server_reflexive(mapped, local, "udp") {
-                    let _ = rtc.add_local_candidate(candidate);
+        if !disable_stun {
+            if let Some(server) = choose_stun(stun_servers) {
+                let stun_timeout = timeout.min(Duration::from_secs(3));
+                if let Ok(Some(mapped)) = stun_binding(&socket, local, server, stun_timeout, dns) {
+                    if let Ok(candidate) = Candidate::server_reflexive(mapped, local, "udp") {
+                        let _ = rtc.add_local_candidate(candidate);
+                    }
                 }
             }
         }
@@ -286,6 +289,23 @@ fn bind_socket(destination: IpAddr) -> Result<UdpSocket, String> {
         .map_err(|error| format!("psiphon webrtc bind: {error}"))
 }
 
+/// The reference tries one STUN server per dial, drawn from the configured list.
+fn choose_stun(servers: &[String]) -> Option<&str> {
+    if servers.is_empty() {
+        return None;
+    }
+    let bound = u64::try_from(servers.len()).unwrap_or(u64::MAX);
+    let ceiling = u64::MAX - u64::MAX % bound;
+    let draw = loop {
+        let draw = u64::from_be_bytes(dial_random::<8>());
+        if draw < ceiling {
+            break draw;
+        }
+    };
+    let index = usize::try_from(draw % bound).unwrap_or(0);
+    servers.get(index).map(String::as_str)
+}
+
 /// Send one RFC 5389 binding request and return its mapped address.
 fn stun_binding(
     socket: &UdpSocket,
@@ -313,7 +333,7 @@ fn stun_binding(
         .into_iter()
         .find(same_family)
         .ok_or_else(|| format!("psiphon webrtc STUN {server}: no address"))?;
-    let transaction = random::<12>();
+    let transaction = dial_random::<12>();
     let mut request = [0u8; STUN_HEADER_LEN];
     let _ = ferrox_core::stun::binding_request_into(&mut request, &transaction);
     socket
@@ -717,8 +737,13 @@ pub(crate) struct Conduit {
     common: Vec<[u8; 32]>,
     personal: Vec<[u8; 32]>,
     stun_servers: Vec<String>,
+    disable_stun: bool,
     protocols: Vec<String>,
     timeout: Duration,
+    offer_timeout: Duration,
+    offer_personal_timeout: Duration,
+    relay_timeout: Duration,
+    await_ready_timeout: Duration,
     headers: Vec<(String, String)>,
     dns_config: crate::psiphon_dns::Config,
     reject: Vec<Cidr>,
@@ -734,8 +759,13 @@ impl Conduit {
         common: Vec<[u8; 32]>,
         personal: Vec<[u8; 32]>,
         stun_servers: Vec<String>,
+        disable_stun: bool,
         protocols: Vec<String>,
         timeout: Duration,
+        offer_timeout: Duration,
+        offer_personal_timeout: Duration,
+        relay_timeout: Duration,
+        await_ready_timeout: Duration,
         headers: Vec<(String, String)>,
         dns_config: crate::psiphon_dns::Config,
         reject_cidrs: &[String],
@@ -757,8 +787,13 @@ impl Conduit {
             common,
             personal,
             stun_servers,
+            disable_stun,
             protocols,
             timeout,
+            offer_timeout,
+            offer_personal_timeout,
+            relay_timeout,
+            await_ready_timeout,
             headers,
             dns_config,
             reject,
@@ -817,6 +852,7 @@ impl Conduit {
             let (mut webrtc, sdp) = match WebRtc::offer(
                 address,
                 &self.stun_servers,
+                self.disable_stun,
                 self.timeout,
                 &self.dns_config,
                 unreliable,
@@ -834,6 +870,9 @@ impl Conduit {
                 None,
                 &self.headers,
                 &self.dns_config,
+                self.offer_timeout,
+                self.offer_personal_timeout,
+                self.relay_timeout,
             ) {
                 Ok(client) => client,
                 Err(error) => {
@@ -865,7 +904,7 @@ impl Conduit {
                 why = error;
                 continue;
             }
-            if let Err(error) = webrtc.await_channel(self.timeout) {
+            if let Err(error) = webrtc.await_channel(self.await_ready_timeout) {
                 why = error;
                 continue;
             }
@@ -1017,6 +1056,7 @@ mod tests {
         let (mut client, offer) = WebRtc::offer(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &[],
+            false,
             Duration::from_secs(1),
             &crate::psiphon_dns::Config::from_servers(&[]),
             false,
@@ -1100,10 +1140,33 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_stun_offer_omits_a_server_reflexive_candidate() {
+        let (_, sdp) = WebRtc::offer(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &["192.0.2.1:3478".to_owned()],
+            true,
+            Duration::from_secs(1),
+            &crate::psiphon_dns::Config::from_servers(&[]),
+            false,
+        )
+        .expect("offer");
+        assert!(!sdp.contains("srflx"), "STUN is disabled: {sdp}");
+    }
+
+    #[test]
+    fn a_stun_choice_draws_only_from_the_configured_list() {
+        assert_eq!(choose_stun(&[]), None);
+        let servers = ["first.example".to_owned(), "second.example".to_owned()];
+        let chosen = choose_stun(&servers).expect("a server");
+        assert!(servers.iter().any(|server| server == chosen));
+    }
+
+    #[test]
     fn a_private_offer_names_a_data_channel() {
         let (webrtc, sdp) = WebRtc::offer(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &[],
+            false,
             Duration::from_secs(1),
             &crate::psiphon_dns::Config::from_servers(&[]),
             false,

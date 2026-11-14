@@ -1363,6 +1363,12 @@ struct Settings {
     conduit_mode: ConduitMode,
     conduit_timeout: Duration,
     conduit_protocols: Vec<String>,
+    inproxy_stun: crate::psiphon_tactics::StunServers,
+    inproxy_disable_stun: bool,
+    inproxy_offer_timeout: Duration,
+    inproxy_offer_personal_timeout: Duration,
+    inproxy_relay_timeout: Duration,
+    inproxy_await_ready_timeout: Duration,
     reject_countries: Vec<String>,
     reject_cidrs: Vec<String>,
     geoip_path: Option<String>,
@@ -2459,9 +2465,14 @@ impl Inner {
             fronts,
             common,
             personal,
-            tactics.stun_servers.clone(),
+            inproxy_stun_servers(&self.settings, &tactics),
+            self.settings.inproxy_disable_stun,
             self.settings.conduit_protocols.clone(),
             self.settings.conduit_timeout,
+            self.settings.inproxy_offer_timeout,
+            self.settings.inproxy_offer_personal_timeout,
+            self.settings.inproxy_relay_timeout,
+            self.settings.inproxy_await_ready_timeout,
             self.settings.meek_headers.clone(),
             self.settings.dns.clone(),
             &self.settings.reject_cidrs,
@@ -3739,6 +3750,44 @@ impl Settings {
                 .unwrap_or(180)
                 .clamp(10, 600),
         );
+        let inproxy_stun = crate::psiphon_tactics::StunServers {
+            basic: stun_list(
+                settings,
+                "InproxyClientSTUNServerAddresses",
+                "InproxySTUNServerAddresses",
+            ),
+            rfc5780: stun_list(
+                settings,
+                "InproxyClientSTUNServerAddressesRFC5780",
+                "InproxySTUNServerAddressesRFC5780",
+            ),
+        };
+        let inproxy_disable_stun = bool_setting(settings, "InproxyDisableSTUN")
+            || bool_setting(settings, "InproxyClientDisableSTUN");
+        let inproxy_offer_timeout = millis_setting(
+            settings,
+            "InproxyClientOfferRequestTimeoutMilliseconds",
+            20_000,
+            10_000,
+        );
+        let inproxy_offer_personal_timeout = millis_setting(
+            settings,
+            "InproxyClientOfferRequestPersonalTimeoutMilliseconds",
+            15_000,
+            10_000,
+        );
+        let inproxy_relay_timeout = millis_setting(
+            settings,
+            "InproxyClientRelayedPacketRequestTimeoutMilliseconds",
+            35_000,
+            10_000,
+        );
+        let inproxy_await_ready_timeout = millis_setting(
+            settings,
+            "InproxyClientWebRTCAwaitReadyToProxyTimeoutMilliseconds",
+            20_000,
+            0,
+        );
         let mut conduit_protocols = string_list(settings, "ConduitTunnelProtocols");
         if conduit_protocols.is_empty() {
             conduit_protocols = string_list(settings, "conduitTunnelProtocols");
@@ -4432,6 +4481,12 @@ impl Settings {
             conduit_mode,
             conduit_timeout,
             conduit_protocols,
+            inproxy_stun,
+            inproxy_disable_stun,
+            inproxy_offer_timeout,
+            inproxy_offer_personal_timeout,
+            inproxy_relay_timeout,
+            inproxy_await_ready_timeout,
             reject_countries,
             reject_cidrs,
             geoip_path,
@@ -5748,6 +5803,34 @@ fn string_list(settings: Option<&Json>, key: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// The client-specific STUN list wins over the generic one, as in the reference.
+fn stun_list(settings: Option<&Json>, client: &str, generic: &str) -> Vec<String> {
+    for key in [client, generic] {
+        let addresses = string_list(settings, key);
+        if !addresses.is_empty() {
+            return addresses;
+        }
+    }
+    Vec::new()
+}
+
+fn bool_setting(settings: Option<&Json>, key: &str) -> bool {
+    settings
+        .and_then(|settings| settings.get(key))
+        .and_then(Json::as_bool)
+        .unwrap_or(false)
+}
+
+/// Read a duration, using the reference's fallback for an explicit non-positive offer or relay.
+fn millis_setting(settings: Option<&Json>, key: &str, default: u64, non_positive: u64) -> Duration {
+    let millis = match integer(settings, key) {
+        None => default,
+        Some(value) if value <= 0 => non_positive,
+        Some(value) => u64::try_from(value).unwrap_or(u64::MAX),
+    };
+    Duration::from_millis(millis)
+}
+
 /// The OSL roots, preferring the plural list and falling back to the legacy single URL.
 fn osl_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
     let global = custom_headers(settings);
@@ -6233,6 +6316,16 @@ const KNOWN_SETTINGS: &[&str] = &[
     "ClientFeatures",
     "InproxyClientPersonalCompartmentID",
     "inproxyClientPersonalCompartmentID",
+    "InproxySTUNServerAddresses",
+    "InproxySTUNServerAddressesRFC5780",
+    "InproxyClientSTUNServerAddresses",
+    "InproxyClientSTUNServerAddressesRFC5780",
+    "InproxyDisableSTUN",
+    "InproxyClientDisableSTUN",
+    "InproxyClientOfferRequestTimeoutMilliseconds",
+    "InproxyClientOfferRequestPersonalTimeoutMilliseconds",
+    "InproxyClientRelayedPacketRequestTimeoutMilliseconds",
+    "InproxyClientWebRTCAwaitReadyToProxyTimeoutMilliseconds",
     "inproxyCompartment",
     "protocol_selection",
     "conduitMode",
@@ -6825,6 +6918,7 @@ fn compartment32(text: &str, what: &str) -> Result<[u8; 32], String> {
 fn webrtc_offer(
     address: IpAddr,
     stun_servers: &[String],
+    disable_stun: bool,
     sdp: Option<&str>,
     timeout: std::time::Duration,
     dns_config: &crate::psiphon_dns::Config,
@@ -6836,6 +6930,7 @@ fn webrtc_offer(
     let (webrtc, sdp) = crate::psiphon_webrtc::WebRtc::offer(
         address,
         stun_servers,
+        disable_stun,
         timeout,
         dns_config,
         unreliable,
@@ -6857,6 +6952,7 @@ fn webrtc_conduit(
 }
 
 /// Send a client offer to the first broker the tactics payload names.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn broker_offer(
     settings: Option<&Json>,
     sdp: Option<&str>,
@@ -6918,7 +7014,8 @@ pub(crate) fn broker_offer(
         let timeout = settings.ready.max(std::time::Duration::from_secs(20));
         let (mut webrtc, generated) = webrtc_offer(
             server.address,
-            &tactics.stun_servers,
+            &inproxy_stun_servers(&settings, &tactics),
+            settings.inproxy_disable_stun,
             sdp,
             timeout,
             &settings.dns,
@@ -6934,6 +7031,9 @@ pub(crate) fn broker_offer(
             settings.proxy.as_ref(),
             &settings.meek_headers,
             &settings.dns,
+            settings.inproxy_offer_timeout,
+            settings.inproxy_offer_personal_timeout,
+            settings.inproxy_relay_timeout,
         ) {
             Ok(client) => client,
             Err(error) => {
@@ -6950,7 +7050,9 @@ pub(crate) fn broker_offer(
         ) {
             Ok(offer) => {
                 if let Some(webrtc) = webrtc.as_mut() {
-                    if let Err(error) = webrtc_conduit(webrtc, &offer, timeout) {
+                    if let Err(error) =
+                        webrtc_conduit(webrtc, &offer, settings.inproxy_await_ready_timeout)
+                    {
                         why = error;
                         continue;
                     }
@@ -6961,6 +7063,24 @@ pub(crate) fn broker_offer(
         }
     }
     Err(why)
+}
+
+/// Configuration overrides win over tactics, and the client list over the generic one.
+fn inproxy_stun_servers(
+    settings: &Settings,
+    tactics: &crate::psiphon_tactics::Tactics,
+) -> Vec<String> {
+    let mut stun = tactics.stun_servers.clone();
+    if !settings.inproxy_stun.basic.is_empty() {
+        stun.basic.clone_from(&settings.inproxy_stun.basic);
+    }
+    if !settings.inproxy_stun.rfc5780.is_empty() {
+        stun.rfc5780.clone_from(&settings.inproxy_stun.rfc5780);
+    }
+    if stun.basic.is_empty() {
+        stun.basic = stun.rfc5780;
+    }
+    stun.basic
 }
 
 fn fetch_tactics(settings: &Settings) -> Result<crate::psiphon_tactics::Tactics, String> {
@@ -15373,6 +15493,53 @@ mod tests {
         ))
         .expect("settings");
         assert_eq!(explicit.reject_countries, vec!["IR", "CN"]);
+    }
+
+    #[test]
+    fn an_explicit_zero_offer_timeout_uses_the_reference_fallback() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"InproxyClientOfferRequestTimeoutMilliseconds":0,"InproxyClientOfferRequestPersonalTimeoutMilliseconds":-1,"InproxyClientRelayedPacketRequestTimeoutMilliseconds":0,"InproxyClientWebRTCAwaitReadyToProxyTimeoutMilliseconds":0}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.inproxy_offer_timeout, Duration::from_secs(10));
+        assert_eq!(
+            settings.inproxy_offer_personal_timeout,
+            Duration::from_secs(10)
+        );
+        assert_eq!(settings.inproxy_relay_timeout, Duration::from_secs(10));
+        assert_eq!(settings.inproxy_await_ready_timeout, Duration::ZERO);
+    }
+
+    #[test]
+    fn client_inproxy_stun_and_timeouts_reach_the_settings() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"InproxySTUNServerAddresses":["generic.example"],"InproxySTUNServerAddressesRFC5780":["generic-rfc.example"],"InproxyClientSTUNServerAddresses":["client.example"],"InproxyClientSTUNServerAddressesRFC5780":["client-rfc.example"],"InproxyDisableSTUN":true,"InproxyClientOfferRequestTimeoutMilliseconds":21000,"InproxyClientOfferRequestPersonalTimeoutMilliseconds":16000,"InproxyClientRelayedPacketRequestTimeoutMilliseconds":36000,"InproxyClientWebRTCAwaitReadyToProxyTimeoutMilliseconds":19000}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(
+            settings.inproxy_stun,
+            crate::psiphon_tactics::StunServers {
+                basic: vec!["client.example".to_owned()],
+                rfc5780: vec!["client-rfc.example".to_owned()],
+            }
+        );
+        assert!(settings.inproxy_disable_stun);
+        assert_eq!(settings.inproxy_offer_timeout, Duration::from_secs(21));
+        assert_eq!(
+            settings.inproxy_offer_personal_timeout,
+            Duration::from_secs(16)
+        );
+        assert_eq!(settings.inproxy_relay_timeout, Duration::from_secs(36));
+        assert_eq!(
+            settings.inproxy_await_ready_timeout,
+            Duration::from_secs(19)
+        );
     }
 
     #[test]
