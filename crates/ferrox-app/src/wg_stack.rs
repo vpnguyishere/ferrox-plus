@@ -1784,7 +1784,9 @@ impl ServerStack {
         out: Outbound,
         headroom: usize,
     ) -> Self {
-        Self::with_mtu(config, to_tunnel, out, headroom, config.mtu, config.mtu, true)
+        Self::with_mtu(
+            config, to_tunnel, out, headroom, config.mtu, config.mtu, true,
+        )
     }
 
     fn with_mtu(
