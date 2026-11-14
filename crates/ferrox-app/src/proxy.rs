@@ -15423,25 +15423,23 @@ fn serve_tun_inbound(
             }
         };
     }
-    let Ok(devices) = crate::tun::Device::open_all(spec) else {
+    let Ok(device) = crate::tun::Device::open(spec) else {
         eprintln!("tun inbound: {}", crate::tun::refusal_reason(spec));
         return false;
     };
-    for device in devices {
-        let outbound = out.clone();
-        let relay: crate::tun::Relay =
-            std::sync::Arc::new(move |conn, dest| serve_device_flow(conn, &outbound, &dest));
-        let datagram = out.clone();
-        // The device's association is the protocol's own: the front reads the greeting and the `UDP ASSOCIATE` request and answers with the relay's address.
-        let associate: crate::tun::Associate =
-            std::sync::Arc::new(move |conn| serve_socks(conn, &datagram, &no_accounts()));
-        let mut handler = crate::tun::Handler::new(device, relay, associate);
-        thread::spawn(move || {
-            if let Err(e) = handler.serve() {
-                eprintln!("tun handler ended: {e}");
-            }
-        });
-    }
+    let outbound = out.clone();
+    let relay: crate::tun::Relay =
+        std::sync::Arc::new(move |conn, dest| serve_device_flow(conn, &outbound, &dest));
+    let datagram = out.clone();
+    // The device's association is the protocol's own: the front reads the greeting and the `UDP ASSOCIATE` request and answers with the relay's address.
+    let associate: crate::tun::Associate =
+        std::sync::Arc::new(move |conn| serve_socks(conn, &datagram, &no_accounts()));
+    let mut handler = crate::tun::Handler::new(device, relay, associate);
+    thread::spawn(move || {
+        if let Err(e) = handler.serve() {
+            eprintln!("tun handler ended: {e}");
+        }
+    });
     true
 }
 

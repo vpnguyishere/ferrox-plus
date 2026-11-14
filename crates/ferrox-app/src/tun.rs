@@ -484,47 +484,57 @@ pub(crate) struct Device {
 }
 
 impl Device {
-    /// One device per configured queue: the kernel hashes a flow onto one queue, so each reader owns its own flow table and the flow stays whole.
-    pub(crate) fn open_all(spec: &Spec) -> io::Result<Vec<Self>> {
+    pub(crate) fn open(spec: &Spec) -> io::Result<Self> {
         if let Some(handle) = inherited_handle() {
             let framing = inherited_framing(&handle);
-            return Ok(vec![Self {
+            return Ok(Self {
                 handle,
                 mtu: spec.mtu,
                 framing,
                 gso: false,
-            }]);
+            });
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::unix::io::IntoRawFd;
-            let (devices, offload) = open_linux(spec, spec.queues().max(1))?;
+            #[cfg(target_os = "linux")]
+            let (device, offload, _) = match crate::tun_stack::build(spec, false, true) {
+                Ok((device, true, multi)) => {
+                    // The kernel enabled UDP segment offload with the TCP ones; the handler does not split an aggregate, so the device is narrowed before its name is released for the plain rebuild.
+                    if crate::tun_stack::tcp_only_offload(&device) {
+                        (device, true, multi)
+                    } else {
+                        drop(device);
+                        let (device, _, multi) = crate::tun_stack::build(spec, false, false)?;
+                        (device, false, multi)
+                    }
+                }
+                Ok((device, false, multi)) => (device, false, multi),
+                Err(error) if offload_refused(&error) => {
+                    crate::tun_stack::build(spec, false, false)?
+                }
+                Err(error) => return Err(error),
+            };
+            #[cfg(target_os = "macos")]
+            let (device, _, _) = crate::tun_stack::build(spec, false, true)?;
+            #[cfg(target_os = "linux")]
             let framing = if offload {
                 Framing::Virtio
             } else {
                 Framing::Raw
             };
-            Ok(devices
-                .into_iter()
-                .map(|device| Self {
-                    handle: unsafe { std::fs::File::from_raw_fd(device.into_raw_fd()) },
-                    mtu: spec.mtu,
-                    framing,
-                    gso: offload,
-                })
-                .collect())
-        }
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::unix::io::IntoRawFd;
-            let (device, _, _) = crate::tun_stack::build(spec, false, true)?;
+            #[cfg(target_os = "macos")]
+            let framing = Framing::Utun;
             let handle = unsafe { std::fs::File::from_raw_fd(device.into_raw_fd()) };
-            Ok(vec![Self {
+            Ok(Self {
                 handle,
                 mtu: spec.mtu,
-                framing: Framing::Utun,
+                framing,
+                #[cfg(target_os = "linux")]
+                gso: offload,
+                #[cfg(target_os = "macos")]
                 gso: false,
-            }])
+            })
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         Err(io::Error::new(
@@ -643,45 +653,6 @@ impl Device {
             gso: false,
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-fn open_linux(spec: &Spec, queues: usize) -> io::Result<(Vec<tun_rs::SyncDevice>, bool)> {
-    match build_queues(spec, queues) {
-        Ok(found) => Ok(found),
-        // A kernel without `IFF_MULTI_QUEUE`, or a clone the interface refused: serve the one queue the platform gives.
-        Err(_) if queues > 1 => build_queues(spec, 1),
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn build_queues(spec: &Spec, queues: usize) -> io::Result<(Vec<tun_rs::SyncDevice>, bool)> {
-    let multi = queues > 1;
-    let (device, offload) = match crate::tun_stack::build(spec, multi, true) {
-        Ok((device, true, _)) => {
-            // The kernel enabled UDP segment offload with the TCP ones; the handler does not split an aggregate, so the device is narrowed before its name is released for the plain rebuild.
-            if crate::tun_stack::tcp_only_offload(&device) {
-                (device, true)
-            } else {
-                drop(device);
-                let (device, _, _) = crate::tun_stack::build(spec, multi, false)?;
-                (device, false)
-            }
-        }
-        Ok((device, false, _)) => (device, false),
-        Err(error) if offload_refused(&error) => {
-            let (device, _, _) = crate::tun_stack::build(spec, multi, false)?;
-            (device, false)
-        }
-        Err(error) => return Err(error),
-    };
-    let mut devices = Vec::with_capacity(queues);
-    for _ in 1..queues {
-        devices.push(device.try_clone()?);
-    }
-    devices.push(device);
-    Ok((devices, offload))
 }
 
 /// A flow's writer: the descriptor clone plus the framing an emit owes it.
@@ -879,14 +850,14 @@ fn write_tcp_checksum(source: IpAddr, destination: IpAddr, partial: bool, out: &
     };
     let tcp_len = out.len() - ip_header;
     let field = ip_header + 16;
-    // A full checksum is written in network order; the offload field holds the pseudo-header sum the kernel folds the payload onto, which is a native-word sum and so is written native.
-    let bytes = if partial {
-        partial_tcp_checksum(source, destination, tcp_len).to_ne_bytes()
+    // Both fields hold the pseudo-header sum in network order; the offload one leaves the segment for the kernel to add and complete.
+    let value = if partial {
+        partial_tcp_checksum(source, destination, tcp_len)
     } else {
         let (source, destination) = octets(source, destination);
-        tcp_checksum(&source, &destination, &out[ip_header..]).to_be_bytes()
+        tcp_checksum(&source, &destination, &out[ip_header..])
     };
-    out[field..field + 2].copy_from_slice(&bytes);
+    out[field..field + 2].copy_from_slice(&value.to_be_bytes());
 }
 
 fn octets(source: IpAddr, destination: IpAddr) -> ([u8; 16], [u8; 16]) {
@@ -1949,7 +1920,7 @@ mod tests {
             payload.as_slice(),
             "one GSO frame carries the whole read"
         );
-        // The offload field is the pseudo-header sum in network order; the kernel folds the payload onto it, so a byte-swapped value would silently fail every segment.
+        // The offload field is the pseudo-header sum in network order, the same value the header-only test pins without the segment the kernel adds.
         let mut pseudo = Vec::with_capacity(12);
         pseudo.extend_from_slice(&ip.source);
         pseudo.extend_from_slice(&ip.destination);
@@ -1957,14 +1928,14 @@ mod tests {
         pseudo.extend_from_slice(&(body.len() as u16).to_be_bytes());
         let mut sum = 0u32;
         for word in pseudo.chunks_exact(2) {
-            sum += u32::from(u16::from_ne_bytes([word[0], word[1]]));
+            sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
         }
         sum = (sum & 0xffff) + (sum >> 16);
         sum = (sum & 0xffff) + (sum >> 16);
         assert_eq!(
-            u16::from_ne_bytes([body[16], body[17]]),
+            u16::from_be_bytes([body[16], body[17]]),
             (sum & 0xffff) as u16,
-            "the partial checksum is the pseudo-header sum in the native order the kernel folds"
+            "the partial checksum is the pseudo-header sum in the network order the kernel folds"
         );
     }
 
