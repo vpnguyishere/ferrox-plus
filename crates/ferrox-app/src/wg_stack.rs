@@ -1890,6 +1890,7 @@ struct ServerStack {
 }
 
 /// Whether this stack rides a tunnel record or a TUN whose GSO the kernel completes.
+#[derive(Clone, Copy)]
 enum QueueMode {
     Tunnel,
     Tun { gso: bool },
