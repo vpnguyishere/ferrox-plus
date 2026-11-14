@@ -263,7 +263,7 @@ struct QueueTx<'a> {
 /// Build an outgoing segment in one buffer with its tunnel headroom reserved.
 impl TxToken for QueueTx<'_> {
     /// Reserve headroom, build the segment, and queue it for the tunnel.
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
