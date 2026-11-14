@@ -209,6 +209,22 @@ pub(crate) fn device_config(spec: &Spec) -> DeviceConfig {
 }
 
 #[cfg(target_os = "linux")]
+fn take_slot(
+    bufs: &mut [Vec<u8>],
+    index: usize,
+    end: usize,
+    reuse: &Receiver<Vec<u8>>,
+    mtu: usize,
+) -> Vec<u8> {
+    let mut replacement = reuse.try_recv().unwrap_or_default();
+    replacement.clear();
+    replacement.resize(VIRTIO_NET_HDR_LEN + mtu, 0);
+    let mut bytes = std::mem::replace(&mut bufs[index], replacement);
+    bytes.truncate(end);
+    bytes
+}
+
+#[cfg(target_os = "linux")]
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn recv_loop(
     device: Arc<SyncDevice>,
@@ -239,12 +255,7 @@ pub(crate) fn recv_loop(
                 continue;
             }
             let bytes = if headroom == VIRTIO_NET_HDR_LEN {
-                let mut replacement = reuse.try_recv().unwrap_or_default();
-                replacement.clear();
-                replacement.resize(VIRTIO_NET_HDR_LEN + mtu, 0);
-                let mut bytes = std::mem::replace(&mut bufs[index], replacement);
-                bytes.truncate(end);
-                bytes
+                take_slot(&mut bufs, index, end, &reuse, mtu)
             } else {
                 packet_bytes(&reuse, &bufs[index][VIRTIO_NET_HDR_LEN..end])
             };
@@ -498,5 +509,21 @@ mod tests {
         });
         assert_eq!(writes, 1, "a dead descriptor stops before the next packet");
         assert!(failed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_received_slot_keeps_its_allocation() {
+        let (_reuse, reused) = mpsc::sync_channel(1);
+        let mut bufs = vec![vec![0u8; VIRTIO_NET_HDR_LEN + 1500]];
+        let base = bufs[0].as_ptr();
+        let capacity = bufs[0].capacity();
+        let end = VIRTIO_NET_HDR_LEN + 60;
+        let bytes = take_slot(&mut bufs, 0, end, &reused, 1500);
+        assert_eq!(bytes.as_ptr(), base, "the slot moved between buffers");
+        assert_eq!(bytes.capacity(), capacity, "the slot reallocated");
+        assert_eq!(bytes.len(), end);
+        assert_ne!(bufs[0].as_ptr(), base, "the batch reused the returned slot");
+        assert_eq!(bufs[0].len(), VIRTIO_NET_HDR_LEN + 1500);
     }
 }
