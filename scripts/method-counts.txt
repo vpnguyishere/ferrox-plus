@@ -761,6 +761,7 @@ front-tun ipv6-extension-headers-walked 1 ferrox-app-tun::tests::an_ipv6_extensi
 front-tun icmpv6-echo-replies-verified 1 ferrox-app-tun::tests::a_v6_echo_request_flips_to_a_v6_reply
 front-tun icmp-error-quoted-flows-named 1 ferrox-app-tun::tests::an_icmp_error_quotes_the_flow_it_ends
 front-tun virtio-gso-headers-written 1 ferrox-app-tun::tests::a_virtio_gso_header_names_the_tcp_segment
+front-tun gso-frames-per-large-response-read 1 ferrox-app-tun::tests::a_large_response_read_leaves_as_one_gso_frame
 front-tun emit-packet-reallocations-per-render 0 ferrox-app-tun::tests::an_emitted_packet_reuses_its_render_buffer
 
 # --- finalmask post-TLS TCP mask chain --------------------------------------

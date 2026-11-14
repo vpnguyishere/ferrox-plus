@@ -16,7 +16,7 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{mpsc, Arc};
 
 #[cfg(unix)]
@@ -254,7 +254,9 @@ struct TcpHead {
     source_port: u16,
     destination_port: u16,
     seq: u32,
+    ack_num: u32,
     flags: u8,
+    window: u16,
 }
 
 fn tcp_head(body: &[u8]) -> Option<(TcpHead, &[u8])> {
@@ -264,6 +266,8 @@ fn tcp_head(body: &[u8]) -> Option<(TcpHead, &[u8])> {
     let source_port = u16::from_be_bytes([body[0], body[1]]);
     let destination_port = u16::from_be_bytes([body[2], body[3]]);
     let seq = u32::from_be_bytes(body[4..8].try_into().unwrap());
+    let ack_num = u32::from_be_bytes(body[8..12].try_into().unwrap());
+    let window = u16::from_be_bytes([body[14], body[15]]);
     let data_offset = usize::from(body[12] >> 4) * 4;
     if data_offset < 20 || data_offset > body.len() {
         return None;
@@ -274,7 +278,9 @@ fn tcp_head(body: &[u8]) -> Option<(TcpHead, &[u8])> {
             source_port,
             destination_port,
             seq,
+            ack_num,
             flags,
+            window,
         },
         &body[data_offset..],
     ))
@@ -478,57 +484,47 @@ pub(crate) struct Device {
 }
 
 impl Device {
-    pub(crate) fn open(spec: &Spec) -> io::Result<Self> {
+    /// One device per configured queue: the kernel hashes a flow onto one queue, so each reader owns its own flow table and the flow stays whole.
+    pub(crate) fn open_all(spec: &Spec) -> io::Result<Vec<Self>> {
         if let Some(handle) = inherited_handle() {
             let framing = inherited_framing(&handle);
-            return Ok(Self {
+            return Ok(vec![Self {
                 handle,
                 mtu: spec.mtu,
                 framing,
                 gso: false,
-            });
+            }]);
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::IntoRawFd;
-            #[cfg(target_os = "linux")]
-            let (device, offload, _) = match crate::tun_stack::build(spec, false, true) {
-                Ok((device, true, multi)) => {
-                    // The kernel enabled UDP segment offload with the TCP ones; the handler does not split an aggregate, so the device is narrowed before its name is released for the plain rebuild.
-                    if crate::tun_stack::tcp_only_offload(&device) {
-                        (device, true, multi)
-                    } else {
-                        drop(device);
-                        let (device, _, multi) = crate::tun_stack::build(spec, false, false)?;
-                        (device, false, multi)
-                    }
-                }
-                Ok((device, false, multi)) => (device, false, multi),
-                Err(error) if offload_refused(&error) => {
-                    crate::tun_stack::build(spec, false, false)?
-                }
-                Err(error) => return Err(error),
-            };
-            #[cfg(target_os = "macos")]
-            let (device, _, _) = crate::tun_stack::build(spec, false, true)?;
-            #[cfg(target_os = "linux")]
+            let (devices, offload) = open_linux(spec, spec.queues().max(1))?;
             let framing = if offload {
                 Framing::Virtio
             } else {
                 Framing::Raw
             };
-            #[cfg(target_os = "macos")]
-            let framing = Framing::Utun;
+            Ok(devices
+                .into_iter()
+                .map(|device| Self {
+                    handle: unsafe { std::fs::File::from_raw_fd(device.into_raw_fd()) },
+                    mtu: spec.mtu,
+                    framing,
+                    gso: offload,
+                })
+                .collect())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::io::IntoRawFd;
+            let (device, _, _) = crate::tun_stack::build(spec, false, true)?;
             let handle = unsafe { std::fs::File::from_raw_fd(device.into_raw_fd()) };
-            Ok(Self {
+            Ok(vec![Self {
                 handle,
                 mtu: spec.mtu,
-                framing,
-                #[cfg(target_os = "linux")]
-                gso: offload,
-                #[cfg(target_os = "macos")]
+                framing: Framing::Utun,
                 gso: false,
-            })
+            }])
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         Err(io::Error::new(
@@ -647,6 +643,45 @@ impl Device {
             gso: false,
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn open_linux(spec: &Spec, queues: usize) -> io::Result<(Vec<tun_rs::SyncDevice>, bool)> {
+    match build_queues(spec, queues) {
+        Ok(found) => Ok(found),
+        // A kernel without `IFF_MULTI_QUEUE`, or a clone the interface refused: serve the one queue the platform gives.
+        Err(_) if queues > 1 => build_queues(spec, 1),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_queues(spec: &Spec, queues: usize) -> io::Result<(Vec<tun_rs::SyncDevice>, bool)> {
+    let multi = queues > 1;
+    let (device, offload) = match crate::tun_stack::build(spec, multi, true) {
+        Ok((device, true, _)) => {
+            // The kernel enabled UDP segment offload with the TCP ones; the handler does not split an aggregate, so the device is narrowed before its name is released for the plain rebuild.
+            if crate::tun_stack::tcp_only_offload(&device) {
+                (device, true)
+            } else {
+                drop(device);
+                let (device, _, _) = crate::tun_stack::build(spec, multi, false)?;
+                (device, false)
+            }
+        }
+        Ok((device, false, _)) => (device, false),
+        Err(error) if offload_refused(&error) => {
+            let (device, _, _) = crate::tun_stack::build(spec, multi, false)?;
+            (device, false)
+        }
+        Err(error) => return Err(error),
+    };
+    let mut devices = Vec::with_capacity(queues);
+    for _ in 1..queues {
+        devices.push(device.try_clone()?);
+    }
+    devices.push(device);
+    Ok((devices, offload))
 }
 
 /// A flow's writer: the descriptor clone plus the framing an emit owes it.
@@ -844,13 +879,14 @@ fn write_tcp_checksum(source: IpAddr, destination: IpAddr, partial: bool, out: &
     };
     let tcp_len = out.len() - ip_header;
     let field = ip_header + 16;
-    let value = if partial {
-        partial_tcp_checksum(source, destination, tcp_len)
+    // A full checksum is written in network order; the offload field holds the pseudo-header sum the kernel folds the payload onto, which is a native-word sum and so is written native.
+    let bytes = if partial {
+        partial_tcp_checksum(source, destination, tcp_len).to_ne_bytes()
     } else {
         let (source, destination) = octets(source, destination);
-        tcp_checksum(&source, &destination, &out[ip_header..])
+        tcp_checksum(&source, &destination, &out[ip_header..]).to_be_bytes()
     };
-    out[field..field + 2].copy_from_slice(&value.to_be_bytes());
+    out[field..field + 2].copy_from_slice(&bytes);
 }
 
 fn octets(source: IpAddr, destination: IpAddr) -> ([u8; 16], [u8; 16]) {
@@ -1007,6 +1043,91 @@ fn build_ipv6_tcp_packet(
     out
 }
 
+/// The peer's send window for one flow: the highest sequence it acknowledged and the room it advertises, so the response thread stalls instead of overrunning a receive buffer and losing segments this handler cannot retransmit.
+struct SendWindow {
+    una: AtomicU32,
+    window: AtomicU32,
+    closed: AtomicBool,
+    parked: AtomicBool,
+    thread: std::sync::OnceLock<std::thread::Thread>,
+}
+
+impl SendWindow {
+    fn new(una: u32, window: u16) -> Self {
+        Self {
+            una: AtomicU32::new(una),
+            window: AtomicU32::new(u32::from(window)),
+            closed: AtomicBool::new(false),
+            parked: AtomicBool::new(false),
+            thread: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Fold one device ACK into the window; a stale number never moves either field, and a zero-window probe still opens the window.
+    fn acked(&self, ack: u32, window: u16, sent: u32) {
+        let current = self.una.load(SeqCst);
+        let advance = ack.wrapping_sub(current);
+        if advance < 1u32 << 31 {
+            if advance != 0 && ack.wrapping_sub(sent) >= 1u32 << 31 {
+                self.una.store(ack, SeqCst);
+            }
+            self.window.store(u32::from(window), SeqCst);
+        }
+        self.wake();
+    }
+
+    fn close(&self) {
+        self.closed.store(true, SeqCst);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        if self.parked.swap(false, SeqCst) {
+            if let Some(thread) = self.thread.get() {
+                thread.unpark();
+            }
+        }
+    }
+
+    /// Room the peer's window leaves right now; `None` when the flow ended or a silent peer kept the window shut past the idle budget.
+    fn room(&self, sent: &AtomicU32) -> Option<u32> {
+        let deadline = std::time::Instant::now() + budgets::udp_idle();
+        loop {
+            if self.closed.load(SeqCst) {
+                return None;
+            }
+            let una = self.una.load(SeqCst);
+            let window = self.window.load(SeqCst);
+            let inflight = sent.load(SeqCst).wrapping_sub(una);
+            if inflight < window {
+                return Some(window - inflight);
+            }
+            self.parked.store(true, SeqCst);
+            // Re-read after publishing the park flag so an ACK that lands in between is not lost.
+            let una = self.una.load(SeqCst);
+            let window = self.window.load(SeqCst);
+            let inflight = sent.load(SeqCst).wrapping_sub(una);
+            if self.closed.load(SeqCst) {
+                self.parked.store(false, SeqCst);
+                return None;
+            }
+            if inflight < window {
+                self.parked.store(false, SeqCst);
+                continue;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                self.parked.store(false, SeqCst);
+                return None;
+            }
+            if let Some(thread) = self.thread.get() {
+                std::thread::park_timeout(deadline - now);
+            }
+            self.parked.store(false, SeqCst);
+        }
+    }
+}
+
 /// One active TCP flow's state. The two cursors are shared with the response
 /// thread: `rcv_nxt` advances as the handler delivers payload to the proxy, and
 /// `snd_nxt` advances as the response thread sends payload out, so a pure ACK
@@ -1026,6 +1147,8 @@ struct Flow {
     remote: (IpAddr, u16),
     /// The largest payload the response thread may put in one segment; a path-MTU report lowers it.
     mss: Arc<AtomicU32>,
+    /// The peer's advertised window, updated from every ACK, so a download stalls at the receive buffer instead of flooding past it.
+    send: Arc<SendWindow>,
     /// One close packet — `FIN` or `RST` — leaves per flow, whichever thread sees the end first.
     signaled: Arc<AtomicBool>,
 }
@@ -1213,6 +1336,10 @@ impl Handler {
         }
         let mut dead = false;
         if let Some(flow) = self.flows.get_mut(&key) {
+            if tcp.flags & FLAG_ACK != 0 {
+                let sent = flow.snd_nxt.load(Relaxed);
+                flow.send.acked(tcp.ack_num, tcp.window, sent);
+            }
             let fin = tcp.flags & FLAG_FIN != 0;
             // A device retransmits and can reorder, so only the bytes past `rcv_nxt` reach the proxy: a duplicate is dropped and an overlapping segment is trimmed, never written twice.
             let rcv = flow.rcv_nxt.load(Relaxed);
@@ -1328,6 +1455,7 @@ impl Handler {
         let snd_nxt = Arc::new(AtomicU32::new(syn_seq.wrapping_add(2)));
         let busy = Arc::new(AtomicBool::new(false));
         let signaled = Arc::new(AtomicBool::new(false));
+        let send = Arc::new(SendWindow::new(syn_seq.wrapping_add(2), tcp.window));
         let id = self.next_flow_id;
         self.next_flow_id = self.next_flow_id.wrapping_add(1);
         self.flows.insert(
@@ -1343,6 +1471,7 @@ impl Handler {
                 local: (local_ip, local_port),
                 remote: (remote_ip, remote_port),
                 mss: Arc::clone(&mss),
+                send: Arc::clone(&send),
                 signaled: Arc::clone(&signaled),
             },
         );
@@ -1362,6 +1491,7 @@ impl Handler {
         });
 
         std::thread::spawn(move || {
+            let _ = send.thread.set(std::thread::current());
             let gso_capable = dev_writer.gso();
             let initial = (mss.load(Relaxed) as usize).max(1);
             let mut buf = vec![
@@ -1395,31 +1525,42 @@ impl Handler {
                         };
                     }
                     Ok(n) => {
-                        let seq = snd_nxt.load(Relaxed);
-                        let max = (mss.load(Relaxed) as usize).max(1);
-                        let gso = gso_capable && n > max;
-                        render_tcp_packet_ip(
-                            (local_ip, local_port),
-                            (remote_ip, remote_port),
-                            seq,
-                            rcv_nxt.load(Relaxed),
-                            FLAG_PSH | FLAG_ACK,
-                            65535,
-                            &buf[..n],
-                            gso,
-                            &mut pkt,
-                        );
-                        let wrote = if gso {
-                            dev_writer.write_gso(&pkt, max as u16)
-                        } else {
-                            dev_writer.write_packet(&pkt)
-                        };
-                        match wrote {
-                            Ok(true) => {
-                                snd_nxt.fetch_add(n as u32, Relaxed);
+                        let mut at = 0;
+                        while at < n {
+                            let Some(room) = send.room(&snd_nxt) else {
+                                break;
+                            };
+                            let max = (mss.load(Relaxed) as usize).max(1);
+                            let take = (n - at).min(room as usize);
+                            let seq = snd_nxt.load(Relaxed);
+                            let gso = gso_capable && take > max;
+                            render_tcp_packet_ip(
+                                (local_ip, local_port),
+                                (remote_ip, remote_port),
+                                seq,
+                                rcv_nxt.load(Relaxed),
+                                FLAG_PSH | FLAG_ACK,
+                                65535,
+                                &buf[at..at + take],
+                                gso,
+                                &mut pkt,
+                            );
+                            let wrote = if gso {
+                                dev_writer.write_gso(&pkt, max as u16)
+                            } else {
+                                dev_writer.write_packet(&pkt)
+                            };
+                            match wrote {
+                                Ok(true) => {
+                                    snd_nxt.fetch_add(take as u32, Relaxed);
+                                    at += take;
+                                }
+                                Ok(false) => break,
+                                Err(_) => break,
                             }
-                            Ok(false) => {}
-                            Err(_) => break FLAG_RST | FLAG_ACK,
+                        }
+                        if at < n {
+                            break FLAG_RST | FLAG_ACK;
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -1520,6 +1661,7 @@ impl Handler {
                 // The device reset the flow itself: nothing has to travel back.
                 _ => flow.signaled.store(true, Relaxed),
             }
+            flow.send.close();
             let _ = flow.write_half.shutdown(Shutdown::Both);
         }
     }
@@ -1711,6 +1853,119 @@ mod tests {
         assert_eq!(u16::from_ne_bytes([header[4], header[5]]), 1400);
         assert_eq!(u16::from_ne_bytes([header[6], header[7]]), 40);
         assert_eq!(u16::from_ne_bytes([header[8], header[9]]), 16);
+    }
+
+    /// A response read larger than one segment leaves as one GSO frame: the end-to-end gate the header-only test cannot be, because it drives the response thread rather than calling the header builder.
+    #[cfg(unix)]
+    #[test]
+    fn a_large_response_read_leaves_as_one_gso_frame() {
+        use std::io::Write;
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let payload: Vec<u8> = (0..4_000u32).map(|i| (i % 251) as u8).collect();
+        let sent = payload.clone();
+        let relay: Relay = Arc::new(move |mut conn: Connection, _dest| {
+            conn.write_all(&sent)?;
+            Ok(())
+        });
+        let device = Device {
+            handle: a,
+            mtu: 100,
+            framing: Framing::Virtio,
+            gso: true,
+        };
+        let mut handler = Handler::new(device, relay, no_associate());
+        let client = (SCRIPT_CLIENT, 51001);
+        let endpoint = ([203, 0, 113, 53], 53);
+        let mut buf = vec![0u8; MAX_PACKET + 64];
+
+        // A virtio-framed SYN: the device read strips the ten-byte header as a Linux descriptor's does, and the response thread is spawned off the flow.
+        let syn = build_tcp_packet(client, endpoint, 7000, 0, FLAG_SYN, 65535, &[]);
+        let mut frame = vec![0u8; VIRTIO_NET_HDR_LEN];
+        frame.extend_from_slice(&syn);
+        peer.write_all(&frame).unwrap();
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+
+        let mut gso = None;
+        for _ in 0..2_500 {
+            match peer.read(&mut buf) {
+                Ok(n) if n > VIRTIO_NET_HDR_LEN => {
+                    let header: [u8; VIRTIO_NET_HDR_LEN] =
+                        buf[..VIRTIO_NET_HDR_LEN].try_into().unwrap();
+                    if header[1] == VIRTIO_NET_HDR_GSO_TCPV4 {
+                        gso = Some((header, n));
+                        break;
+                    }
+                    // The SYN-ACK carries no GSO header; answer it so the flow's receive cursor moves, then wait for the response.
+                    if header == [0u8; VIRTIO_NET_HDR_LEN] {
+                        if let Some((_ip, body)) = ipv4_head(&buf[VIRTIO_NET_HDR_LEN..n]) {
+                            if let Some((tcp, _)) = tcp_head(body) {
+                                if tcp.flags == FLAG_SYN | FLAG_ACK {
+                                    let ack = build_tcp_packet(
+                                        client,
+                                        endpoint,
+                                        7001,
+                                        tcp.seq.wrapping_add(1),
+                                        FLAG_ACK,
+                                        65535,
+                                        &[],
+                                    );
+                                    let mut frame = vec![0u8; VIRTIO_NET_HDR_LEN];
+                                    frame.extend_from_slice(&ack);
+                                    peer.write_all(&frame).unwrap();
+                                    let m = handler.device.read_packet(&mut buf).unwrap();
+                                    handler.dispatch(&buf[..m]).unwrap();
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
+        }
+        let (header, total) = gso.expect("a read larger than the MSS leaves as one GSO frame");
+        assert_eq!(
+            header[0] & VIRTIO_NET_HDR_F_NEEDS_CSUM,
+            VIRTIO_NET_HDR_F_NEEDS_CSUM,
+            "the kernel completes the checksum"
+        );
+        assert_eq!(header[1], VIRTIO_NET_HDR_GSO_TCPV4);
+        assert_eq!(
+            usize::from(u16::from_ne_bytes([header[4], header[5]])),
+            60,
+            "the split size is the flow's MSS"
+        );
+        let (ip, body) = ipv4_head(&buf[VIRTIO_NET_HDR_LEN..total]).unwrap();
+        let (_tcp, carried) = tcp_head(body).unwrap();
+        assert_eq!(
+            carried,
+            payload.as_slice(),
+            "one GSO frame carries the whole read"
+        );
+        // The offload field is the pseudo-header sum in network order; the kernel folds the payload onto it, so a byte-swapped value would silently fail every segment.
+        let mut pseudo = Vec::with_capacity(12);
+        pseudo.extend_from_slice(&ip.source);
+        pseudo.extend_from_slice(&ip.destination);
+        pseudo.extend_from_slice(&[0, TCP_PROTO]);
+        pseudo.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        let mut sum = 0u32;
+        for word in pseudo.chunks_exact(2) {
+            sum += u32::from(u16::from_ne_bytes([word[0], word[1]]));
+        }
+        sum = (sum & 0xffff) + (sum >> 16);
+        sum = (sum & 0xffff) + (sum >> 16);
+        assert_eq!(
+            u16::from_ne_bytes([body[16], body[17]]),
+            (sum & 0xffff) as u16,
+            "the partial checksum is the pseudo-header sum in the native order the kernel folds"
+        );
     }
 
     #[cfg(target_os = "linux")]
