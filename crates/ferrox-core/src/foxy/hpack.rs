@@ -27,6 +27,9 @@ const SHORTEST: usize = 5;
 const MAX_BITS: usize = 30;
 const PEEK: usize = 12;
 
+/// The pair table's bit above the second symbol's length, set when a `PEEK`-bit window holds two codes.
+const TWO_CODES: u32 = 1 << 26;
+
 /// The symbols a `len`-octet Huffman window can hold: `SHORTEST` is the code's shortest symbol, so this is the ceiling the decode can reach and a buffer of it never grows.
 const fn decoded_bound(len: usize) -> usize {
     8 * len / SHORTEST
@@ -40,8 +43,8 @@ struct Huffman {
     symbols: [u16; 257],
     /// Each symbol's canonical code, built by the same walk the decode ranges come from, so encode and decode can never disagree.
     codes: [u32; 257],
-    /// One load resolves every symbol of `PEEK` bits or fewer — which is every ASCII byte — as `(symbol << 5) | length`; zero means no code of that length prefixes the window, and the serial probe takes over from the bits already read. Prefix-freeness makes the entry unique, and Kraft makes the table fill below one write per entry.
-    primary: [u16; 1 << PEEK],
+    /// One load resolves one or two symbols whose codes fit the `PEEK`-bit window: low byte is the first symbol, the next five bits its length, then the second symbol and length with `TWO_CODES`; zero means no code prefixes the window and the serial probe takes over. Prefix-freeness makes each hit unique.
+    pair: [u32; 1 << PEEK],
 }
 
 fn huffman() -> &'static Huffman {
@@ -52,7 +55,7 @@ fn huffman() -> &'static Huffman {
             base: [0; MAX_BITS + 1],
             symbols: [0; 257],
             codes: [0; 257],
-            primary: [0; 1 << PEEK],
+            pair: [0; 1 << PEEK],
         };
         let mut next = 0u32;
         let mut placed = 0usize;
@@ -77,21 +80,43 @@ fn huffman() -> &'static Huffman {
                 next += 1;
             }
             table.probe[bits] = (u64::from(first) << 32) | u64::from(count);
-            if bits <= PEEK {
-                let spread = 1usize << (PEEK - bits);
-                for slot in 0..count as usize {
-                    let entry =
-                        (table.symbols[table.base[bits] as usize + slot] << 5) | bits as u16;
-                    let window = (first as usize + slot) << (PEEK - bits);
-                    table.primary[window..window + spread].fill(entry);
+        }
+        for window in 0..(1u32 << PEEK) {
+            let mut entry = 0u32;
+            let mut first_len = 0usize;
+            for bits in SHORTEST..=PEEK {
+                let probe = table.probe[bits];
+                let acc = (window >> (PEEK - bits)) as u32;
+                let offset = acc.wrapping_sub((probe >> 32) as u32);
+                if offset < probe as u32 {
+                    let symbol = table.symbols[table.base[bits] as usize + offset as usize] as u32;
+                    entry = symbol | ((bits as u32) << 8);
+                    first_len = bits;
+                    break;
                 }
             }
+            if first_len != 0 {
+                let remaining = PEEK - first_len;
+                let rest = (window << first_len) & ((1u32 << PEEK) - 1);
+                for bits in SHORTEST..=remaining {
+                    let probe = table.probe[bits];
+                    let acc = (rest >> (PEEK - bits)) as u32;
+                    let offset = acc.wrapping_sub((probe >> 32) as u32);
+                    if offset < probe as u32 {
+                        let symbol =
+                            table.symbols[table.base[bits] as usize + offset as usize] as u32;
+                        entry |= (symbol << 13) | ((bits as u32) << 21) | TWO_CODES;
+                        break;
+                    }
+                }
+            }
+            table.pair[window as usize] = entry;
         }
         table
     })
 }
 
-/// Decodes one Huffman-coded string: the 257th entry is the EOS code rather than a symbol, so a block decoding one is malformed, and only the all-ones prefix under eight bits may follow the last symbol. The unread bits sit in one register, refilled a byte at a time, so a symbol costs a shift and a load of the 4096-entry table `huffman()` builds once beside the probe rows — it answers every code of length `PEEK` or shorter, which is the whole ASCII range — and a miss hands the register's high bits to the same serial probe the pre-table decoder ran, for the 13..30-bit codes, without reading a byte for it.
+/// Decodes one Huffman-coded string: the 257th entry is the EOS code rather than a symbol, so a block decoding one is malformed, and only the all-ones prefix under eight bits may follow the last symbol. The unread bits sit in one register, refilled a byte at a time, so a load of the 4096-entry pair table `huffman()` builds once beside the probe rows resolves one or two codes of `PEEK` bits or fewer — the whole ASCII range — and a miss hands the register's high bits to the same serial probe the pre-table decoder ran, for the 13..30-bit codes, without reading a byte for it.
 pub fn huffman_decode(code: &[u8], out: &mut Vec<u8>) -> Option<()> {
     let table = huffman();
     // The register is left-justified at the next unread bit, so consuming a symbol is one shift, and `held + 8 * (code.len() - cursor)` is the string's remaining bit count at every point of the walk.
@@ -107,10 +132,16 @@ pub fn huffman_decode(code: &[u8], out: &mut Vec<u8>) -> Option<()> {
         if bits < PEEK {
             break;
         }
-        let entry = table.primary[(held >> (64 - PEEK)) as usize];
-        if entry != 0 {
-            out.push((entry >> 5) as u8);
-            let used = usize::from(entry & 31);
+        let entry = table.pair[(held >> (64 - PEEK)) as usize];
+        let first = ((entry >> 8) & 0x1f) as usize;
+        if first != 0 {
+            out.push((entry & 0xff) as u8);
+            let used = if entry & TWO_CODES != 0 {
+                out.push(((entry >> 13) & 0xff) as u8);
+                first + ((entry >> 21) & 0x1f) as usize
+            } else {
+                first
+            };
             held <<= used;
             bits -= used;
             continue;
@@ -840,32 +871,39 @@ mod tests {
     }
 
     #[test]
-    fn the_primary_window_resolves_exactly_the_codes_of_twelve_bits_or_fewer() {
+    fn the_pair_window_resolves_one_or_two_short_codes() {
         let table = huffman();
-        for window in 0..(1 << PEEK) {
-            let mut hit = (0usize, 0usize);
-            for bits in SHORTEST..=PEEK {
-                let probe = table.probe[bits];
-                let acc = (window >> (PEEK - bits)) as u32;
-                let offset = acc.wrapping_sub((probe >> 32) as u32);
-                if offset < probe as u32 {
-                    hit = (
-                        bits,
-                        usize::from(table.symbols[table.base[bits] as usize + offset as usize]),
-                    );
-                    break;
+        for window in 0..(1u32 << PEEK) {
+            let mut expected = Vec::new();
+            let mut at = 0usize;
+            while PEEK - at >= SHORTEST {
+                let remaining = PEEK - at;
+                let mut hit = None;
+                for bits in SHORTEST..=remaining {
+                    let probe = table.probe[bits];
+                    let acc = (window >> (PEEK - at - bits)) as u32;
+                    let offset = acc.wrapping_sub((probe >> 32) as u32);
+                    if offset < probe as u32 {
+                        let symbol =
+                            table.symbols[table.base[bits] as usize + offset as usize] as u32;
+                        hit = Some((symbol, bits));
+                        break;
+                    }
+                }
+                let Some((symbol, bits)) = hit else { break };
+                expected.push((symbol, bits));
+                at += bits;
+            }
+            let entry = table.pair[window as usize];
+            let mut got = Vec::new();
+            let first = ((entry >> 8) & 0x1f) as usize;
+            if first != 0 {
+                got.push((entry & 0xff, first));
+                if entry & TWO_CODES != 0 {
+                    got.push(((entry >> 13) & 0xff, ((entry >> 21) & 0x1f) as usize));
                 }
             }
-            let entry = table.primary[window];
-            if hit.0 == 0 {
-                assert_eq!(
-                    entry, 0,
-                    "window {window} holds no short code and must miss"
-                );
-            } else {
-                assert_eq!(usize::from(entry >> 5), hit.1, "window {window} symbol");
-                assert_eq!(usize::from(entry & 31), hit.0, "window {window} length");
-            }
+            assert_eq!(got, expected, "window {window}");
         }
     }
 
