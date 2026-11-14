@@ -154,7 +154,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
     let headroom = 0;
     #[cfg(target_os = "linux")]
     let (tx_pool, tx_free) = if headroom == VIRTIO_NET_HDR_LEN {
-        let (pool, free) = TxPool::new(WRITE_BATCH, headroom + 65_535);
+        let (pool, free) = TxPool::new(WRITE_BATCH, headroom + 65_535, TX_QUEUE);
         (Some(pool), Some(free))
     } else {
         (None, None)
