@@ -438,6 +438,58 @@ mod tests {
         assert_eq!(recovered, payload);
     }
 
+    const FRAME_PROBE_ROUNDS: usize = 8;
+    const FRAME_PROBE_FRAMES: usize = 32;
+
+    #[inline(never)]
+    fn frame_read_probe() -> usize {
+        let mut body = Vec::new();
+        write_string(&mut body, CHANNEL).expect("channel");
+        body.extend(vec![0x5a; MAX_PACKET_DATA]);
+        let frame = encode_packet(CLIENTBOUND_CUSTOM_PAYLOAD, &body).expect("frame");
+        let mut wire = Vec::with_capacity(frame.len() * FRAME_PROBE_FRAMES);
+        for _ in 0..FRAME_PROBE_FRAMES {
+            wire.extend_from_slice(&frame);
+        }
+        let mut output = vec![0u8; MAX_PACKET_DATA];
+        let mut total = 0;
+        for _ in 0..FRAME_PROBE_ROUNDS {
+            let stream =
+                PacketStream::new(std::io::Cursor::new(wire.as_slice()), std::io::sink(), true);
+            let mut read = &stream;
+            for _ in 0..FRAME_PROBE_FRAMES {
+                total += read.read(&mut output).expect("reads");
+            }
+        }
+        std::hint::black_box(total)
+    }
+
+    #[inline(never)]
+    fn frame_write_probe() -> usize {
+        let input = vec![0x33u8; MAX_PACKET_DATA];
+        let mut total = 0;
+        for _ in 0..FRAME_PROBE_ROUNDS {
+            let stream = PacketStream::new(
+                std::io::Cursor::new(Vec::<u8>::new()),
+                std::io::sink(),
+                true,
+            );
+            let mut write = &stream;
+            write.write_all(&input).expect("writes");
+            total += input.len();
+        }
+        std::hint::black_box(total)
+    }
+
+    #[test]
+    fn the_xmc_frame_path_costs_the_payload() {
+        assert_eq!(
+            frame_read_probe(),
+            MAX_PACKET_DATA * FRAME_PROBE_FRAMES * FRAME_PROBE_ROUNDS
+        );
+        assert_eq!(frame_write_probe(), MAX_PACKET_DATA * FRAME_PROBE_ROUNDS);
+    }
+
     #[test]
     fn a_custom_payload_is_a_slice_of_its_frame() {
         let mut data = Vec::new();

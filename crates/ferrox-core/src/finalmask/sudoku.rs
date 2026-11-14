@@ -1325,6 +1325,48 @@ mod tests {
     }
 
     #[inline(never)]
+    fn decode_only_probe() -> usize {
+        let config = stage("probe", "", &[]);
+        let plain: Vec<u8> = (0..PROBE_PLAINTEXT).map(|at| at as u8).collect();
+        let mut wire = Vec::new();
+        config
+            .open_write(MaskRole::Client)
+            .write(&mut wire, &plain)
+            .expect("encodes");
+        let mut total = 0;
+        for _ in 0..PROBE_ROUNDS {
+            let mut reader = config.open_read(MaskRole::Server);
+            let mut input = wire.as_slice();
+            let mut decoded = vec![0u8; plain.len()];
+            let mut got = 0usize;
+            while got < decoded.len() {
+                let n = reader
+                    .read_from(&mut input, &mut decoded[got..])
+                    .expect("decodes");
+                if n == 0 {
+                    break;
+                }
+                got += n;
+            }
+            total += got;
+        }
+        std::hint::black_box(total)
+    }
+
+    #[inline(never)]
+    fn packed_encode_probe() -> usize {
+        let config = stage("probe", "", &[]);
+        let mut writer = config.open_write(MaskRole::Server);
+        let plain: Vec<u8> = (0..PROBE_PLAINTEXT).map(|at| at as u8).collect();
+        let mut sink = std::io::sink();
+        let mut total = 0;
+        for _ in 0..PROBE_ROUNDS {
+            total += writer.write(&mut sink, &plain).expect("encodes");
+        }
+        std::hint::black_box(total)
+    }
+
+    #[inline(never)]
     fn decode_probe() -> usize {
         let config = stage("probe", "", &[]);
         let plain: Vec<u8> = (0..PROBE_PLAINTEXT).map(|at| at as u8).collect();
@@ -1351,6 +1393,12 @@ mod tests {
     fn the_sudoku_wire_costs_the_bytes_and_nothing_else() {
         assert_eq!(encode_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
         assert_eq!(decode_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
+    }
+
+    #[test]
+    fn the_sudoku_tail_and_lookup_costs_the_bytes() {
+        assert_eq!(decode_only_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
+        assert_eq!(packed_encode_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
     }
 
     #[test]
