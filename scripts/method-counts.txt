@@ -530,6 +530,7 @@ kcp ack-numbers-reallocations-per-cycle 0 ferrox-core-kcp::segment::tests::a_rec
 kcp segment-header-staging-copies-per-segment 0 ferrox-core-kcp::segment::tests::a_borrowed_payload_serialises_identically_to_an_owned_one
 kcp segment-list-vectors-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next
 kcp reader-wakeups-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries
+kcp receiving-lock-acquisitions-per-multi-segment-datagram 1 ferrox-core-kcp::connection::tests::a_multi_segment_datagram_takes_the_receiving_lock_once
 kcp mask-families-implemented 9 ferrox-core-kcp::listener::tests::every_mask_family_echoes_over_loopback
 kcp filter-verdicts-from-one-list 5 ferrox-app-config::tests::a_finalmask_filter_reads_both_lists
 kcp mask-chain-wire-overhead-bytes 32 ferrox-core-kcp::listener::tests::the_wire_under_a_masked_session_carries_the_mask

@@ -241,12 +241,19 @@ impl ReceivingWindow {
     }
 
     pub fn set(&mut self, id: u32, value: DataSegment) -> bool {
+        self.insert(id, value).is_none()
+    }
+
+    /// Stores `value` unless the slot is taken, in which case the caller gets it
+    /// back: the payload is a lent buffer, and a rejected segment would drop it
+    /// instead of returning it to the pool.
+    pub fn insert(&mut self, id: u32, value: DataSegment) -> Option<DataSegment> {
         if let Some(map) = &mut self.map {
             return match map.entry(id) {
-                Entry::Occupied(_) => false,
+                Entry::Occupied(_) => Some(value),
                 Entry::Vacant(slot) => {
                     slot.insert(value);
-                    true
+                    None
                 }
             };
         }
@@ -254,10 +261,10 @@ impl ReceivingWindow {
         let index = self.index(id);
         let slot = &mut self.slots[index];
         if slot.is_some() {
-            return false;
+            return Some(value);
         }
         *slot = Some(value);
-        true
+        None
     }
 
     #[must_use]

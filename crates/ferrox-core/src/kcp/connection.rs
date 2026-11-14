@@ -455,20 +455,28 @@ impl Connection {
         let current = self.elapsed();
         self.last_incoming_time.store(current, Ordering::SeqCst);
         let mut woke = false;
+        let mut receiving = None;
         for seg in segments.drain(..) {
             if seg.conversation() != self.ctx.meta.conversation {
                 break;
             }
             if seg.option().is_close() {
+                drop(receiving.take());
                 self.on_peer_closed();
             }
             match seg {
                 Segment::Data(d) => {
-                    let mut receiving = self.receiving.lock().unwrap();
+                    let receiving = receiving.get_or_insert_with(|| {
+                        let receiving = self.receiving.lock().unwrap();
+                        #[cfg(test)]
+                        self.pass_lock_gate("receiving");
+                        receiving
+                    });
                     receiving.process_segment(d);
                     woke |= receiving.is_data_available();
                 }
                 Segment::Ack(a) => {
+                    drop(receiving.take());
                     let rto = self.ctx.round_trip.lock().unwrap().timeout();
                     self.sending
                         .lock()
@@ -479,6 +487,7 @@ impl Connection {
                     super::segment::reclaim_ack_numbers(a.numbers);
                 }
                 Segment::CmdOnly(c) => {
+                    drop(receiving.take());
                     if c.kind() == Some(Command::Terminate) {
                         match self.state() {
                             State::Active | State::PeerClosed => {
@@ -511,6 +520,7 @@ impl Connection {
                 }
             }
         }
+        drop(receiving);
         // One wake for the datagram: a reader parked on the generation counter needs it to change once, not once per segment.
         if woke {
             self.data_input.signal();
@@ -888,6 +898,32 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_segment_datagram_takes_the_receiving_lock_once() {
+        let local = ([127, 0, 0, 1], 1).into();
+        let conn = Connection::new_unstarted(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 4,
+            },
+            Box::new(|_| Ok(())),
+            Box::new(|| {}),
+            Config::default(),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        conn.set_lock_gate(Some(Arc::new(move |site: &'static str| {
+            recorded.lock().unwrap().push(site);
+        })));
+        conn.input(&mut vec![
+            data(0, 0, b"a"),
+            data(1, 0, b"bb"),
+            data(2, 0, b"ccc"),
+        ]);
+        assert_eq!(*events.lock().unwrap(), ["receiving"]);
+    }
+
+    #[test]
     fn poll_and_ping_do_not_hold_worker_locks_across_each_other() {
         let local = ([127, 0, 0, 1], 1).into();
         let conn = Connection::new_unstarted(
@@ -1084,8 +1120,39 @@ mod tests {
             settled >= 8 * 1332,
             "the pool must hold the window's worth: {settled}"
         );
+        // A duplicate and a segment beyond the window are refused after parsing; both lent buffers must come back.
+        let next = 64 * 8;
+        let duplicate = next + 1;
+        let beyond = next + Config::default().receiving_in_flight_size();
+        let mut after = Vec::new();
+        for number in [duplicate, duplicate, beyond, next] {
+            let mut payload = conn.take_payload();
+            payload.extend_from_slice(&[number as u8; 1332]);
+            after.push(Segment::Data(super::DataSegment {
+                conv: 4,
+                option: super::SegmentOption::NONE,
+                timestamp: 0,
+                number,
+                sending_next: next,
+                payload,
+                timeout: 0,
+                transmit: 0,
+            }));
+        }
+        conn.input(&mut after);
         assert_eq!(
-            conn.receiving.lock().unwrap().spare_buffers(),
+            read_once(&conn, &mut out),
+            Ok(2 * 1332),
+            "the in-order segment and the duplicate's first copy did not deliver"
+        );
+        let receiving = conn.receiving.lock().unwrap();
+        assert_eq!(
+            receiving.spare_capacity(),
+            settled,
+            "a rejected segment's buffer was dropped instead of returned"
+        );
+        assert_eq!(
+            receiving.spare_buffers(),
             8,
             "every drained buffer comes back"
         );

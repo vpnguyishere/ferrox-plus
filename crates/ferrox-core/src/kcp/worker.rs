@@ -264,11 +264,14 @@ impl ReceivingWorker {
     pub fn process_segment(&mut self, seg: DataSegment) {
         let number = seg.number;
         if number.wrapping_sub(self.next_number) >= self.window_size {
+            self.spare.push(seg.payload);
             return;
         }
         self.acklist.clear(seg.sending_next);
         self.acklist.add(number, seg.timestamp);
-        self.window.set(number, seg);
+        if let Some(rejected) = self.window.insert(number, seg) {
+            self.spare.push(rejected.payload);
+        }
     }
 
     /// Drains every segment the window holds so `next_number` reaches the end of what arrived before `read` gets the caller's buffer: lazily it lags by whatever one read did not consume, and `process_segment` refuses anything `window_size` ahead, so a lazy pull drops segments an eager drain accepts.
